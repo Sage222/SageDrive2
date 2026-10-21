@@ -917,6 +917,12 @@ function cleanupActiveMedia() {
   const player = document.getElementById('active-media-player');
   if (player) {
     try {
+      player.onerror = null;
+      player.onloadeddata = null;
+      player.oncanplay = null;
+      player.onwaiting = null;
+      player.onplaying = null;
+      player.onended = null;
       player.pause();
       player.removeAttribute('src');
       player.load();
@@ -929,13 +935,20 @@ function cleanupActiveMedia() {
 }
 
 async function fallbackStreamMedia(src, f, player, statusWrap, statusText, statusPct, statusFill) {
-  cleanupActiveMedia();
+  if (_activeMediaAbort) {
+    try { _activeMediaAbort.abort(); } catch(_) {}
+    _activeMediaAbort = null;
+  }
+  if (_activeMediaBlobUrl) {
+    try { URL.revokeObjectURL(_activeMediaBlobUrl); } catch(_) {}
+    _activeMediaBlobUrl = null;
+  }
   const ctrl = new AbortController();
   _activeMediaAbort = ctrl;
   const ext = _fileExt(f);
   const isVid = isVideoFile(f);
   const needsVidTranscode = isVid && ['mkv', 'avi', 'wmv', 'flv', 'ts', 'm2ts'].includes(ext);
-  const needsAudTranscode = !isVid && ['wma', 'aiff', 'aif', 'alac', 'flac'].includes(ext);
+  const needsAudTranscode = !isVid && ['wma', 'aiff', 'aif', 'alac'].includes(ext);
   const fetchUrl = needsVidTranscode
     ? (src + '&transcode=1')
     : (needsAudTranscode ? (src + '&transcode=audio') : src);
@@ -1186,6 +1199,26 @@ function nextImage(type) {
   openImageViewer(encodeFileArg(_imagePlaylist[idx]), type);
 }
 
+async function fallbackLoadImage(src, imgEl) {
+  try {
+    const r = await apiFetch(src);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const blob = await r.blob();
+    if (_activeMediaBlobUrl) {
+      try { URL.revokeObjectURL(_activeMediaBlobUrl); } catch (_) {}
+    }
+    _activeMediaBlobUrl = URL.createObjectURL(blob);
+    imgEl.onerror = () => {
+      const sp = document.getElementById('img-loading-spinner');
+      if (sp) sp.outerHTML = '<span style="color:var(--color-error);font-size:var(--text-sm)">Unable to preview image</span>';
+    };
+    imgEl.src = _activeMediaBlobUrl;
+  } catch (_) {
+    const sp = document.getElementById('img-loading-spinner');
+    if (sp) sp.outerHTML = '<span style="color:var(--color-error);font-size:var(--text-sm)">Unable to preview image</span>';
+  }
+}
+
 function openImageViewer(fJson, type) {
   cleanupActiveMedia();
   _imageZoom = 1;
@@ -1217,7 +1250,7 @@ function openImageViewer(fJson, type) {
              style="max-width:100%;max-height:100%;object-fit:contain;transition:transform 150ms ease;transform-origin:center center;cursor:zoom-in;display:none"
              onclick="adjustImageZoom(_imageZoom === 1 ? 0.75 : 0, _imageZoom !== 1)"
              onload="document.getElementById('img-loading-spinner')?.remove();this.style.display='block'"
-             onerror="const sp=document.getElementById('img-loading-spinner');if(sp)sp.outerHTML='<span style=\\'color:var(--color-error);font-size:var(--text-sm)\\'>Unable to preview image</span>'" />
+             onerror="this.onerror=null;fallbackLoadImage('${src}',this)" />
       </div>
       <div class="media-controls-bar">
         <div class="media-nav-group">

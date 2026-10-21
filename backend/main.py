@@ -1,13 +1,150 @@
-import os, json, mimetypes, io, re, subprocess, threading
+import os, json, time, mimetypes, io, re, subprocess, threading, tempfile, zipfile, requests
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 from flask import Flask, request, jsonify, send_file, send_from_directory, redirect
 from flask_cors import CORS
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
 import auth, smb_manager, gdrive_manager
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 CORS(app, supports_credentials=True, expose_headers=["Content-Length", "Content-Range", "Accept-Ranges", "Content-Disposition"])
 auth.bootstrap_admin()
+
+# ── Ensure gdrive_manager has token-expiry persistence, 401 retry & meta cache ─
+_gd_creds_lock = threading.Lock()
+_gd_meta_cache = getattr(gdrive_manager, "_meta_cache", {})
+_GD_META_TTL = 120.0
+
+def _gd_parse_expiry(raw_expiry):
+    if not raw_expiry:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw_expiry).replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+    except Exception:
+        return None
+
+def _gd_save_creds(c):
+    expiry_str = None
+    if getattr(c, "expiry", None) is not None:
+        expiry_str = c.expiry.isoformat()
+    gdrive_manager.CREDS_FILE.write_text(json.dumps({
+        "token": c.token,
+        "refresh_token": c.refresh_token,
+        "token_uri": c.token_uri,
+        "client_id": c.client_id,
+        "client_secret": c.client_secret,
+        "scopes": list(c.scopes or gdrive_manager.SCOPES),
+        "expiry": expiry_str,
+    }, indent=2))
+
+def _gd_load_creds(force_refresh=False):
+    with _gd_creds_lock:
+        if not gdrive_manager.CREDS_FILE.exists():
+            return None
+        d = json.loads(gdrive_manager.CREDS_FILE.read_text())
+        cfg = gdrive_manager.get_config()
+        expiry_dt = _gd_parse_expiry(d.get("expiry"))
+        c = Credentials(
+            token=d.get("token"),
+            refresh_token=d.get("refresh_token"),
+            token_uri=d.get("token_uri", "https://oauth2.googleapis.com/token"),
+            client_id=d.get("client_id", cfg["client_id"]),
+            client_secret=d.get("client_secret", cfg["client_secret"]),
+            scopes=d.get("scopes", gdrive_manager.SCOPES),
+            expiry=expiry_dt,
+        )
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        needs_refresh = (
+            force_refresh
+            or not c.token
+            or expiry_dt is None
+            or not c.valid
+            or (expiry_dt - now_utc).total_seconds() < 300
+        )
+        if needs_refresh and c.refresh_token:
+            c.refresh(Request())
+            _gd_save_creds(c)
+        return c if (c.token or c.valid) else None
+
+def _gd_svc():
+    c = _gd_load_creds()
+    if not c:
+        raise RuntimeError("Not authenticated with Google Drive")
+    return build("drive", "v3", credentials=c, cache_discovery=False)
+
+def _gd_get_file_meta(file_id):
+    now = time.time()
+    cached = _gd_meta_cache.get(file_id)
+    if cached and (now - cached[0]) < _GD_META_TTL:
+        return cached[1]
+    svc = _gd_svc()
+    meta = svc.files().get(
+        fileId=file_id,
+        fields="name,mimeType,size",
+        supportsAllDrives=True,
+    ).execute()
+    info = {
+        "name": meta.get("name", "download"),
+        "mimeType": meta.get("mimeType", "application/octet-stream"),
+        "size": int(meta.get("size", 0) or 0),
+    }
+    _gd_meta_cache[file_id] = (now, info)
+    return info
+
+def _gd_open_media_response(file_id, start=None, end=None):
+    url = (
+        f"https://www.googleapis.com/drive/v3/files/{file_id}"
+        f"?alt=media&supportsAllDrives=true&acknowledgeAbuse=true"
+    )
+    for attempt in range(2):
+        c = _gd_load_creds(force_refresh=(attempt > 0))
+        if not c:
+            raise RuntimeError("Not authenticated with Google Drive")
+        headers = {"Authorization": f"Bearer {c.token}"}
+        if start is not None and end is not None:
+            headers["Range"] = f"bytes={start}-{end}"
+        elif start:
+            headers["Range"] = f"bytes={start}-"
+        r = requests.get(url, headers=headers, stream=True, timeout=(15, 300))
+        if r.status_code in (401, 403) and attempt == 0:
+            r.close()
+            continue
+        if not r.ok:
+            err_body = ""
+            try:
+                err_body = r.text[:300]
+            except Exception:
+                pass
+            r.close()
+            raise RuntimeError(f"Google Drive stream failed ({r.status_code}): {err_body}")
+        return r
+    raise RuntimeError("Google Drive authentication failed after token refresh")
+
+def _gd_stream_file_range(file_id, start=0, end=None, chunk_size=262144):
+    r = _gd_open_media_response(file_id, start=start, end=end)
+    def _gen():
+        try:
+            for chunk in r.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    yield chunk
+        finally:
+            try:
+                r.close()
+            except Exception:
+                pass
+    return _gen()
+
+gdrive_manager._save_creds = _gd_save_creds
+gdrive_manager._load_creds = _gd_load_creds
+gdrive_manager._svc = _gd_svc
+gdrive_manager.get_file_meta = _gd_get_file_meta
+gdrive_manager.stream_file_range = _gd_stream_file_range
 
 MEDIA_MIMES = {
     "mp4": "video/mp4",
@@ -31,7 +168,9 @@ MEDIA_MIMES = {
     "aif": "audio/aiff",
     "jpg": "image/jpeg",
     "jpeg": "image/jpeg",
+    "jfif": "image/jpeg",
     "png": "image/png",
+    "apng": "image/apng",
     "gif": "image/gif",
     "webp": "image/webp",
     "svg": "image/svg+xml",
@@ -62,6 +201,16 @@ def guess_media_mime(filename, fallback=None):
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     if ext in MEDIA_MIMES:
         return MEDIA_MIMES[ext]
+    if fallback == "video/quicktime":
+        return "video/mp4"
+    if fallback in ("audio/mp3", "audio/mpeg3", "audio/x-mp3"):
+        return "audio/mpeg"
+    if fallback in ("audio/x-wav", "audio/wave"):
+        return "audio/wav"
+    if fallback in ("audio/x-m4a", "audio/m4a"):
+        return "audio/mp4"
+    if fallback in ("audio/x-flac",):
+        return "audio/flac"
     guessed = mimetypes.guess_type(filename)[0]
     if guessed and guessed not in ("application/octet-stream", "video/quicktime"):
         return guessed
@@ -501,7 +650,7 @@ def gdrive_download(file_id):
 
         if request.args.get("transcode") == "1":
             resp = app.response_class(
-                transcode_stream(gdrive_manager.stream_file_range(file_id, start=0, end=file_size - 1 if file_size > 0 else None)),
+                transcode_stream(gdrive_manager.stream_file_range(file_id, start=0, end=None)),
                 status=200,
                 mimetype="video/mp4",
                 direct_passthrough=True,
@@ -512,7 +661,7 @@ def gdrive_download(file_id):
 
         if request.args.get("transcode") == "audio":
             resp = app.response_class(
-                transcode_audio_stream(gdrive_manager.stream_file_range(file_id, start=0, end=file_size - 1 if file_size > 0 else None)),
+                transcode_audio_stream(gdrive_manager.stream_file_range(file_id, start=0, end=None)),
                 status=200,
                 mimetype="audio/mpeg",
                 direct_passthrough=True,
@@ -561,7 +710,7 @@ def gdrive_download(file_id):
             return resp
         else:
             resp = app.response_class(
-                gdrive_manager.stream_file_range(file_id, start=0, end=file_size - 1 if file_size > 0 else None),
+                gdrive_manager.stream_file_range(file_id, start=0, end=None),
                 status=200,
                 mimetype=mime,
                 direct_passthrough=True,
@@ -573,6 +722,7 @@ def gdrive_download(file_id):
             resp.headers["Content-Disposition"] = disposition
             return resp
     except Exception as e:
+        print(f"GDRIVE DOWNLOAD ERROR file_id={file_id}: {e}", flush=True)
         return jsonify({"error": str(e)}), 500
 
 @app.post("/api/gdrive/upload")
@@ -603,6 +753,7 @@ def gdrive_rename(file_id):
     if not new_name:
         return jsonify({"error": "New name is required"}), 400
     try:
+        _gd_meta_cache.pop(file_id, None)
         gdrive_manager.rename_file(file_id, new_name)
         return jsonify({"ok": True})
     except Exception as e:
@@ -635,6 +786,7 @@ def gdrive_zip():
 @auth.require_auth
 def gdrive_delete(file_id):
     try:
+        _gd_meta_cache.pop(file_id, None)
         gdrive_manager.delete_file(file_id)
         return jsonify({"ok": True})
     except Exception as e:
@@ -749,7 +901,6 @@ def transfer_items():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
 # ── SMB Proxy Credentials ─────────────────────────────────────────────────────
 @app.get("/api/smb/proxy-credentials")
 @auth.require_auth
@@ -766,11 +917,13 @@ def set_smb_proxy_creds():
     body = request.get_json(force=True) or {}
     username = (body.get("username") or "sagedrive").strip()
     password = (body.get("password") or "").strip()
+
     if not password:
         return jsonify({"error": "Password is required"}), 400
+
     creds_file = Path(os.environ.get("DATA_DIR", "/app/data")) / "smb_proxy_credentials.json"
     creds_file.write_text(json.dumps({"username": username, "password": password}, indent=2))
-    # Apply immediately — update the running smbd without full restart
+
     try:
         subprocess.run(["groupadd", "-f", "sambausers"], check=False)
         subprocess.run(["useradd", "-M", "-s", "/sbin/nologin", "-G", "sambausers", username],

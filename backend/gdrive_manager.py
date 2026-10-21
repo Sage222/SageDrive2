@@ -1,4 +1,5 @@
-import json, os, io, tempfile, zipfile, requests
+import json, os, io, time, threading, tempfile, zipfile, requests
+from datetime import datetime, timezone
 from pathlib import Path
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
@@ -10,6 +11,10 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 CREDS_FILE = DATA_DIR / "gdrive_token.json"
 CONFIG_FILE = DATA_DIR / "gdrive_client.json"
 SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+_creds_lock = threading.Lock()
+_meta_cache = {}
+_META_TTL = 120.0
 
 def _env_defaults():
     return {
@@ -46,8 +51,11 @@ def is_configured():
 def is_authenticated():
     if not CREDS_FILE.exists():
         return False
-    c = _load_creds()
-    return c is not None and (c.valid or bool(c.refresh_token))
+    try:
+        c = _load_creds()
+        return c is not None and (c.valid or bool(c.refresh_token))
+    except Exception:
+        return False
 
 def _client_config():
     cfg = get_config()
@@ -59,25 +67,50 @@ def _client_config():
         "token_uri": "https://oauth2.googleapis.com/token",
     }}
 
-def _load_creds():
-    if not CREDS_FILE.exists():
+def _parse_expiry(raw_expiry):
+    if not raw_expiry:
         return None
-    d = json.loads(CREDS_FILE.read_text())
-    cfg = get_config()
-    c = Credentials(
-        token=d.get("token"),
-        refresh_token=d.get("refresh_token"),
-        token_uri=d.get("token_uri", "https://oauth2.googleapis.com/token"),
-        client_id=d.get("client_id", cfg["client_id"]),
-        client_secret=d.get("client_secret", cfg["client_secret"]),
-        scopes=d.get("scopes", SCOPES),
-    )
-    if not c.valid and c.refresh_token:
-        c.refresh(Request())
-        _save_creds(c)
-    return c if c.valid else None
+    try:
+        dt = datetime.fromisoformat(str(raw_expiry).replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+    except Exception:
+        return None
+
+def _load_creds(force_refresh=False):
+    with _creds_lock:
+        if not CREDS_FILE.exists():
+            return None
+        d = json.loads(CREDS_FILE.read_text())
+        cfg = get_config()
+        expiry_dt = _parse_expiry(d.get("expiry"))
+        c = Credentials(
+            token=d.get("token"),
+            refresh_token=d.get("refresh_token"),
+            token_uri=d.get("token_uri", "https://oauth2.googleapis.com/token"),
+            client_id=d.get("client_id", cfg["client_id"]),
+            client_secret=d.get("client_secret", cfg["client_secret"]),
+            scopes=d.get("scopes", SCOPES),
+            expiry=expiry_dt,
+        )
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        needs_refresh = (
+            force_refresh
+            or not c.token
+            or expiry_dt is None
+            or not c.valid
+            or (expiry_dt - now_utc).total_seconds() < 300
+        )
+        if needs_refresh and c.refresh_token:
+            c.refresh(Request())
+            _save_creds(c)
+        return c if (c.token or c.valid) else None
 
 def _save_creds(c):
+    expiry_str = None
+    if getattr(c, "expiry", None) is not None:
+        expiry_str = c.expiry.isoformat()
     CREDS_FILE.write_text(json.dumps({
         "token": c.token,
         "refresh_token": c.refresh_token,
@@ -85,13 +118,14 @@ def _save_creds(c):
         "client_id": c.client_id,
         "client_secret": c.client_secret,
         "scopes": list(c.scopes or SCOPES),
+        "expiry": expiry_str,
     }, indent=2))
 
 def _svc():
     c = _load_creds()
     if not c:
         raise RuntimeError("Not authenticated with Google Drive")
-    return build("drive", "v3", credentials=c)
+    return build("drive", "v3", credentials=c, cache_discovery=False)
 
 def get_auth_url():
     cfg = get_config()
@@ -106,55 +140,106 @@ def handle_callback(code, state):
     _save_creds(flow.credentials)
 
 def revoke():
+    _meta_cache.clear()
     CREDS_FILE.unlink(missing_ok=True)
 
 def list_files(folder_id="root"):
     res = _svc().files().list(
         q=f"'{folder_id}' in parents and trashed=false",
         fields="files(id,name,mimeType,size,modifiedTime,parents)",
-        pageSize=200
+        pageSize=200,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
     ).execute()
     out = []
+    now = time.time()
     for f in res.get("files", []):
         is_folder = f["mimeType"] == "application/vnd.google-apps.folder"
+        size_val = int(f.get("size", 0) or 0)
+        _meta_cache[f["id"]] = (now, {
+            "name": f["name"],
+            "mimeType": f["mimeType"],
+            "size": size_val,
+        })
         out.append({
             "id": f["id"],
             "name": f["name"],
             "type": "folder" if is_folder else "file",
-            "size": int(f.get("size", 0)),
+            "size": size_val,
             "modified": f.get("modifiedTime", ""),
             "mimeType": f["mimeType"],
         })
     return out
 
 def get_file_meta(file_id):
+    now = time.time()
+    cached = _meta_cache.get(file_id)
+    if cached and (now - cached[0]) < _META_TTL:
+        return cached[1]
     svc = _svc()
-    meta = svc.files().get(fileId=file_id, fields="name,mimeType,size").execute()
-    return {
+    meta = svc.files().get(
+        fileId=file_id,
+        fields="name,mimeType,size",
+        supportsAllDrives=True,
+    ).execute()
+    info = {
         "name": meta.get("name", "download"),
         "mimeType": meta.get("mimeType", "application/octet-stream"),
         "size": int(meta.get("size", 0) or 0),
     }
+    _meta_cache[file_id] = (now, info)
+    return info
+
+def _open_media_response(file_id, start=None, end=None):
+    url = (
+        f"https://www.googleapis.com/drive/v3/files/{file_id}"
+        f"?alt=media&supportsAllDrives=true&acknowledgeAbuse=true"
+    )
+    for attempt in range(2):
+        c = _load_creds(force_refresh=(attempt > 0))
+        if not c:
+            raise RuntimeError("Not authenticated with Google Drive")
+        headers = {"Authorization": f"Bearer {c.token}"}
+        if start is not None and end is not None:
+            headers["Range"] = f"bytes={start}-{end}"
+        elif start:
+            headers["Range"] = f"bytes={start}-"
+        r = requests.get(url, headers=headers, stream=True, timeout=(15, 300))
+        if r.status_code in (401, 403) and attempt == 0:
+            r.close()
+            continue
+        if not r.ok:
+            err_body = ""
+            try:
+                err_body = r.text[:300]
+            except Exception:
+                pass
+            r.close()
+            raise RuntimeError(f"Google Drive stream failed ({r.status_code}): {err_body}")
+        return r
+    raise RuntimeError("Google Drive authentication failed after token refresh")
 
 def stream_file_range(file_id, start=0, end=None, chunk_size=262144):
-    c = _load_creds()
-    if not c:
-        raise RuntimeError("Not authenticated with Google Drive")
-    headers = {"Authorization": f"Bearer {c.token}"}
-    if start is not None and end is not None:
-        headers["Range"] = f"bytes={start}-{end}"
-    elif start:
-        headers["Range"] = f"bytes={start}-"
-    url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
-    with requests.get(url, headers=headers, stream=True, timeout=60) as r:
-        r.raise_for_status()
-        for chunk in r.iter_content(chunk_size=chunk_size):
-            if chunk:
-                yield chunk
+    r = _open_media_response(file_id, start=start, end=end)
+    def _gen():
+        try:
+            for chunk in r.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    yield chunk
+        finally:
+            try:
+                r.close()
+            except Exception:
+                pass
+    return _gen()
 
 def download_file(file_id):
     svc = _svc()
-    meta = svc.files().get(fileId=file_id, fields="name,mimeType").execute()
+    meta = svc.files().get(
+        fileId=file_id,
+        fields="name,mimeType",
+        supportsAllDrives=True,
+    ).execute()
     name, mime = meta["name"], meta["mimeType"]
     export_map = {
         "application/vnd.google-apps.document":
@@ -166,7 +251,7 @@ def download_file(file_id):
     }
     buf = io.BytesIO()
     req = svc.files().export_media(fileId=file_id, mimeType=export_map[mime]) \
-        if mime in export_map else svc.files().get_media(fileId=file_id)
+        if mime in export_map else svc.files().get_media(fileId=file_id, supportsAllDrives=True)
     dl = MediaIoBaseDownload(buf, req)
     done = False
     while not done:
@@ -188,7 +273,13 @@ def ensure_folder_path(base_folder_id, parts):
             f"'{curr_id}' in parents and name = '{safe_part}' "
             f"and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
         )
-        res = svc.files().list(q=q, fields="files(id)", pageSize=1).execute()
+        res = svc.files().list(
+            q=q,
+            fields="files(id)",
+            pageSize=1,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
         files = res.get("files", [])
         if files:
             curr_id = files[0]["id"]
@@ -200,6 +291,7 @@ def ensure_folder_path(base_folder_id, parts):
                     "mimeType": "application/vnd.google-apps.folder",
                 },
                 fields="id",
+                supportsAllDrives=True,
             ).execute()
             curr_id = created["id"]
     return curr_id
@@ -220,18 +312,22 @@ def upload_file(parent_id, filename, data, mime_type="application/octet-stream",
     svc.files().create(
         body={"name": actual_name, "parents": [target_parent]},
         media_body=media,
-        fields="id"
+        fields="id",
+        supportsAllDrives=True,
     ).execute()
 
 def rename_file(file_id, new_name):
+    _meta_cache.pop(file_id, None)
     return _svc().files().update(
         fileId=file_id,
         body={"name": new_name},
-        fields="id,name"
+        fields="id,name",
+        supportsAllDrives=True,
     ).execute()
 
 def delete_file(file_id):
-    _svc().files().delete(fileId=file_id).execute()
+    _meta_cache.pop(file_id, None)
+    _svc().files().delete(fileId=file_id, supportsAllDrives=True).execute()
 
 def create_folder(parent_id, name):
     f = _svc().files().create(
@@ -240,7 +336,8 @@ def create_folder(parent_id, name):
             "parents": [parent_id],
             "mimeType": "application/vnd.google-apps.folder",
         },
-        fields="id"
+        fields="id",
+        supportsAllDrives=True,
     ).execute()
     return f["id"]
 

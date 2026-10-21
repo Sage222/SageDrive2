@@ -44,6 +44,20 @@ def make_content_disposition(filename, is_download=False):
     encoded = quote(filename)
     return f"{disp_type}; filename=\"{safe_ascii}\"; filename*=UTF-8''{encoded}"
 
+def _stream_and_unlink_tmpfile(tmp_path, chunk_size=262144):
+    try:
+        with open(tmp_path, "rb") as fp:
+            while True:
+                data = fp.read(chunk_size)
+                if not data:
+                    break
+                yield data
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
 def transcode_stream(chunk_iterable):
     """
     Pipes raw media chunks from SMB/GDrive into ffmpeg and yields fragmented MP4
@@ -247,12 +261,52 @@ def smb_download(share_id):
 @auth.require_auth
 def smb_upload(share_id):
     dest = request.args.get("path", "/")
+    rel_path = (request.form.get("relative_path") or request.args.get("relative_path") or "").strip()
     f = request.files.get("file")
     if not f:
         return jsonify({"error": "No file provided"}), 400
     try:
-        smb_manager.upload_file(share_id, dest.rstrip("/") + "/" + f.filename, f.read())
+        sub_path = rel_path.lstrip("/") if rel_path else f.filename
+        target_path = dest.rstrip("/") + "/" + sub_path
+        smb_manager.upload_file(share_id, target_path, f.read())
         return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.post("/api/smb/rename/<share_id>")
+@auth.require_auth
+def smb_rename(share_id):
+    b = request.get_json(force=True) or {}
+    old_path = (b.get("path") or "").strip()
+    new_name = (b.get("new_name") or "").strip()
+    if not old_path or not new_name:
+        return jsonify({"error": "path and new_name are required"}), 400
+    try:
+        new_path = smb_manager.rename_path(share_id, old_path, new_name)
+        return jsonify({"ok": True, "path": new_path})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.post("/api/smb/zip/<share_id>")
+@auth.require_auth
+def smb_zip(share_id):
+    b = request.get_json(force=True) or {}
+    paths = b.get("paths") or []
+    if not paths:
+        return jsonify({"error": "No paths provided"}), 400
+    try:
+        tmp_path, zip_size = smb_manager.create_zip_tmpfile(share_id, paths)
+        archive_name = b.get("name") or "SageDrive_Download.zip"
+        resp = app.response_class(
+            _stream_and_unlink_tmpfile(tmp_path),
+            status=200,
+            mimetype="application/zip",
+            direct_passthrough=True,
+        )
+        resp.headers["Content-Length"] = str(zip_size)
+        resp.headers["Content-Disposition"] = make_content_disposition(archive_name, True)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -423,13 +477,55 @@ def gdrive_download(file_id):
 @auth.require_auth
 def gdrive_upload():
     folder_id = request.args.get("folder","root")
+    rel_path = (request.form.get("relative_path") or request.args.get("relative_path") or "").strip()
     f = request.files.get("file")
     if not f:
         return jsonify({"error": "No file provided"}), 400
     try:
-        gdrive_manager.upload_file(folder_id, f.filename, f.read(),
-                                   f.content_type or "application/octet-stream")
+        gdrive_manager.upload_file(
+            folder_id,
+            f.filename,
+            f.read(),
+            f.content_type or "application/octet-stream",
+            relative_path=rel_path or None,
+        )
         return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.post("/api/gdrive/rename/<file_id>")
+@auth.require_auth
+def gdrive_rename(file_id):
+    b = request.get_json(force=True) or {}
+    new_name = (b.get("name") or b.get("new_name") or "").strip()
+    if not new_name:
+        return jsonify({"error": "New name is required"}), 400
+    try:
+        gdrive_manager.rename_file(file_id, new_name)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.post("/api/gdrive/zip")
+@auth.require_auth
+def gdrive_zip():
+    b = request.get_json(force=True) or {}
+    ids = b.get("ids") or []
+    if not ids:
+        return jsonify({"error": "No file IDs provided"}), 400
+    try:
+        tmp_path, zip_size = gdrive_manager.create_zip_tmpfile(ids)
+        archive_name = b.get("name") or "GoogleDrive_Download.zip"
+        resp = app.response_class(
+            _stream_and_unlink_tmpfile(tmp_path),
+            status=200,
+            mimetype="application/zip",
+            direct_passthrough=True,
+        )
+        resp.headers["Content-Length"] = str(zip_size)
+        resp.headers["Content-Disposition"] = make_content_disposition(archive_name, True)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -449,6 +545,105 @@ def gdrive_mkdir():
     try:
         fid = gdrive_manager.create_folder(b.get("parent","root"), b.get("name","New Folder"))
         return jsonify({"id": fid})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ── Cross-Drive Transfer (SMB <-> Google Drive & SMB <-> SMB) ─────────────────
+def _copy_smb_item_to_gdrive(src_share, smb_path, is_folder, dest_folder_id):
+    name = smb_path.rstrip("/").split("/")[-1]
+    if is_folder:
+        new_folder_id = gdrive_manager.ensure_folder_path(dest_folder_id, [name])
+        for child in smb_manager.browse(src_share, smb_path):
+            _copy_smb_item_to_gdrive(
+                src_share,
+                child["path"],
+                child["type"] == "folder",
+                new_folder_id,
+            )
+    else:
+        data = smb_manager.read_file_bytes(src_share, smb_path)
+        mime = guess_media_mime(name)
+        gdrive_manager.upload_file(dest_folder_id, name, data, mime)
+
+def _copy_gdrive_item_to_smb(file_id, is_folder, dest_share, dest_smb_dir):
+    meta = gdrive_manager.get_file_meta(file_id)
+    name = meta["name"]
+    target_path = dest_smb_dir.rstrip("/") + "/" + name
+    if is_folder or meta["mimeType"] == "application/vnd.google-apps.folder":
+        smb_manager.create_directory(dest_share, target_path)
+        for child in gdrive_manager.list_files(file_id):
+            _copy_gdrive_item_to_smb(
+                child["id"],
+                child["type"] == "folder",
+                dest_share,
+                target_path,
+            )
+    else:
+        data, _, _ = gdrive_manager.download_file(file_id)
+        smb_manager.upload_file(dest_share, target_path, data)
+
+def _copy_smb_item_to_smb(src_share, smb_path, is_folder, dest_share, dest_smb_dir):
+    name = smb_path.rstrip("/").split("/")[-1]
+    target_path = dest_smb_dir.rstrip("/") + "/" + name
+    if is_folder:
+        smb_manager.create_directory(dest_share, target_path)
+        for child in smb_manager.browse(src_share, smb_path):
+            _copy_smb_item_to_smb(
+                src_share,
+                child["path"],
+                child["type"] == "folder",
+                dest_share,
+                target_path,
+            )
+    else:
+        data = smb_manager.read_file_bytes(src_share, smb_path)
+        smb_manager.upload_file(dest_share, target_path, data)
+
+def _copy_gdrive_item_to_gdrive(file_id, is_folder, dest_folder_id):
+    meta = gdrive_manager.get_file_meta(file_id)
+    name = meta["name"]
+    if is_folder or meta["mimeType"] == "application/vnd.google-apps.folder":
+        new_folder_id = gdrive_manager.ensure_folder_path(dest_folder_id, [name])
+        for child in gdrive_manager.list_files(file_id):
+            _copy_gdrive_item_to_gdrive(
+                child["id"],
+                child["type"] == "folder",
+                new_folder_id,
+            )
+    else:
+        data, _, mime = gdrive_manager.download_file(file_id)
+        gdrive_manager.upload_file(dest_folder_id, name, data, mime)
+
+@app.post("/api/transfer")
+@auth.require_auth
+def transfer_items():
+    b = request.get_json(force=True) or {}
+    src_type = b.get("src_type")
+    src_drive = b.get("src_drive")
+    dest_type = b.get("dest_type")
+    dest_drive = b.get("dest_drive")
+    dest_folder = b.get("dest_folder") or ("/" if dest_type == "smb" else "root")
+    items = b.get("items") or []
+
+    if not items:
+        return jsonify({"error": "No items selected for transfer"}), 400
+
+    try:
+        copied = 0
+        for item in items:
+            is_folder = item.get("type") == "folder"
+            if src_type == "smb" and dest_type == "gdrive":
+                _copy_smb_item_to_gdrive(src_drive, item["path"], is_folder, dest_folder)
+            elif src_type == "gdrive" and dest_type == "smb":
+                _copy_gdrive_item_to_smb(item["id"], is_folder, dest_drive, dest_folder)
+            elif src_type == "smb" and dest_type == "smb":
+                _copy_smb_item_to_smb(src_drive, item["path"], is_folder, dest_drive, dest_folder)
+            elif src_type == "gdrive" and dest_type == "gdrive":
+                _copy_gdrive_item_to_gdrive(item["id"], is_folder, dest_folder)
+            else:
+                return jsonify({"error": "Invalid source or destination type"}), 400
+            copied += 1
+        return jsonify({"ok": True, "copied": copied})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

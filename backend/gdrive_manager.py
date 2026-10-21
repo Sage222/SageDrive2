@@ -1,4 +1,4 @@
-import json, os, io, requests
+import json, os, io, tempfile, zipfile, requests
 from pathlib import Path
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
@@ -173,13 +173,61 @@ def download_file(file_id):
         _, done = dl.next_chunk()
     return buf.getvalue(), name, mime
 
-def upload_file(parent_id, filename, data, mime_type="application/octet-stream"):
+def ensure_folder_path(base_folder_id, parts):
+    """
+    Ensures nested folder segments exist under base_folder_id on Google Drive,
+    returning the leaf folder ID.
+    """
     svc = _svc()
+    curr_id = base_folder_id or "root"
+    for part in parts:
+        if not part:
+            continue
+        safe_part = part.replace("'", "\\'")
+        q = (
+            f"'{curr_id}' in parents and name = '{safe_part}' "
+            f"and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        )
+        res = svc.files().list(q=q, fields="files(id)", pageSize=1).execute()
+        files = res.get("files", [])
+        if files:
+            curr_id = files[0]["id"]
+        else:
+            created = svc.files().create(
+                body={
+                    "name": part,
+                    "parents": [curr_id],
+                    "mimeType": "application/vnd.google-apps.folder",
+                },
+                fields="id",
+            ).execute()
+            curr_id = created["id"]
+    return curr_id
+
+def upload_file(parent_id, filename, data, mime_type="application/octet-stream", relative_path=None):
+    svc = _svc()
+    target_parent = parent_id or "root"
+    actual_name = filename
+    if relative_path:
+        norm_rel = relative_path.replace("\\", "/").lstrip("/")
+        segments = [s for s in norm_rel.split("/") if s]
+        if len(segments) > 1:
+            target_parent = ensure_folder_path(target_parent, segments[:-1])
+            actual_name = segments[-1]
+        elif segments:
+            actual_name = segments[0]
     media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime_type, resumable=True)
     svc.files().create(
-        body={"name": filename, "parents": [parent_id]},
+        body={"name": actual_name, "parents": [target_parent]},
         media_body=media,
         fields="id"
+    ).execute()
+
+def rename_file(file_id, new_name):
+    return _svc().files().update(
+        fileId=file_id,
+        body={"name": new_name},
+        fields="id,name"
     ).execute()
 
 def delete_file(file_id):
@@ -195,3 +243,39 @@ def create_folder(parent_id, name):
         fields="id"
     ).execute()
     return f["id"]
+
+def create_zip_tmpfile(file_ids):
+    """
+    Creates a temporary .zip archive containing the specified Google Drive
+    files and folders (recursively). Returns (tmp_path, zip_size).
+    """
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    tmp.close()
+
+    def _add_item(zf, fid, arc_prefix):
+        meta = get_file_meta(fid)
+        name = meta["name"]
+        mime = meta["mimeType"]
+        arc_path = f"{arc_prefix}/{name}" if arc_prefix else name
+        if mime == "application/vnd.google-apps.folder":
+            children = list_files(fid)
+            if not children:
+                zf.writestr(arc_path.rstrip("/") + "/", b"")
+            for ch in children:
+                _add_item(zf, ch["id"], arc_path)
+        else:
+            data, _, _ = download_file(fid)
+            zf.writestr(arc_path, data)
+
+    try:
+        with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zf:
+            for fid in file_ids:
+                _add_item(zf, fid, "")
+        size = os.path.getsize(tmp.name)
+        return tmp.name, size
+    except Exception:
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
+        raise

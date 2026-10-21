@@ -5,6 +5,7 @@ import multer from 'multer';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import zlib from 'zlib';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 
@@ -60,13 +61,113 @@ function saveJson(file, data) {
   }
 }
 
+// Pure-Node ZIP archive builder (supports files and folders without external binary dependencies)
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) {
+      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    }
+    table[i] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(buf) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    crc = CRC_TABLE[(crc ^ buf[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function buildZipBuffer(entries) {
+  // entries: Array<{ arcPath: string, data: Buffer, isDir?: boolean }>
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+
+  for (const entry of entries) {
+    const rawName = entry.isDir
+      ? entry.arcPath.replace(/\/+$/, '') + '/'
+      : entry.arcPath.replace(/^\/+/, '');
+    const nameBuf = Buffer.from(rawName, 'utf-8');
+    const uncompressed = entry.isDir ? Buffer.alloc(0) : (entry.data || Buffer.alloc(0));
+    const crc = crc32(uncompressed);
+    const compressed = entry.isDir ? Buffer.alloc(0) : zlib.deflateRawSync(uncompressed);
+    const method = entry.isDir ? 0 : 8;
+
+    const localHeader = Buffer.alloc(30);
+    localHeader.writeUInt32LE(0x04034b50, 0); // signature
+    localHeader.writeUInt16LE(20, 4); // version needed
+    localHeader.writeUInt16LE(0x0800, 6); // UTF-8 flag
+    localHeader.writeUInt16LE(method, 8);
+    localHeader.writeUInt16LE(0, 10); // mod time
+    localHeader.writeUInt16LE(0x21, 12); // mod date
+    localHeader.writeUInt32LE(crc, 14);
+    localHeader.writeUInt32LE(compressed.length, 18);
+    localHeader.writeUInt32LE(uncompressed.length, 22);
+    localHeader.writeUInt16LE(nameBuf.length, 26);
+    localHeader.writeUInt16LE(0, 28);
+
+    localParts.push(localHeader, nameBuf, compressed);
+
+    const centralHeader = Buffer.alloc(46);
+    centralHeader.writeUInt32LE(0x02014b50, 0);
+    centralHeader.writeUInt16LE(20, 4);
+    centralHeader.writeUInt16LE(20, 6);
+    centralHeader.writeUInt16LE(0x0800, 8);
+    centralHeader.writeUInt16LE(method, 10);
+    centralHeader.writeUInt16LE(0, 12);
+    centralHeader.writeUInt16LE(0x21, 14);
+    centralHeader.writeUInt32LE(crc, 16);
+    centralHeader.writeUInt32LE(compressed.length, 20);
+    centralHeader.writeUInt32LE(uncompressed.length, 24);
+    centralHeader.writeUInt16LE(nameBuf.length, 28);
+    centralHeader.writeUInt16LE(0, 30);
+    centralHeader.writeUInt16LE(0, 32);
+    centralHeader.writeUInt16LE(0, 34);
+    centralHeader.writeUInt16LE(0, 36);
+    centralHeader.writeUInt32LE(entry.isDir ? 0x10 : 0, 38);
+    centralHeader.writeUInt32LE(offset, 42);
+
+    centralParts.push(centralHeader, nameBuf);
+    offset += localHeader.length + nameBuf.length + compressed.length;
+  }
+
+  const centralSize = centralParts.reduce((acc, b) => acc + b.length, 0);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(0, 4);
+  eocd.writeUInt16LE(0, 6);
+  eocd.writeUInt16LE(entries.length, 8);
+  eocd.writeUInt16LE(entries.length, 10);
+  eocd.writeUInt32LE(centralSize, 12);
+  eocd.writeUInt32LE(offset, 16);
+  eocd.writeUInt16LE(0, 20);
+
+  return Buffer.concat([...localParts, ...centralParts, eocd]);
+}
+
+function getItemBuffer(item) {
+  if (!item) return Buffer.alloc(0);
+  if (item.blobPath && fs.existsSync(item.blobPath)) {
+    return fs.readFileSync(item.blobPath);
+  }
+  if (item.data) {
+    return Buffer.from(item.data);
+  }
+  return Buffer.alloc(0);
+}
+
 // Accurate MIME type lookup for media streaming and file downloads
 function getMimeType(filename, fallbackMime) {
   const ext = String(filename || '').split('.').pop().toLowerCase();
   const mimeMap = {
     mp4: 'video/mp4',
     m4v: 'video/mp4',
-    mov: 'video/mp4', // Serve .mov as video/mp4 so Chromium/Firefox HTML5 video player demuxes H.264/AAC instead of rejecting video/quicktime
+    mov: 'video/mp4',
     webm: 'video/webm',
     ogv: 'video/ogg',
     mkv: 'video/webm',
@@ -115,13 +216,12 @@ function ensureSampleMediaFiles() {
     const dataSize = numSamples * numChannels * bytesPerSample;
     const buf = Buffer.alloc(44 + dataSize);
 
-    // WAV Header
     buf.write('RIFF', 0);
     buf.writeUInt32LE(36 + dataSize, 4);
     buf.write('WAVE', 8);
     buf.write('fmt ', 12);
-    buf.writeUInt32LE(16, 16); // PCM chunk size
-    buf.writeUInt16LE(1, 20);  // PCM format
+    buf.writeUInt32LE(16, 16);
+    buf.writeUInt16LE(1, 20);
     buf.writeUInt16LE(numChannels, 22);
     buf.writeUInt32LE(sampleRate, 24);
     buf.writeUInt32LE(sampleRate * numChannels * bytesPerSample, 28);
@@ -130,7 +230,6 @@ function ensureSampleMediaFiles() {
     buf.write('data', 36);
     buf.writeUInt32LE(dataSize, 40);
 
-    // Synthesize a warm stereo chord progression (Cmaj7 -> Fmaj7)
     const chords = [
       [261.63, 329.63, 392.00, 493.88],
       [349.23, 440.00, 523.25, 659.25],
@@ -310,7 +409,6 @@ function ensureShareFS(shareId) {
     smbFSData[shareId] = shareEntries;
     saveSmbFS();
   } else {
-    // Ensure sample video appears once ffmpeg finishes generating it
     const entries = smbFSData[shareId];
     if (
       entries['/Media'] &&
@@ -399,6 +497,13 @@ function requireAuth(req, res, next) {
   next();
 }
 
+function makeDispositionHeader(filename, isDownload) {
+  const safeAsciiName = filename.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
+  const encodedName = encodeURIComponent(filename);
+  const dispositionType = isDownload ? 'attachment' : 'inline';
+  return `${dispositionType}; filename="${safeAsciiName}"; filename*=UTF-8''${encodedName}`;
+}
+
 // Unified streaming & Range response handler for both SMB and Google Drive files
 function streamFileResponse(req, res, item) {
   if (!item || item.type === 'folder') {
@@ -407,7 +512,6 @@ function streamFileResponse(req, res, item) {
 
   let blobPath = item.blobPath;
   if (!blobPath || !fs.existsSync(blobPath)) {
-    // Fallback if legacy buffer data exists
     if (item.data) {
       blobPath = path.join(BLOBS_DIR, `legacy_${crypto.randomBytes(6).toString('hex')}_${path.basename(item.name)}`);
       fs.writeFileSync(blobPath, Buffer.from(item.data));
@@ -420,13 +524,8 @@ function streamFileResponse(req, res, item) {
   const stat = fs.statSync(blobPath);
   const fileSize = stat.size;
   const filename = item.name || 'download';
-  const safeAsciiName = filename.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
-  const encodedName = encodeURIComponent(filename);
-  const isDownload = Boolean(req.query.dl);
-  const dispositionType = isDownload ? 'attachment' : 'inline';
-  const disposition = `${dispositionType}; filename="${safeAsciiName}"; filename*=UTF-8''${encodedName}`;
+  const disposition = makeDispositionHeader(filename, Boolean(req.query.dl));
 
-  // On-the-fly ffmpeg fragmented MP4 transcoding fallback when ?transcode=1 is requested
   if (req.query.transcode === '1') {
     res.writeHead(200, {
       'Content-Type': 'video/mp4',
@@ -462,7 +561,6 @@ function streamFileResponse(req, res, item) {
     let end = m[2] ? parseInt(m[2], 10) : fileSize - 1;
 
     if (!m[1] && m[2]) {
-      // Suffix byte range: bytes=-500
       const suffixLength = parseInt(m[2], 10);
       start = Math.max(0, fileSize - suffixLength);
       end = fileSize - 1;
@@ -477,7 +575,7 @@ function streamFileResponse(req, res, item) {
     const chunkLength = end - start + 1;
 
     res.writeHead(206, {
-      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+      'Content-Range': `bytes ${start}-{end}/${fileSize}`.replace('{end}', String(end)),
       'Accept-Ranges': 'bytes',
       'Content-Length': String(chunkLength),
       'Content-Type': mime,
@@ -554,9 +652,26 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
   return res.json({ username: req.session.username, role: req.session.role });
 });
 
-// ── SMB ───────────────────────────────────────────────────────────────────────
+// ── SMB Helpers & Routes ──────────────────────────────────────────────────────
 function listShares() {
   return loadJson(SHARES_FILE, []);
+}
+
+function ensureSmbParentDirs(entries, fullFilePath) {
+  const parts = fullFilePath.split('/').filter(Boolean);
+  let built = '';
+  for (let i = 0; i < parts.length - 1; i++) {
+    built += '/' + parts[i];
+    if (!entries[built]) {
+      entries[built] = {
+        name: parts[i],
+        type: 'folder',
+        size: 0,
+        modified: Math.floor(Date.now() / 1000),
+        path: built,
+      };
+    }
+  }
 }
 
 app.get('/api/smb/shares', requireAuth, (req, res) => {
@@ -631,23 +746,122 @@ app.get('/api/smb/download/:share_id', requireAuth, (req, res) => {
 app.post('/api/smb/upload/:share_id', requireAuth, upload.single('file'), (req, res) => {
   const { share_id } = req.params;
   const dest = (req.query.path || '/').replace(/\/+$/, '');
+  const relPath = String(req.body?.relative_path || req.query?.relative_path || '').trim().replace(/^\/+/, '');
   const f = req.file;
   if (!f) {
     return res.status(400).json({ error: 'No file provided' });
   }
   const entries = ensureShareFS(share_id);
-  const fullPath = `${dest}/${f.originalname}`;
+  const subPath = relPath || f.originalname;
+  const fullPath = `${dest}/${subPath}`;
+  ensureSmbParentDirs(entries, fullPath);
+  const actualName = path.posix.basename(fullPath);
   entries[fullPath] = {
-    name: f.originalname,
+    name: actualName,
     type: 'file',
     size: f.size,
     modified: Math.floor(Date.now() / 1000),
     path: fullPath,
     blobPath: f.path,
-    mimeType: getMimeType(f.originalname, f.mimetype),
+    mimeType: getMimeType(actualName, f.mimetype),
   };
   saveSmbFS();
   return res.json({ ok: true });
+});
+
+app.post('/api/smb/rename/:share_id', requireAuth, (req, res) => {
+  const { share_id } = req.params;
+  const b = req.body || {};
+  const oldPath = String(b.path || '').replace(/\/+$/, '');
+  const newName = String(b.new_name || '').trim();
+  if (!oldPath || !newName) {
+    return res.status(400).json({ error: 'path and new_name are required' });
+  }
+  const entries = ensureShareFS(share_id);
+  const item = entries[oldPath];
+  if (!item) {
+    return res.status(404).json({ error: 'Item not found' });
+  }
+  const parentDir = path.posix.dirname(oldPath);
+  const newPath = parentDir === '/' ? `/${newName}` : `${parentDir}/${newName}`;
+  if (entries[newPath] && newPath !== oldPath) {
+    return res.status(400).json({ error: 'An item with that name already exists' });
+  }
+
+  delete entries[oldPath];
+  entries[newPath] = {
+    ...item,
+    name: newName,
+    path: newPath,
+    modified: Math.floor(Date.now() / 1000),
+  };
+
+  if (item.type === 'folder') {
+    const oldPrefix = oldPath + '/';
+    const newPrefix = newPath + '/';
+    for (const [k, child] of Object.entries(entries)) {
+      if (k.startsWith(oldPrefix)) {
+        const updatedChildPath = newPrefix + k.slice(oldPrefix.length);
+        delete entries[k];
+        entries[updatedChildPath] = {
+          ...child,
+          path: updatedChildPath,
+        };
+      }
+    }
+  }
+
+  saveSmbFS();
+  return res.json({ ok: true, path: newPath });
+});
+
+app.post('/api/smb/zip/:share_id', requireAuth, (req, res) => {
+  const { share_id } = req.params;
+  const b = req.body || {};
+  const reqPaths = Array.isArray(b.paths) ? b.paths : [];
+  if (!reqPaths.length) {
+    return res.status(400).json({ error: 'No paths provided' });
+  }
+  const entries = ensureShareFS(share_id);
+  const zipItems = [];
+
+  function addSmbPathToZip(smbPath, arcPrefix) {
+    const norm = smbPath.replace(/\/+$/, '');
+    const item = entries[norm];
+    if (!item) return;
+    if (item.type === 'folder') {
+      const prefix = norm + '/';
+      const children = Object.values(entries).filter((c) => path.posix.dirname(c.path) === norm);
+      if (children.length === 0) {
+        zipItems.push({ arcPath: arcPrefix, isDir: true });
+      } else {
+        for (const ch of children) {
+          addSmbPathToZip(ch.path, `${arcPrefix}/${ch.name}`);
+        }
+      }
+    } else {
+      zipItems.push({
+        arcPath: arcPrefix,
+        data: getItemBuffer(item),
+      });
+    }
+  }
+
+  for (const p of reqPaths) {
+    const norm = String(p || '').replace(/\/+$/, '');
+    const base = path.posix.basename(norm) || 'folder';
+    addSmbPathToZip(norm, base);
+  }
+
+  const zipBuf = buildZipBuffer(zipItems);
+  const archiveName = b.name || 'SageDrive_Download.zip';
+  res.writeHead(200, {
+    'Content-Type': 'application/zip',
+    'Content-Length': String(zipBuf.length),
+    'Content-Disposition': makeDispositionHeader(archiveName, true),
+    'Cache-Control': 'no-cache',
+  });
+  return res.end(zipBuf);
 });
 
 app.delete('/api/smb/delete/:share_id', requireAuth, (req, res) => {
@@ -673,20 +887,13 @@ app.post('/api/smb/mkdir/:share_id', requireAuth, (req, res) => {
   if (!rawPath) {
     return res.status(400).json({ error: 'Path required' });
   }
-  const name = path.posix.basename(rawPath);
   const entries = ensureShareFS(share_id);
-  entries[rawPath] = {
-    name,
-    type: 'folder',
-    size: 0,
-    modified: Math.floor(Date.now() / 1000),
-    path: rawPath,
-  };
+  ensureSmbParentDirs(entries, rawPath + '/placeholder');
   saveSmbFS();
   return res.json({ ok: true });
 });
 
-// ── Google Drive ──────────────────────────────────────────────────────────────
+// ── Google Drive Helpers & Routes ─────────────────────────────────────────────
 function getGDriveConfig() {
   const defaults = {
     client_id: process.env.GOOGLE_CLIENT_ID || '',
@@ -709,6 +916,32 @@ function isGDriveConfigured() {
 function isGDriveAuthenticated() {
   const creds = loadJson(GDRIVE_CREDS_FILE, null);
   return Boolean(creds && creds.token);
+}
+
+function ensureGDriveFolderPath(baseFolderId, parts) {
+  let currId = baseFolderId || 'root';
+  for (const part of parts) {
+    if (!part) continue;
+    const existing = Object.values(gdriveFSData).find(
+      (f) => f.parent === currId && f.type === 'folder' && f.name === part
+    );
+    if (existing) {
+      currId = existing.id;
+    } else {
+      const newId = 'folder-' + crypto.randomBytes(6).toString('hex');
+      gdriveFSData[newId] = {
+        id: newId,
+        name: part,
+        type: 'folder',
+        size: 0,
+        modified: new Date().toISOString(),
+        mimeType: 'application/vnd.google-apps.folder',
+        parent: currId,
+      };
+      currId = newId;
+    }
+  }
+  return currId;
 }
 
 app.get('/api/gdrive/status', requireAuth, (req, res) => {
@@ -764,7 +997,6 @@ app.delete('/api/gdrive/revoke', requireAuth, (req, res) => {
 
 app.get('/api/gdrive/files', requireAuth, (req, res) => {
   const folderId = req.query.folder || 'root';
-  // Ensure sample video is added to Google Drive Media folder once generated
   if (
     !gdriveFSData['file-sample-video'] &&
     fs.existsSync(SAMPLE_MP4_PATH) &&
@@ -806,28 +1038,111 @@ app.get('/api/gdrive/download/:file_id', requireAuth, (req, res) => {
 
 app.post('/api/gdrive/upload', requireAuth, upload.single('file'), (req, res) => {
   const folderId = req.query.folder || 'root';
+  const relPath = String(req.body?.relative_path || req.query?.relative_path || '').trim().replace(/^\/+/, '');
   const f = req.file;
   if (!f) {
     return res.status(400).json({ error: 'No file provided' });
   }
+  let targetParent = folderId;
+  let actualName = f.originalname;
+  if (relPath) {
+    const parts = relPath.split('/').filter(Boolean);
+    if (parts.length > 1) {
+      targetParent = ensureGDriveFolderPath(folderId, parts.slice(0, -1));
+      actualName = parts[parts.length - 1];
+    } else if (parts.length === 1) {
+      actualName = parts[0];
+    }
+  }
   const id = 'file-' + crypto.randomBytes(6).toString('hex');
   gdriveFSData[id] = {
     id,
-    name: f.originalname,
+    name: actualName,
     type: 'file',
     size: f.size,
     modified: new Date().toISOString(),
-    mimeType: getMimeType(f.originalname, f.mimetype),
-    parent: folderId,
+    mimeType: getMimeType(actualName, f.mimetype),
+    parent: targetParent,
     blobPath: f.path,
   };
   saveGDriveFS();
   return res.json({ ok: true });
 });
 
+app.post('/api/gdrive/rename/:file_id', requireAuth, (req, res) => {
+  const { file_id } = req.params;
+  const b = req.body || {};
+  const newName = String(b.name || b.new_name || '').trim();
+  if (!newName) {
+    return res.status(400).json({ error: 'New name is required' });
+  }
+  const item = gdriveFSData[file_id];
+  if (!item) {
+    return res.status(404).json({ error: 'File not found' });
+  }
+  item.name = newName;
+  item.modified = new Date().toISOString();
+  saveGDriveFS();
+  return res.json({ ok: true });
+});
+
+app.post('/api/gdrive/zip', requireAuth, (req, res) => {
+  const b = req.body || {};
+  const ids = Array.isArray(b.ids) ? b.ids : [];
+  if (!ids.length) {
+    return res.status(400).json({ error: 'No file IDs provided' });
+  }
+  const zipItems = [];
+
+  function addGDriveItemToZip(fid, arcPrefix) {
+    const item = gdriveFSData[fid];
+    if (!item) return;
+    const arcPath = arcPrefix ? `${arcPrefix}/${item.name}` : item.name;
+    if (item.type === 'folder') {
+      const children = Object.values(gdriveFSData).filter((c) => c.parent === fid);
+      if (children.length === 0) {
+        zipItems.push({ arcPath, isDir: true });
+      } else {
+        for (const ch of children) {
+          addGDriveItemToZip(ch.id, arcPath);
+        }
+      }
+    } else {
+      zipItems.push({
+        arcPath,
+        data: getItemBuffer(item),
+      });
+    }
+  }
+
+  for (const id of ids) {
+    addGDriveItemToZip(id, '');
+  }
+
+  const zipBuf = buildZipBuffer(zipItems);
+  const archiveName = b.name || 'GoogleDrive_Download.zip';
+  res.writeHead(200, {
+    'Content-Type': 'application/zip',
+    'Content-Length': String(zipBuf.length),
+    'Content-Disposition': makeDispositionHeader(archiveName, true),
+    'Cache-Control': 'no-cache',
+  });
+  return res.end(zipBuf);
+});
+
 app.delete('/api/gdrive/delete/:file_id', requireAuth, (req, res) => {
   const { file_id } = req.params;
-  delete gdriveFSData[file_id];
+  function deleteRecursive(fid) {
+    const item = gdriveFSData[fid];
+    if (!item) return;
+    if (item.type === 'folder') {
+      for (const ch of Object.values(gdriveFSData)) {
+        if (ch.parent === fid) deleteRecursive(ch.id);
+      }
+    }
+    delete gdriveFSData[fid];
+  }
+  deleteRecursive(file_id);
   saveGDriveFS();
   return res.json({ ok: true });
 });
@@ -848,6 +1163,174 @@ app.post('/api/gdrive/mkdir', requireAuth, (req, res) => {
   };
   saveGDriveFS();
   return res.json({ id });
+});
+
+// ── Cross-Drive Transfer (SMB <-> Google Drive & SMB <-> SMB) ─────────────────
+function copyBlobFile(srcItem, nameHint) {
+  const buf = getItemBuffer(srcItem);
+  const ext = path.extname(nameHint || srcItem?.name || '') || '';
+  const newBlobPath = path.join(BLOBS_DIR, `copy_${Date.now()}_${crypto.randomBytes(6).toString('hex')}${ext}`);
+  fs.writeFileSync(newBlobPath, buf);
+  return { blobPath: newBlobPath, size: buf.length };
+}
+
+function copySmbItemToGDrive(srcShare, smbPath, destFolderId) {
+  const entries = ensureShareFS(srcShare);
+  const norm = smbPath.replace(/\/+$/, '');
+  const item = entries[norm];
+  if (!item) return;
+  if (item.type === 'folder') {
+    const newFolderId = ensureGDriveFolderPath(destFolderId, [item.name]);
+    const children = Object.values(entries).filter((c) => path.posix.dirname(c.path) === norm);
+    for (const ch of children) {
+      copySmbItemToGDrive(srcShare, ch.path, newFolderId);
+    }
+  } else {
+    const { blobPath, size } = copyBlobFile(item, item.name);
+    const id = 'file-' + crypto.randomBytes(6).toString('hex');
+    gdriveFSData[id] = {
+      id,
+      name: item.name,
+      type: 'file',
+      size,
+      modified: new Date().toISOString(),
+      mimeType: getMimeType(item.name, item.mimeType),
+      parent: destFolderId || 'root',
+      blobPath,
+    };
+  }
+}
+
+function copyGDriveItemToSmb(fileId, destShare, destSmbDir) {
+  const item = gdriveFSData[fileId];
+  if (!item) return;
+  const entries = ensureShareFS(destShare);
+  const baseDir = (destSmbDir || '/').replace(/\/+$/, '');
+  const targetPath = `${baseDir}/${item.name}`;
+  ensureSmbParentDirs(entries, targetPath);
+
+  if (item.type === 'folder') {
+    entries[targetPath] = {
+      name: item.name,
+      type: 'folder',
+      size: 0,
+      modified: Math.floor(Date.now() / 1000),
+      path: targetPath,
+    };
+    const children = Object.values(gdriveFSData).filter((c) => c.parent === fileId);
+    for (const ch of children) {
+      copyGDriveItemToSmb(ch.id, destShare, targetPath);
+    }
+  } else {
+    const { blobPath, size } = copyBlobFile(item, item.name);
+    entries[targetPath] = {
+      name: item.name,
+      type: 'file',
+      size,
+      modified: Math.floor(Date.now() / 1000),
+      path: targetPath,
+      blobPath,
+      mimeType: getMimeType(item.name, item.mimeType),
+    };
+  }
+}
+
+function copySmbItemToSmb(srcShare, smbPath, destShare, destSmbDir) {
+  const srcEntries = ensureShareFS(srcShare);
+  const destEntries = ensureShareFS(destShare);
+  const norm = smbPath.replace(/\/+$/, '');
+  const item = srcEntries[norm];
+  if (!item) return;
+  const baseDir = (destSmbDir || '/').replace(/\/+$/, '');
+  const targetPath = `${baseDir}/${item.name}`;
+  ensureSmbParentDirs(destEntries, targetPath);
+
+  if (item.type === 'folder') {
+    destEntries[targetPath] = {
+      name: item.name,
+      type: 'folder',
+      size: 0,
+      modified: Math.floor(Date.now() / 1000),
+      path: targetPath,
+    };
+    const children = Object.values(srcEntries).filter((c) => path.posix.dirname(c.path) === norm);
+    for (const ch of children) {
+      copySmbItemToSmb(srcShare, ch.path, destShare, targetPath);
+    }
+  } else {
+    const { blobPath, size } = copyBlobFile(item, item.name);
+    destEntries[targetPath] = {
+      name: item.name,
+      type: 'file',
+      size,
+      modified: Math.floor(Date.now() / 1000),
+      path: targetPath,
+      blobPath,
+      mimeType: getMimeType(item.name, item.mimeType),
+    };
+  }
+}
+
+function copyGDriveItemToGDrive(fileId, destFolderId) {
+  const item = gdriveFSData[fileId];
+  if (!item) return;
+  if (item.type === 'folder') {
+    const newFolderId = ensureGDriveFolderPath(destFolderId, [item.name]);
+    const children = Object.values(gdriveFSData).filter((c) => c.parent === fileId);
+    for (const ch of children) {
+      copyGDriveItemToGDrive(ch.id, newFolderId);
+    }
+  } else {
+    const { blobPath, size } = copyBlobFile(item, item.name);
+    const id = 'file-' + crypto.randomBytes(6).toString('hex');
+    gdriveFSData[id] = {
+      id,
+      name: item.name,
+      type: 'file',
+      size,
+      modified: new Date().toISOString(),
+      mimeType: getMimeType(item.name, item.mimeType),
+      parent: destFolderId || 'root',
+      blobPath,
+    };
+  }
+}
+
+app.post('/api/transfer', requireAuth, (req, res) => {
+  const b = req.body || {};
+  const srcType = b.src_type;
+  const srcDrive = b.src_drive;
+  const destType = b.dest_type;
+  const destDrive = b.dest_drive;
+  const destFolder = b.dest_folder || (destType === 'smb' ? '/' : 'root');
+  const items = Array.isArray(b.items) ? b.items : [];
+
+  if (!items.length) {
+    return res.status(400).json({ error: 'No items selected for transfer' });
+  }
+
+  try {
+    let copied = 0;
+    for (const it of items) {
+      if (srcType === 'smb' && destType === 'gdrive') {
+        copySmbItemToGDrive(srcDrive, it.path, destFolder);
+      } else if (srcType === 'gdrive' && destType === 'smb') {
+        copyGDriveItemToSmb(it.id, destDrive, destFolder);
+      } else if (srcType === 'smb' && destType === 'smb') {
+        copySmbItemToSmb(srcDrive, it.path, destDrive, destFolder);
+      } else if (srcType === 'gdrive' && destType === 'gdrive') {
+        copyGDriveItemToGDrive(it.id, destFolder);
+      } else {
+        return res.status(400).json({ error: 'Invalid source or destination type' });
+      }
+      copied++;
+    }
+    saveSmbFS();
+    saveGDriveFS();
+    return res.json({ ok: true, copied });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 // ── SMB Proxy Credentials ─────────────────────────────────────────────────────

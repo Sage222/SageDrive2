@@ -153,32 +153,92 @@
     .file-item-grid{background:var(--color-surface);border:1px solid var(--color-border);
                     border-radius:var(--radius-lg);padding:var(--space-4);
                     cursor:pointer;display:flex;flex-direction:column;align-items:center;
-                    gap:var(--space-2);text-align:center;
+                    gap:var(--space-2);text-align:center;position:relative;
                     transition:all var(--transition-interactive)}
-    .grid-dl-btn{position:absolute;top:var(--space-1);right:var(--space-1);
+    .file-item-grid.selected{border-color:var(--color-primary);
+                             background:oklch(from var(--color-primary) l c h/.1)}
+    .grid-dl-btn{position:absolute;top:var(--space-2);right:var(--space-2);
                   opacity:0;transition:opacity var(--transition-interactive);
                   background:var(--color-surface);border-radius:var(--radius-sm);padding:2px}
-    .file-item-grid:hover .grid-dl-btn{opacity:1}
+    .grid-select-cb{position:absolute;top:var(--space-2);left:var(--space-2);
+                    width:16px;height:16px;accent-color:var(--color-primary);
+                    opacity:0;transition:opacity var(--transition-interactive);cursor:pointer}
+    .file-item-grid:hover .grid-dl-btn,
+    .file-item-grid:hover .grid-select-cb,
+    .file-item-grid.selected .grid-select-cb{opacity:1}
     .file-item-grid:hover{background:var(--color-surface-offset);
                           box-shadow:var(--shadow-md);transform:translateY(-1px)}
     .file-item-list{display:flex;align-items:center;gap:var(--space-3);
-                    padding:var(--space-3) var(--space-4);
+                    padding:var(--space-2) var(--space-4);min-height:48px;
                     border-bottom:1px solid var(--color-divider);cursor:pointer;
                     transition:background var(--transition-interactive)}
     .file-item-list:hover{background:var(--color-surface-offset)}
+    .file-item-list.selected{background:oklch(from var(--color-primary) l c h/.1)}
     .file-item-list:last-child{border-bottom:none}
-    .file-icon{width:40px;height:40px;display:flex;align-items:center;justify-content:center;
-               border-radius:var(--radius-md);background:var(--color-surface-offset)}
+    .list-select-cb{width:16px;height:16px;accent-color:var(--color-primary);
+                    cursor:pointer;flex-shrink:0}
+    .file-icon{width:36px;height:36px;display:flex;align-items:center;justify-content:center;
+               border-radius:var(--radius-md);background:var(--color-surface-offset);flex-shrink:0}
     .file-icon-grid{width:48px;height:48px;display:flex;align-items:center;justify-content:center;
                     border-radius:var(--radius-lg);background:var(--color-surface-offset)}
     .file-name{font-size:var(--text-sm);font-weight:500;
                overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:140px}
-    .file-meta{font-size:var(--text-xs);color:var(--color-text-muted)}
+    .file-meta{font-size:var(--text-xs);color:var(--color-text-muted);
+               font-variant-numeric:tabular-nums}
     .file-actions{display:flex;gap:var(--space-1);margin-left:auto;opacity:0;
                   transition:opacity var(--transition-interactive)}
     .file-item-list:hover .file-actions{opacity:1}
 
-    .toolbar{display:flex;align-items:center;gap:var(--space-3);
+    /* Batch selection bar */
+    .batch-bar{display:flex;align-items:center;justify-content:space-between;
+               gap:var(--space-3);padding:var(--space-2) var(--space-4);
+               margin-bottom:var(--space-3);background:var(--color-surface);
+               border:1px solid var(--color-primary);border-radius:var(--radius-lg);
+               box-shadow:var(--shadow-sm);flex-wrap:wrap}
+    .batch-bar-left{display:flex;align-items:center;gap:var(--space-3);font-size:var(--text-sm);font-weight:500}
+    .batch-count{font-family:var(--font-mono);font-size:var(--text-xs);
+                 background:var(--color-primary);color:#fff;padding:2px 8px;
+                 border-radius:var(--radius-sm);font-variant-numeric:tabular-nums}
+    .batch-bar-actions{display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap}
+
+    /* Right-click context menu */
+    .context-menu{position:fixed;z-index:300;min-width:200px;
+                  background:var(--color-surface-2);border:1px solid var(--color-border);
+                  border-radius:var(--radius-lg);box-shadow:var(--shadow-lg);
+                  padding:var(--space-1);display:none;flex-direction:column;
+                  animation:ctx-in 120ms cubic-bezier(.16,1,.3,1)}
+    @keyframes ctx-in{from{opacity:0;transform:scale(.96)}to{opacity:1;transform:none}}
+    .ctx-item{display:flex;align-items:center;gap:var(--space-3);
+              padding:var(--space-2) var(--space-3);border-radius:var(--radius-sm);
+              font-size:var(--text-sm);color:var(--color-text);cursor:pointer;
+              text-align:left;width:100%}
+    .ctx-item svg{width:15px;height:15px;color:var(--color-text-muted);flex-shrink:0}
+    .ctx-item:hover{background:var(--color-surface-offset)}
+    .ctx-item:hover svg{color:var(--color-text)}
+    .ctx-item.danger{color:var(--color-error)}
+    .ctx-item.danger svg{color:var(--color-error)}
+    .ctx-item.danger:hover{background:oklch(from var(--color-error) l c h/.12)}
+    .ctx-divider{height:1px;background:var(--color-divider);margin:var(--space-1) 0}
+
+    /* Media player controls */
+    .media-controls-bar{display:flex;align-items:center;justify-content:space-between;
+                        gap:var(--space-3);padding:var(--space-2) var(--space-3);
+                        background:var(--color-surface-offset);border-radius:var(--radius-md);
+                        flex-wrap:wrap}
+    .media-nav-group{display:flex;align-items:center;gap:var(--space-2)}
+    .media-track-badge{font-family:var(--font-mono);font-size:var(--text-xs);
+                       color:var(--color-text-muted);font-variant-numeric:tabular-nums;
+                       padding:0 var(--space-1)}
+    .speed-group{display:inline-flex;align-items:center;background:var(--color-surface);
+                 border:1px solid var(--color-border);border-radius:var(--radius-md);
+                 padding:2px;gap:2px}
+    .speed-btn{font-family:var(--font-mono);font-size:11px;padding:2px 6px;
+               border-radius:calc(var(--radius-sm) - 1px);color:var(--color-text-muted);
+               font-variant-numeric:tabular-nums}
+    .speed-btn:hover{color:var(--color-text)}
+    .speed-btn.active{background:var(--color-primary);color:#fff;font-weight:500}
+
+    .toolbar{display:flex;align-items:center;gap:var(--space-2);
              margin-bottom:var(--space-5);flex-wrap:wrap}
     .view-toggle{display:flex;background:var(--color-surface-offset);
                  border-radius:var(--radius-md);padding:2px;gap:2px}
@@ -368,6 +428,7 @@
 
 <div class="toast-container" id="toasts"></div>
 <div id="modal-root"></div>
+<div class="context-menu" id="context-menu"></div>
 
 <script>
 const API = '';
@@ -384,6 +445,12 @@ let _shares    = [];
 let _gdStatus  = {configured:false, authenticated:false};
 let _gdConfig  = {client_id:'', client_secret:'', redirect_uri:''};
 let smbProxyCreds = {username:'sagedrive', configured:false};
+let _currentFiles = [];
+let _selectedItems = new Map();
+let _mediaPlaylist = [];
+let _mediaIndex = -1;
+let _playbackRate = 1;
+let _autoPlayNext = true;
 
 async function apiFetch(path, opts={}) {
   const headers = { ...(opts.headers||{}) };
@@ -568,13 +635,95 @@ function gDriveBreadcrumbs() {
   }));
 }
 
-function renderFileView(files, type) {
+function itemKey(f, type) {
+  return type === 'smb' ? (f.path || f.name) : f.id;
+}
+
+function clearSelection() {
+  _selectedItems.clear();
+  updateBatchBar();
+  document.querySelectorAll('.file-item-list.selected, .file-item-grid.selected').forEach(el => {
+    el.classList.remove('selected');
+  });
+  document.querySelectorAll('.list-select-cb, .grid-select-cb').forEach(cb => {
+    cb.checked = false;
+  });
+}
+
+function toggleSelectItem(fJson, type, ev) {
+  if (ev) ev.stopPropagation();
+  const f = parseFileArg(fJson);
+  const key = itemKey(f, type);
+  if (_selectedItems.has(key)) {
+    _selectedItems.delete(key);
+  } else {
+    _selectedItems.set(key, f);
+  }
+  if (_currentFiles.length) {
+    renderFileView(_currentFiles, type, true);
+  }
+}
+
+function selectAllItems(type) {
+  if (_selectedItems.size === _currentFiles.length && _currentFiles.length > 0) {
+    _selectedItems.clear();
+  } else {
+    for (const f of _currentFiles) {
+      _selectedItems.set(itemKey(f, type), f);
+    }
+  }
+  renderFileView(_currentFiles, type, true);
+}
+
+function updateBatchBar() {
+  const bar = document.getElementById('batch-bar-container');
+  if (!bar || !_activeDrive) return;
+  const count = _selectedItems.size;
+  if (count === 0) {
+    bar.innerHTML = '';
+    return;
+  }
+  const type = _activeDrive.type;
+  const allSelected = count === _currentFiles.length && _currentFiles.length > 0;
+  bar.innerHTML = `
+    <div class="batch-bar">
+      <div class="batch-bar-left">
+        <span class="batch-count">${count} selected</span>
+        <button class="btn btn-ghost btn-sm" onclick="selectAllItems('${type}')">
+          <svg data-lucide="${allSelected ? 'check-square' : 'square'}" width="14" height="14"></svg>
+          ${allSelected ? 'Deselect All' : 'Select All'}
+        </button>
+      </div>
+      <div class="batch-bar-actions">
+        <button class="btn btn-secondary btn-sm" onclick="downloadSelectedZip('${type}')">
+          <svg data-lucide="archive" width="14" height="14"></svg> Download ZIP
+        </button>
+        <button class="btn btn-secondary btn-sm" onclick="showTransferModal('${type}')">
+          <svg data-lucide="folder-input" width="14" height="14"></svg> Copy to Drive…
+        </button>
+        <button class="btn btn-danger btn-sm" onclick="deleteSelectedItems('${type}')">
+          <svg data-lucide="trash-2" width="14" height="14"></svg> Delete Selected
+        </button>
+        <button class="btn btn-ghost btn-sm" onclick="clearSelection()">
+          <svg data-lucide="x" width="14" height="14"></svg> Clear
+        </button>
+      </div>
+    </div>
+  `;
+  lucide.createIcons();
+}
+
+function renderFileView(files, type, keepSelection = false) {
+  if (!keepSelection) {
+    _selectedItems.clear();
+  }
   if (!files.length) {
+    _currentFiles = [];
     document.getElementById('content-area').innerHTML = `
       <div class="empty-state">
         <svg data-lucide="folder-open" width="48" height="48"></svg>
         <h3>Empty folder</h3>
-        <p>Upload a file or create a new folder to get started.</p>
+        <p>Upload files or folders, or create a new folder to get started.</p>
       </div>`;
     lucide.createIcons(); return;
   }
@@ -583,13 +732,15 @@ function renderFileView(files, type) {
     if (a.type===b.type) return a.name.localeCompare(b.name);
     return a.type==='folder' ? -1 : 1;
   });
+  _currentFiles = files;
 
   const ca = document.getElementById('content-area');
-  if (_viewMode === 'grid') {
-    ca.innerHTML = `<div class="file-grid">${files.map(f=>fileCardGrid(f,type)).join('')}</div>`;
-  } else {
-    ca.innerHTML = `<div class="card"><div class="file-list">${files.map(f=>fileCardList(f,type)).join('')}</div></div>`;
-  }
+  const listHtml = _viewMode === 'grid'
+    ? `<div class="file-grid">${files.map(f=>fileCardGrid(f,type)).join('')}</div>`
+    : `<div class="card"><div class="file-list">${files.map(f=>fileCardList(f,type)).join('')}</div></div>`;
+
+  ca.innerHTML = `<div id="batch-bar-container"></div>${listHtml}`;
+  updateBatchBar();
   lucide.createIcons();
 }
 
@@ -648,31 +799,47 @@ function parseFileArg(fJson) {
 
 function fileCardGrid(f, type) {
   const fj = encodeFileArg(f);
-  return `<div class="file-item-grid" style="position:relative" onclick="fileClick('${fj}','${type}')">
+  const key = itemKey(f, type);
+  const isSel = _selectedItems.has(key);
+  return `<div class="file-item-grid ${isSel ? 'selected' : ''}"
+               onclick="fileClick('${fj}','${type}',event)"
+               oncontextmenu="openContextMenu(event,'${fj}','${type}')">
+    <input type="checkbox" class="grid-select-cb" ${isSel ? 'checked' : ''}
+           onclick="toggleSelectItem('${fj}','${type}',event)" title="Select item" />
     <div class="file-icon-grid" style="${fileColorClass(f)}">
       <svg data-lucide="${fileIcon(f)}" width="24" height="24"></svg>
     </div>
     <span class="file-name" title="${escHtml(f.name)}">${escHtml(f.name)}</span>
-    <span class="file-meta">${fmtSize(f.size)}</span>
-    ${f.type!=='folder'?`<button class="btn btn-ghost btn-icon btn-sm grid-dl-btn"
-        onclick="event.stopPropagation();dlFile('${fj}','${type}')" title="Download">
-        <svg data-lucide="download" width="13" height="13"></svg>
-      </button>`:''}
+    <span class="file-meta">${f.type==='folder' ? 'Folder' : fmtSize(f.size)}</span>
+    <button class="btn btn-ghost btn-icon btn-sm grid-dl-btn"
+        onclick="event.stopPropagation();openContextMenu(event,'${fj}','${type}')" title="More actions">
+        <svg data-lucide="more-vertical" width="13" height="13"></svg>
+    </button>
   </div>`;
 }
 
 function fileCardList(f, type) {
   const fj = encodeFileArg(f);
-  return `<div class="file-item-list" onclick="fileClick('${fj}','${type}')">
+  const key = itemKey(f, type);
+  const isSel = _selectedItems.has(key);
+  return `<div class="file-item-list ${isSel ? 'selected' : ''}"
+               onclick="fileClick('${fj}','${type}',event)"
+               oncontextmenu="openContextMenu(event,'${fj}','${type}')">
+    <input type="checkbox" class="list-select-cb" ${isSel ? 'checked' : ''}
+           onclick="toggleSelectItem('${fj}','${type}',event)" title="Select item" />
     <div class="file-icon" style="${fileColorClass(f)}">
       <svg data-lucide="${fileIcon(f)}" width="18" height="18"></svg>
     </div>
     <span class="file-name" style="max-width:none;flex:1" title="${escHtml(f.name)}">${escHtml(f.name)}</span>
-    <span class="file-meta" style="min-width:80px;text-align:right">${fmtSize(f.size)}</span>
+    <span class="file-meta" style="min-width:80px;text-align:right">${f.type==='folder' ? '—' : fmtSize(f.size)}</span>
     <span class="file-meta" style="min-width:100px;text-align:right">${fmtDate(f.modified)}</span>
     <div class="file-actions" onclick="event.stopPropagation()">
-      ${f.type!=='folder'?`<button class="btn btn-ghost btn-icon btn-sm" onclick="dlFile('${fj}','${type}')" title="Download">
-        <svg data-lucide="download" width="14" height="14"></svg></button>`:''}
+      <button class="btn btn-ghost btn-icon btn-sm" onclick="dlFile('${fj}','${type}')" title="${f.type==='folder'?'Download ZIP':'Download'}">
+        <svg data-lucide="download" width="14" height="14"></svg></button>
+      <button class="btn btn-ghost btn-icon btn-sm" onclick="showRenameModal('${fj}','${type}')" title="Rename">
+        <svg data-lucide="edit-3" width="14" height="14"></svg></button>
+      <button class="btn btn-ghost btn-icon btn-sm" onclick="showTransferModal('${type}','${fj}')" title="Copy to Drive…">
+        <svg data-lucide="copy" width="14" height="14"></svg></button>
       <button class="btn btn-danger btn-icon btn-sm" onclick="rmFile('${fj}','${type}')" title="Delete">
         <svg data-lucide="trash-2" width="14" height="14"></svg></button>
     </div>
@@ -785,26 +952,71 @@ async function fallbackStreamMedia(src, f, player, statusWrap, statusText, statu
   }
 }
 
+function setPlaybackRate(rate) {
+  _playbackRate = rate;
+  const player = document.getElementById('active-media-player');
+  if (player) player.playbackRate = rate;
+  document.querySelectorAll('.speed-btn').forEach(btn => {
+    btn.classList.toggle('active', parseFloat(btn.dataset.rate) === rate);
+  });
+}
+
+function toggleAutoNext(cb) {
+  _autoPlayNext = cb.checked;
+}
+
+function playMediaAtIndex(idx, type) {
+  if (idx < 0 || idx >= _mediaPlaylist.length) return;
+  _mediaIndex = idx;
+  openMedia(encodeFileArg(_mediaPlaylist[idx]), type);
+}
+
+function prevMediaTrack(type) {
+  if (_mediaPlaylist.length <= 1) return;
+  const nextIdx = (_mediaIndex - 1 + _mediaPlaylist.length) % _mediaPlaylist.length;
+  playMediaAtIndex(nextIdx, type);
+}
+
+function nextMediaTrack(type) {
+  if (_mediaPlaylist.length <= 1) return;
+  const nextIdx = (_mediaIndex + 1) % _mediaPlaylist.length;
+  playMediaAtIndex(nextIdx, type);
+}
+
 function openMedia(fJson, type) {
   cleanupActiveMedia();
   var f   = parseFileArg(fJson);
+  _mediaPlaylist = _currentFiles.filter(item => item.type !== 'folder' && (isVideoFile(item.name) || isAudioFile(item.name)));
+  _mediaIndex = _mediaPlaylist.findIndex(item => itemKey(item, type) === itemKey(f, type));
+  if (_mediaIndex === -1) {
+    _mediaPlaylist = [f];
+    _mediaIndex = 0;
+  }
+
   var src = mediaApiUrl(f, type);
   var isVid = isVideoFile(f.name);
   var mediaEl = isVid
     ? '<video id="active-media-player" controls autoplay playsinline preload="auto" src="' + src + '" '
-        + 'style="width:100%;max-height:70vh;background:#000;'
+        + 'style="width:100%;max-height:66vh;background:#000;'
         + 'border-radius:var(--radius-md);display:block">'
         + 'Your browser cannot play this video.</video>'
     : '<audio id="active-media-player" controls autoplay preload="auto" src="' + src + '" '
-        + 'style="width:100%;margin:var(--space-4) 0;display:block">'
+        + 'style="width:100%;margin:var(--space-3) 0;display:block">'
         + 'Your browser cannot play this audio.</audio>';
-  var styleW = isVid ? 'max-width:860px' : '';
+  var styleW = isVid ? 'max-width:860px' : 'max-width:560px';
   var fjEsc  = encodeFileArg(f);
+  var rates  = [0.5, 0.75, 1, 1.25, 1.5, 2];
+  var speedBtns = rates.map(r =>
+    `<button class="speed-btn ${_playbackRate === r ? 'active' : ''}" data-rate="${r}" onclick="setPlaybackRate(${r})">${r}x</button>`
+  ).join('');
+
   showModal(
     '<div class="modal-header">'
-    + '<h3 style="font-size:var(--text-sm);font-weight:600;overflow:hidden;'
-    +     'text-overflow:ellipsis;white-space:nowrap;max-width:calc(100% - 48px)">'
-    + escHtml(f.name) + '</h3>'
+    + '<div style="display:flex;align-items:center;gap:var(--space-2);overflow:hidden;max-width:calc(100% - 48px)">'
+    +   '<svg data-lucide="' + (isVid ? 'film' : 'music') + '" width="16" height="16" style="color:var(--color-primary);flex-shrink:0"></svg>'
+    +   '<h3 style="font-size:var(--text-sm);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'
+    +     escHtml(f.name) + '</h3>'
+    + '</div>'
     + '<button class="btn btn-ghost btn-icon" onclick="closeModal()" title="Close">'
     +   '<svg data-lucide="x" width="18" height="18"></svg></button></div>'
     + '<div class="modal-body" style="padding-top:var(--space-3);gap:var(--space-3)">'
@@ -813,8 +1025,27 @@ function openMedia(fJson, type) {
     +   '<div class="progress-track"><div id="media-stream-fill" class="progress-fill indeterminate"></div></div>'
     + '</div>'
     + mediaEl
+    + '<div class="media-controls-bar">'
+    +   '<div class="media-nav-group">'
+    +     '<button class="btn btn-secondary btn-sm" onclick="prevMediaTrack(\'' + type + '\')" ' + (_mediaPlaylist.length <= 1 ? 'disabled style="opacity:.45;cursor:not-allowed"' : '') + ' title="Previous track">'
+    +       '<svg data-lucide="skip-back" width="14" height="14"></svg> Prev'
+    +     '</button>'
+    +     '<span class="media-track-badge">' + (_mediaIndex + 1) + ' / ' + _mediaPlaylist.length + '</span>'
+    +     '<button class="btn btn-secondary btn-sm" onclick="nextMediaTrack(\'' + type + '\')" ' + (_mediaPlaylist.length <= 1 ? 'disabled style="opacity:.45;cursor:not-allowed"' : '') + ' title="Next track">'
+    +       'Next <svg data-lucide="skip-forward" width="14" height="14"></svg>'
+    +     '</button>'
+    +     (_mediaPlaylist.length > 1
+            ? '<label style="display:inline-flex;align-items:center;gap:4px;font-size:var(--text-xs);color:var(--color-text-muted);margin-left:var(--space-2);cursor:pointer">'
+              + '<input type="checkbox" ' + (_autoPlayNext ? 'checked' : '') + ' onchange="toggleAutoNext(this)" style="accent-color:var(--color-primary)"/> Auto-next</label>'
+            : '')
+    +   '</div>'
+    +   '<div style="display:flex;align-items:center;gap:var(--space-2)">'
+    +     '<span style="font-size:var(--text-xs);color:var(--color-text-muted)">Speed</span>'
+    +     '<div class="speed-group">' + speedBtns + '</div>'
+    +   '</div>'
+    + '</div>'
     + '<div style="display:flex;justify-content:space-between;align-items:center">'
-    +   '<span style="font-size:var(--text-xs);color:var(--color-text-muted)">' + fmtSize(f.size) + '</span>'
+    +   '<span style="font-size:var(--text-xs);color:var(--color-text-muted);font-family:var(--font-mono)">' + fmtSize(f.size) + '</span>'
     +   '<button class="btn btn-secondary btn-sm" '
     +     'onclick="dlFile(\'' + fjEsc + '\',\'' + type + '\')">'
     +     '<svg data-lucide="download" width="14" height="14"></svg> Download'
@@ -830,12 +1061,15 @@ function openMedia(fJson, type) {
   const statusFill = document.getElementById('media-stream-fill');
 
   if (player) {
+    player.playbackRate = _playbackRate;
     let triedTranscode = false;
     let triedFallback = false;
     player.onloadeddata = () => {
+      player.playbackRate = _playbackRate;
       if (statusWrap) statusWrap.style.display = 'none';
     };
     player.oncanplay = () => {
+      player.playbackRate = _playbackRate;
       if (statusWrap) statusWrap.style.display = 'none';
     };
     player.onwaiting = () => {
@@ -847,6 +1081,11 @@ function openMedia(fJson, type) {
     };
     player.onplaying = () => {
       if (statusWrap) statusWrap.style.display = 'none';
+    };
+    player.onended = () => {
+      if (_autoPlayNext && _mediaPlaylist.length > 1) {
+        nextMediaTrack(type);
+      }
     };
     player.onerror = () => {
       if (isVid && !triedTranscode) {
@@ -869,7 +1108,11 @@ function openMedia(fJson, type) {
   }
 }
 
-function fileClick(fJson, type) {
+function fileClick(fJson, type, ev) {
+  if (ev && (ev.shiftKey || ev.metaKey || ev.ctrlKey)) {
+    toggleSelectItem(fJson, type, ev);
+    return;
+  }
   const f = parseFileArg(fJson);
   if (f.type !== 'folder') {
     if (isVideoFile(f.name) || isAudioFile(f.name)) { openMedia(fJson, type); return; }
@@ -887,6 +1130,24 @@ function fileClick(fJson, type) {
 
 function dlFile(fJson, type) {
   const f = parseFileArg(fJson);
+  if (f.type === 'folder') {
+    if (type === 'smb') {
+      authedDownload(
+        `/api/smb/zip/${_activeDrive.id}`,
+        `${f.name}.zip`,
+        0,
+        { method: 'POST', json: { paths: [f.path || f.name], name: `${f.name}.zip` } }
+      );
+    } else {
+      authedDownload(
+        '/api/gdrive/zip',
+        `${f.name}.zip`,
+        0,
+        { method: 'POST', json: { ids: [f.id], name: `${f.name}.zip` } }
+      );
+    }
+    return;
+  }
   if (type==='smb') {
     authedDownload(`/api/smb/download/${_activeDrive.id}?path=${encodeURIComponent(f.path)}&dl=1`, f.name, f.size);
   } else {
@@ -904,7 +1165,7 @@ function cancelDownload(dlId) {
   }
 }
 
-async function authedDownload(path, name, knownSize = 0) {
+async function authedDownload(path, name, knownSize = 0, fetchOpts = {}) {
   const dlId = 'dl_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
   const ctrl = new AbortController();
   _activeDownloads.set(dlId, ctrl);
@@ -940,7 +1201,7 @@ async function authedDownload(path, name, knownSize = 0) {
 
   try {
     const startTime = performance.now();
-    const r = await apiFetch(path, { signal: ctrl.signal });
+    const r = await apiFetch(path, { ...fetchOpts, signal: ctrl.signal });
     if (!r.ok) {
       const err = await r.json().catch(() => ({ error: 'Download failed' }));
       throw new Error(err.error || 'Download failed');
@@ -1031,6 +1292,368 @@ async function authedDownload(path, name, knownSize = 0) {
   }
 }
 
+// ── Right-Click Context Menu ──────────────────────────────────────────────────
+function closeContextMenu() {
+  const menu = document.getElementById('context-menu');
+  if (menu) menu.style.display = 'none';
+}
+window.addEventListener('click', closeContextMenu);
+window.addEventListener('scroll', closeContextMenu, true);
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeContextMenu();
+});
+
+function openContextMenu(e, fJson, type) {
+  e.preventDefault();
+  e.stopPropagation();
+  const f = parseFileArg(fJson);
+  const key = itemKey(f, type);
+  const isSel = _selectedItems.has(key);
+  const isMedia = f.type !== 'folder' && (isVideoFile(f.name) || isAudioFile(f.name));
+  const menu = document.getElementById('context-menu');
+
+  let html = '';
+  if (f.type === 'folder') {
+    html += `<button class="ctx-item" onclick="closeContextMenu();fileClick('${fJson}','${type}')">
+      <svg data-lucide="folder-open"></svg> Open Folder
+    </button>`;
+  } else if (isMedia) {
+    html += `<button class="ctx-item" onclick="closeContextMenu();openMedia('${fJson}','${type}')">
+      <svg data-lucide="play"></svg> Stream Media
+    </button>`;
+  }
+
+  html += `<button class="ctx-item" onclick="closeContextMenu();dlFile('${fJson}','${type}')">
+    <svg data-lucide="${f.type === 'folder' ? 'archive' : 'download'}"></svg>
+    ${f.type === 'folder' ? 'Download ZIP' : 'Download'}
+  </button>`;
+
+  html += `<button class="ctx-item" onclick="closeContextMenu();showRenameModal('${fJson}','${type}')">
+    <svg data-lucide="edit-3"></svg> Rename
+  </button>`;
+
+  html += `<button class="ctx-item" onclick="closeContextMenu();showTransferModal('${type}','${fJson}')">
+    <svg data-lucide="copy"></svg> Copy to Drive…
+  </button>`;
+
+  html += `<button class="ctx-item" onclick="closeContextMenu();toggleSelectItem('${fJson}','${type}')">
+    <svg data-lucide="${isSel ? 'check-square' : 'square'}"></svg>
+    ${isSel ? 'Deselect' : 'Select'}
+  </button>`;
+
+  html += `<div class="ctx-divider"></div>`;
+  html += `<button class="ctx-item danger" onclick="closeContextMenu();rmFile('${fJson}','${type}')">
+    <svg data-lucide="trash-2"></svg> Delete
+  </button>`;
+
+  menu.innerHTML = html;
+  menu.style.display = 'flex';
+  lucide.createIcons();
+
+  const rect = menu.getBoundingClientRect();
+  const x = Math.min(e.clientX, window.innerWidth - rect.width - 12);
+  const y = Math.min(e.clientY, window.innerHeight - rect.height - 12);
+  menu.style.left = Math.max(8, x) + 'px';
+  menu.style.top = Math.max(8, y) + 'px';
+}
+
+// ── In-Place Rename Modal ─────────────────────────────────────────────────────
+function showRenameModal(fJson, type) {
+  const f = parseFileArg(fJson);
+  showModal(`
+    <div class="modal-header">
+      <span class="modal-title">Rename ${f.type === 'folder' ? 'Folder' : 'File'}</span>
+      <button class="btn btn-ghost btn-icon" onclick="closeModal()">
+        <svg data-lucide="x" width="16" height="16"></svg></button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <label class="form-label">New name</label>
+        <input class="form-input" id="rename-input" type="text" value="${escHtml(f.name)}"
+               onkeydown="if(event.key==='Enter'){event.preventDefault();doRename('${fJson}','${type}')}" />
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="doRename('${fJson}','${type}')">Rename</button>
+    </div>
+  `);
+  lucide.createIcons();
+  setTimeout(() => {
+    const inp = document.getElementById('rename-input');
+    if (inp) {
+      inp.focus();
+      const dotIdx = f.type === 'folder' ? -1 : f.name.lastIndexOf('.');
+      if (dotIdx > 0) inp.setSelectionRange(0, dotIdx);
+      else inp.select();
+    }
+  }, 40);
+}
+
+async function doRename(fJson, type) {
+  const f = parseFileArg(fJson);
+  const newName = (document.getElementById('rename-input')?.value || '').trim();
+  if (!newName || newName === f.name) {
+    closeModal();
+    return;
+  }
+  try {
+    if (type === 'smb') {
+      await apiJSON(`/api/smb/rename/${_activeDrive.id}`, {
+        method: 'POST',
+        json: { path: f.path || (_path.replace(/\/$/, '') + '/' + f.name), new_name: newName }
+      });
+      closeModal();
+      toast(`Renamed to "${newName}"`, 'success');
+      loadSMBFiles();
+    } else {
+      await apiJSON(`/api/gdrive/rename/${f.id}`, {
+        method: 'POST',
+        json: { name: newName }
+      });
+      closeModal();
+      toast(`Renamed to "${newName}"`, 'success');
+      loadGDriveFiles();
+    }
+  } catch (e) {
+    toast('Rename failed: ' + e.message, 'error');
+  }
+}
+
+// ── Multi-Select Batch Actions (ZIP Download, Delete, Copy Across Drives) ────
+function downloadSelectedZip(type) {
+  const items = Array.from(_selectedItems.values());
+  if (!items.length) return;
+  const archiveName = items.length === 1
+    ? `${items[0].name}.zip`
+    : `${_activeDrive.name.replace(/\s+/g, '_')}_${items.length}_items.zip`;
+
+  if (type === 'smb') {
+    const paths = items.map(it => it.path || (_path.replace(/\/$/, '') + '/' + it.name));
+    authedDownload(`/api/smb/zip/${_activeDrive.id}`, archiveName, 0, {
+      method: 'POST',
+      json: { paths, name: archiveName }
+    });
+  } else {
+    const ids = items.map(it => it.id);
+    authedDownload('/api/gdrive/zip', archiveName, 0, {
+      method: 'POST',
+      json: { ids, name: archiveName }
+    });
+  }
+}
+
+async function deleteSelectedItems(type) {
+  const items = Array.from(_selectedItems.values());
+  if (!items.length) return;
+  if (!confirm(`Delete ${items.length} selected item${items.length > 1 ? 's' : ''}?`)) return;
+  let deleted = 0;
+  for (const f of items) {
+    try {
+      if (type === 'smb') {
+        await apiJSON(`/api/smb/delete/${_activeDrive.id}`, {
+          method: 'DELETE',
+          json: { path: f.path || f.name, is_dir: f.type === 'folder' }
+        });
+      } else {
+        await apiJSON(`/api/gdrive/delete/${f.id}`, { method: 'DELETE' });
+      }
+      deleted++;
+    } catch (e) {
+      toast(`Failed deleting "${f.name}": ${e.message}`, 'error');
+    }
+  }
+  clearSelection();
+  if (deleted) toast(`Deleted ${deleted} item${deleted > 1 ? 's' : ''}`, 'success');
+  if (type === 'smb') loadSMBFiles(); else loadGDriveFiles();
+}
+
+// ── Cross-Drive Transfer Modal ────────────────────────────────────────────────
+let _transferItems = [];
+let _transferSrcType = '';
+let _transferDestDrive = null;
+let _transferDestFolder = '/';
+let _transferDestStack = [];
+
+async function showTransferModal(srcType, singleItemJson = null) {
+  _transferSrcType = srcType;
+  _transferItems = singleItemJson
+    ? [parseFileArg(singleItemJson)]
+    : Array.from(_selectedItems.values());
+
+  if (!_transferItems.length) {
+    toast('Select at least one file or folder first', 'error');
+    return;
+  }
+
+  await refreshShares();
+  await refreshGDStatus();
+
+  const destOptions = [];
+  if (_gdStatus.authenticated) {
+    destOptions.push({ key: 'gdrive:root', type: 'gdrive', id: 'root', name: 'Google Drive' });
+  }
+  for (const s of _shares) {
+    destOptions.push({ key: `smb:${s.id}`, type: 'smb', id: s.id, name: `SMB: ${s.name}` });
+  }
+
+  if (!destOptions.length) {
+    toast('No destination drives configured', 'error');
+    return;
+  }
+
+  // Pick a default target drive (prefer the opposite drive type for quick cross-drive copy)
+  const preferred = destOptions.find(d => d.type !== srcType || d.id !== _activeDrive.id) || destOptions[0];
+  _transferDestDrive = preferred;
+  _transferDestFolder = preferred.type === 'smb' ? '/' : 'root';
+  _transferDestStack = [{ id: _transferDestFolder, name: preferred.name }];
+
+  const itemSummary = _transferItems.length === 1
+    ? `"${_transferItems[0].name}"`
+    : `${_transferItems.length} selected items`;
+
+  showModal(`
+    <div class="modal-header">
+      <span class="modal-title">Copy ${escHtml(itemSummary)}</span>
+      <button class="btn btn-ghost btn-icon" onclick="closeModal()">
+        <svg data-lucide="x" width="16" height="16"></svg></button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <label class="form-label">Destination Drive</label>
+        <select class="form-input" id="transfer-drive-select" onchange="onTransferDriveChange(this.value)">
+          ${destOptions.map(d => `<option value="${escHtml(d.key)}" ${d.key === preferred.key ? 'selected' : ''}>${escHtml(d.name)}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-group">
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <label class="form-label">Destination Folder</label>
+          <span id="transfer-cur-path" style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--color-primary)">/</span>
+        </div>
+        <div id="transfer-folder-browser" style="border:1px solid var(--color-border);border-radius:var(--radius-md);background:var(--color-surface-2);max-height:200px;overflow-y:auto;padding:var(--space-2)">
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="transfer-submit-btn" onclick="doTransfer()">
+        <svg data-lucide="copy" width="14" height="14"></svg> Copy Here
+      </button>
+    </div>
+  `);
+  lucide.createIcons();
+  loadTransferFolders();
+}
+
+function onTransferDriveChange(val) {
+  const [type, id] = val.split(':');
+  const label = type === 'gdrive' ? 'Google Drive' : (_shares.find(s => s.id === id)?.name || id);
+  _transferDestDrive = { key: val, type, id, name: label };
+  _transferDestFolder = type === 'smb' ? '/' : 'root';
+  _transferDestStack = [{ id: _transferDestFolder, name: label }];
+  loadTransferFolders();
+}
+
+async function loadTransferFolders() {
+  const box = document.getElementById('transfer-folder-browser');
+  const pathLabel = document.getElementById('transfer-cur-path');
+  if (!box || !_transferDestDrive) return;
+
+  if (_transferDestDrive.type === 'smb') {
+    pathLabel.textContent = _transferDestFolder;
+  } else {
+    pathLabel.textContent = '/' + _transferDestStack.slice(1).map(s => s.name).join('/');
+  }
+
+  box.innerHTML = `<div style="padding:var(--space-4);text-align:center;color:var(--color-text-muted);font-size:var(--text-xs)">Loading folders…</div>`;
+  try {
+    let items = [];
+    if (_transferDestDrive.type === 'smb') {
+      items = await apiJSON(`/api/smb/browse/${_transferDestDrive.id}?path=${encodeURIComponent(_transferDestFolder)}`);
+    } else {
+      items = await apiJSON(`/api/gdrive/files?folder=${encodeURIComponent(_transferDestFolder)}`);
+    }
+    const folders = items.filter(it => it.type === 'folder');
+    let html = '';
+
+    if ((_transferDestDrive.type === 'smb' && _transferDestFolder !== '/') ||
+        (_transferDestDrive.type === 'gdrive' && _transferDestStack.length > 1)) {
+      html += `<div class="ctx-item" onclick="transferGoUp()">
+        <svg data-lucide="corner-left-up"></svg> .. (Parent folder)
+      </div>`;
+    }
+
+    if (!folders.length && !html) {
+      html = `<div style="padding:var(--space-3);text-align:center;color:var(--color-text-faint);font-size:var(--text-xs)">No subfolders (will copy into current folder)</div>`;
+    } else {
+      for (const fld of folders) {
+        const targetId = _transferDestDrive.type === 'smb'
+          ? (fld.path || (_transferDestFolder.replace(/\/$/, '') + '/' + fld.name))
+          : fld.id;
+        html += `<div class="ctx-item" onclick="transferEnterFolder('${escAttr(targetId)}','${escAttr(fld.name)}')">
+          <svg data-lucide="folder" style="color:var(--color-gold,#d19900)"></svg>
+          <span>${escHtml(fld.name)}</span>
+        </div>`;
+      }
+    }
+    box.innerHTML = html;
+    lucide.createIcons();
+  } catch (e) {
+    box.innerHTML = `<div style="padding:var(--space-3);color:var(--color-error);font-size:var(--text-xs)">${escHtml(e.message)}</div>`;
+  }
+}
+
+function transferEnterFolder(idOrPath, name) {
+  _transferDestFolder = idOrPath;
+  _transferDestStack.push({ id: idOrPath, name });
+  loadTransferFolders();
+}
+
+function transferGoUp() {
+  if (_transferDestDrive.type === 'smb') {
+    const parts = _transferDestFolder.split('/').filter(Boolean);
+    parts.pop();
+    _transferDestFolder = '/' + parts.join('/');
+  } else if (_transferDestStack.length > 1) {
+    _transferDestStack.pop();
+    _transferDestFolder = _transferDestStack[_transferDestStack.length - 1].id;
+  }
+  loadTransferFolders();
+}
+
+async function doTransfer() {
+  const btn = document.getElementById('transfer-submit-btn');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Copying…';
+  }
+  try {
+    const res = await apiJSON('/api/transfer', {
+      method: 'POST',
+      json: {
+        src_type: _transferSrcType,
+        src_drive: _activeDrive.id,
+        dest_type: _transferDestDrive.type,
+        dest_drive: _transferDestDrive.id,
+        dest_folder: _transferDestFolder,
+        items: _transferItems,
+      }
+    });
+    closeModal();
+    clearSelection();
+    toast(`Copied ${res.copied} item${res.copied > 1 ? 's' : ''} to ${_transferDestDrive.name}`, 'success');
+    if (_transferDestDrive.type === _activeDrive.type && _transferDestDrive.id === _activeDrive.id) {
+      if (_activeDrive.type === 'smb') loadSMBFiles(); else loadGDriveFiles();
+    }
+  } catch (e) {
+    toast('Transfer failed: ' + e.message, 'error');
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'Copy Here';
+    }
+  }
+}
+
 async function rmFile(fJson, type) {
   const f = parseFileArg(fJson);
   if (!confirm(`Delete "${f.name}"?`)) return;
@@ -1075,18 +1698,24 @@ function setViewMode(m) {
 function showUploadModal(type) {
   showModal(`
     <div class="modal-header">
-      <span class="modal-title">Upload Files</span>
+      <span class="modal-title">Upload Files or Folders</span>
       <button class="btn btn-ghost btn-icon" onclick="closeModal()">
         <svg data-lucide="x" width="16" height="16"></svg></button>
     </div>
     <div class="modal-body">
       <div class="dropzone" id="dropzone" ondragover="dzOver(event)" ondragleave="dzLeave(event)" ondrop="dzDrop(event,'${type}')">
         <svg data-lucide="upload-cloud" width="32" height="32" style="margin:0 auto var(--space-3);color:var(--color-text-faint)"></svg>
-        <p style="margin-bottom:var(--space-3)">Drag & drop files here</p>
-        <button class="btn btn-secondary btn-sm" onclick="document.getElementById('file-input').click()">
-          Choose files
-        </button>
+        <p style="margin-bottom:var(--space-3)">Drag &amp; drop files or entire folders here</p>
+        <div style="display:flex;justify-content:center;gap:var(--space-2);flex-wrap:wrap">
+          <button class="btn btn-secondary btn-sm" onclick="document.getElementById('file-input').click()">
+            <svg data-lucide="file-plus" width="14" height="14"></svg> Choose Files
+          </button>
+          <button class="btn btn-secondary btn-sm" onclick="document.getElementById('folder-input').click()">
+            <svg data-lucide="folder-up" width="14" height="14"></svg> Choose Folder
+          </button>
+        </div>
         <input type="file" id="file-input" style="display:none" multiple onchange="uploadFiles(this.files,'${type}')">
+        <input type="file" id="folder-input" style="display:none" webkitdirectory directory multiple onchange="uploadFiles(this.files,'${type}')">
       </div>
       <div id="upload-progress" style="display:none;flex-direction:column;gap:var(--space-2)">
         <div class="dl-toast-meta">
@@ -1102,15 +1731,61 @@ function showUploadModal(type) {
   lucide.createIcons();
 }
 
-function dzOver(e) { e.preventDefault(); document.getElementById('dropzone').classList.add('drag-over'); }
-function dzLeave(e) { document.getElementById('dropzone').classList.remove('drag-over'); }
-function dzDrop(e, type) {
+function dzOver(e) { e.preventDefault(); document.getElementById('dropzone')?.classList.add('drag-over'); }
+function dzLeave(e) { document.getElementById('dropzone')?.classList.remove('drag-over'); }
+
+async function readEntryRecursively(entry, parentPath = '') {
+  if (entry.isFile) {
+    return new Promise((resolve) => {
+      entry.file((file) => {
+        const relPath = parentPath ? `${parentPath}/${file.name}` : file.name;
+        resolve([{ file, relativePath: relPath }]);
+      }, () => resolve([]));
+    });
+  }
+  if (entry.isDirectory) {
+    const dirReader = entry.createReader();
+    const allEntries = [];
+    while (true) {
+      const batch = await new Promise((resolve) => dirReader.readEntries(resolve, () => resolve([])));
+      if (!batch || batch.length === 0) break;
+      allEntries.push(...batch);
+    }
+    const nextParent = parentPath ? `${parentPath}/${entry.name}` : entry.name;
+    const nested = [];
+    for (const child of allEntries) {
+      const items = await readEntryRecursively(child, nextParent);
+      nested.push(...items);
+    }
+    return nested;
+  }
+  return [];
+}
+
+async function dzDrop(e, type) {
   e.preventDefault();
-  document.getElementById('dropzone').classList.remove('drag-over');
+  document.getElementById('dropzone')?.classList.remove('drag-over');
+  const items = e.dataTransfer?.items;
+  if (items && items.length && typeof items[0].webkitGetAsEntry === 'function') {
+    const entries = [];
+    for (let i = 0; i < items.length; i++) {
+      const entry = items[i].webkitGetAsEntry();
+      if (entry) entries.push(entry);
+    }
+    const collected = [];
+    for (const entry of entries) {
+      const filesWithPaths = await readEntryRecursively(entry, '');
+      collected.push(...filesWithPaths);
+    }
+    if (collected.length) {
+      await uploadFileEntries(collected, type);
+      return;
+    }
+  }
   uploadFiles(e.dataTransfer.files, type);
 }
 
-function uploadFileWithProgress(url, file, onProgress) {
+function uploadFileWithProgress(url, file, relativePath, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', API + url);
@@ -1125,35 +1800,45 @@ function uploadFileWithProgress(url, file, onProgress) {
     };
     xhr.onerror = () => reject(new Error('Network error'));
     const fd = new FormData();
+    if (relativePath) fd.append('relative_path', relativePath);
     fd.append('file', file);
     xhr.send(fd);
   });
 }
 
 async function uploadFiles(fileList, type) {
+  const entries = Array.from(fileList).map(file => ({
+    file,
+    relativePath: file.webkitRelativePath || file.name
+  }));
+  await uploadFileEntries(entries, type);
+}
+
+async function uploadFileEntries(entries, type) {
+  if (!entries.length) return;
   const prog = document.getElementById('upload-progress');
   const statusText = document.getElementById('upload-status-text');
   const statusPct = document.getElementById('upload-status-pct');
   const fillEl = document.getElementById('upload-progress-fill');
-  prog.style.display = 'flex';
+  if (prog) prog.style.display = 'flex';
   let ok = 0;
-  const files = Array.from(fileList);
-  for (let i = 0; i < files.length; i++) {
-    const file = files[i];
-    statusText.textContent = `Uploading (${i + 1}/${files.length}): ${file.name}`;
-    statusPct.textContent = '0%';
-    fillEl.style.width = '0%';
+  for (let i = 0; i < entries.length; i++) {
+    const { file, relativePath } = entries[i];
+    const displayLabel = relativePath || file.name;
+    if (statusText) statusText.textContent = `Uploading (${i + 1}/${entries.length}): ${displayLabel}`;
+    if (statusPct) statusPct.textContent = '0%';
+    if (fillEl) fillEl.style.width = '0%';
     try {
       const targetUrl = type === 'smb'
         ? `/api/smb/upload/${_activeDrive.id}?path=${encodeURIComponent(_path)}`
-        : `/api/gdrive/upload?folder=${_folderId}`;
-      await uploadFileWithProgress(targetUrl, file, (loaded, total) => {
+        : `/api/gdrive/upload?folder=${encodeURIComponent(_folderId)}`;
+      await uploadFileWithProgress(targetUrl, file, relativePath, (loaded, total) => {
         const pct = Math.min(100, Math.round((loaded / total) * 100));
-        fillEl.style.width = pct + '%';
-        statusPct.textContent = `${pct}% (${fmtSize(loaded)} / ${fmtSize(total)})`;
+        if (fillEl) fillEl.style.width = pct + '%';
+        if (statusPct) statusPct.textContent = `${pct}% (${fmtSize(loaded)} / ${fmtSize(total)})`;
       });
       ok++;
-    } catch(e) { toast(`Failed: ${file.name} – ${e.message}`, 'error'); }
+    } catch(e) { toast(`Failed: ${displayLabel} – ${e.message}`, 'error'); }
   }
   closeModal();
   if (ok) toast(`Uploaded ${ok} file${ok>1?'s':''}`, 'success');
@@ -1170,7 +1855,8 @@ function showMkdirModal(type) {
     <div class="modal-body">
       <div class="form-group">
         <label class="form-label">Folder name</label>
-        <input class="form-input" id="mkdir-name" type="text" placeholder="New Folder" autofocus />
+        <input class="form-input" id="mkdir-name" type="text" placeholder="New Folder" autofocus
+               onkeydown="if(event.key==='Enter'){event.preventDefault();doMkdir('${type}')}" />
       </div>
     </div>
     <div class="modal-footer">

@@ -1,0 +1,5 @@
+{
+  "name": "SageDrive",
+  "description": "Self-hosted browser-based file manager providing unified access to SMB/NAS shares and Google Drive from a single interface.",
+  "requestFramePermissions": []
+}

@@ -1,0 +1,34 @@
+services:
+  sagedrive:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: sagedrive
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "445:445"
+    environment:
+      - SECRET_KEY=${SECRET_KEY}
+      - ADMIN_USER=${ADMIN_USER:-admin}
+      - ADMIN_PASS=${ADMIN_PASS}
+      - SESSION_TTL_HOURS=${SESSION_TTL_HOURS:-24}
+    volumes:
+      - sagedrive-data:/app/data
+      - ./backend/auth.py:/app/auth.py:ro
+      - ./frontend/public/index.html:/app/static/index.html
+      - ./backend/main.py:/app/main.py
+    # CRITICAL: These privileges are required for FUSE to work
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
+    security_opt:
+      - apparmor:unconfined
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+volumes:
+  sagedrive-data:

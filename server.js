@@ -180,16 +180,34 @@ function getMimeType(filename, fallbackMime) {
     m4a: 'audio/mp4',
     aac: 'audio/aac',
     flac: 'audio/flac',
+    weba: 'audio/webm',
+    wma: 'audio/x-ms-wma',
+    aiff: 'audio/aiff',
+    aif: 'audio/aiff',
     jpg: 'image/jpeg',
     jpeg: 'image/jpeg',
     png: 'image/png',
     gif: 'image/gif',
     webp: 'image/webp',
     svg: 'image/svg+xml',
+    bmp: 'image/bmp',
+    ico: 'image/x-icon',
+    avif: 'image/avif',
     pdf: 'application/pdf',
     txt: 'text/plain; charset=utf-8',
-    md: 'text/markdown; charset=utf-8',
-    json: 'application/json',
+    md: 'text/plain; charset=utf-8',
+    log: 'text/plain; charset=utf-8',
+    csv: 'text/plain; charset=utf-8',
+    xml: 'text/xml; charset=utf-8',
+    yaml: 'text/plain; charset=utf-8',
+    yml: 'text/plain; charset=utf-8',
+    ini: 'text/plain; charset=utf-8',
+    conf: 'text/plain; charset=utf-8',
+    toml: 'text/plain; charset=utf-8',
+    py: 'text/plain; charset=utf-8',
+    sh: 'text/plain; charset=utf-8',
+    ts: 'text/plain; charset=utf-8',
+    json: 'application/json; charset=utf-8',
     html: 'text/html; charset=utf-8',
     css: 'text/css; charset=utf-8',
     js: 'application/javascript',
@@ -538,6 +556,26 @@ function streamFileResponse(req, res, item) {
       '-c:a', 'aac', '-b:a', '128k',
       '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
       '-f', 'mp4',
+      'pipe:1',
+    ]);
+    ff.stdout.pipe(res);
+    req.on('close', () => {
+      try { ff.kill('SIGKILL'); } catch (_) {}
+    });
+    return;
+  }
+
+  if (req.query.transcode === 'audio') {
+    res.writeHead(200, {
+      'Content-Type': 'audio/mpeg',
+      'Content-Disposition': disposition,
+      'Cache-Control': 'no-cache',
+    });
+    const ff = spawn('ffmpeg', [
+      '-i', blobPath,
+      '-vn',
+      '-c:a', 'libmp3lame', '-b:a', '192k',
+      '-f', 'mp3',
       'pipe:1',
     ]);
     ff.stdout.pipe(res);

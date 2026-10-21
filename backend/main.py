@@ -25,6 +25,37 @@ MEDIA_MIMES = {
     "m4a": "audio/mp4",
     "aac": "audio/aac",
     "flac": "audio/flac",
+    "weba": "audio/webm",
+    "wma": "audio/x-ms-wma",
+    "aiff": "audio/aiff",
+    "aif": "audio/aiff",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+    "gif": "image/gif",
+    "webp": "image/webp",
+    "svg": "image/svg+xml",
+    "bmp": "image/bmp",
+    "ico": "image/x-icon",
+    "avif": "image/avif",
+    "pdf": "application/pdf",
+    "txt": "text/plain; charset=utf-8",
+    "md": "text/plain; charset=utf-8",
+    "log": "text/plain; charset=utf-8",
+    "csv": "text/plain; charset=utf-8",
+    "json": "application/json; charset=utf-8",
+    "xml": "text/xml; charset=utf-8",
+    "yaml": "text/plain; charset=utf-8",
+    "yml": "text/plain; charset=utf-8",
+    "ini": "text/plain; charset=utf-8",
+    "conf": "text/plain; charset=utf-8",
+    "toml": "text/plain; charset=utf-8",
+    "py": "text/plain; charset=utf-8",
+    "sh": "text/plain; charset=utf-8",
+    "js": "text/plain; charset=utf-8",
+    "ts": "text/plain; charset=utf-8",
+    "css": "text/css; charset=utf-8",
+    "html": "text/html; charset=utf-8",
 }
 
 def guess_media_mime(filename, fallback=None):
@@ -72,6 +103,55 @@ def transcode_stream(chunk_iterable):
             "-c:a", "aac", "-b:a", "160k",
             "-movflags", "frag_keyframe+empty_moov+default_base_moof",
             "-f", "mp4",
+            "pipe:1",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        bufsize=65536,
+    )
+
+    def feed_stdin():
+        try:
+            for chunk in chunk_iterable:
+                if proc.poll() is not None:
+                    break
+                proc.stdin.write(chunk)
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+
+    feeder = threading.Thread(target=feed_stdin, daemon=True)
+    feeder.start()
+
+    try:
+        while True:
+            out = proc.stdout.read(65536)
+            if not out:
+                break
+            yield out
+    finally:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+def transcode_audio_stream(chunk_iterable):
+    """
+    Pipes raw audio chunks from SMB/GDrive into ffmpeg and yields streaming MP3
+    for audio codecs/containers the browser cannot decode natively.
+    """
+    proc = subprocess.Popen(
+        [
+            "ffmpeg",
+            "-hide_banner", "-loglevel", "error",
+            "-i", "pipe:0",
+            "-vn",
+            "-c:a", "libmp3lame", "-b:a", "192k",
+            "-f", "mp3",
             "pipe:1",
         ],
         stdin=subprocess.PIPE,
@@ -199,6 +279,17 @@ def smb_download(share_id):
                 transcode_stream(smb_manager.stream_file_range(share_id, path, start=0, length=file_size)),
                 status=200,
                 mimetype="video/mp4",
+                direct_passthrough=True,
+            )
+            resp.headers["Cache-Control"] = "no-cache"
+            resp.headers["Content-Disposition"] = disposition
+            return resp
+
+        if request.args.get("transcode") == "audio":
+            resp = app.response_class(
+                transcode_audio_stream(smb_manager.stream_file_range(share_id, path, start=0, length=file_size)),
+                status=200,
+                mimetype="audio/mpeg",
                 direct_passthrough=True,
             )
             resp.headers["Cache-Control"] = "no-cache"
@@ -402,7 +493,7 @@ def gdrive_download(file_id):
             return send_file(
                 io.BytesIO(data),
                 download_name=filename,
-                as_attachment=bool(request.args.get("dl", True)),
+                as_attachment=bool(request.args.get("dl")),
                 mimetype=mime or "application/octet-stream",
             )
 
@@ -413,6 +504,17 @@ def gdrive_download(file_id):
                 transcode_stream(gdrive_manager.stream_file_range(file_id, start=0, end=file_size - 1 if file_size > 0 else None)),
                 status=200,
                 mimetype="video/mp4",
+                direct_passthrough=True,
+            )
+            resp.headers["Cache-Control"] = "no-cache"
+            resp.headers["Content-Disposition"] = disposition
+            return resp
+
+        if request.args.get("transcode") == "audio":
+            resp = app.response_class(
+                transcode_audio_stream(gdrive_manager.stream_file_range(file_id, start=0, end=file_size - 1 if file_size > 0 else None)),
+                status=200,
+                mimetype="audio/mpeg",
                 direct_passthrough=True,
             )
             resp.headers["Cache-Control"] = "no-cache"

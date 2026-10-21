@@ -846,25 +846,56 @@ function fileCardList(f, type) {
   </div>`;
 }
 
-function _fileExt(name) {
+function _fileExt(nameOrObj) {
+  var name = (typeof nameOrObj === 'object' && nameOrObj !== null) ? nameOrObj.name : nameOrObj;
   var m = String(name || '').toLowerCase().match(/\.([^.]+)$/);
   return m ? m[1] : '';
 }
-function isVideoFile(name) {
-  return ['mp4','webm','ogg','ogv','mov','m4v','mkv','avi'].indexOf(_fileExt(name)) !== -1;
+function _fileMime(nameOrObj) {
+  if (typeof nameOrObj === 'object' && nameOrObj !== null && nameOrObj.mimeType) {
+    return String(nameOrObj.mimeType).toLowerCase();
+  }
+  return '';
 }
-function isAudioFile(name) {
-  return ['mp3','wav','ogg','oga','m4a','aac','flac','opus'].indexOf(_fileExt(name)) !== -1;
+function isVideoFile(nameOrObj) {
+  var ext = _fileExt(nameOrObj);
+  var mime = _fileMime(nameOrObj);
+  if (['mp4','webm','ogg','ogv','mov','m4v','mkv','avi','3gp','ts','m2ts','flv','wmv'].indexOf(ext) !== -1) return true;
+  return mime.indexOf('video/') === 0;
 }
-function getMediaMime(name) {
-  const ext = _fileExt(name);
+function isAudioFile(nameOrObj) {
+  var ext = _fileExt(nameOrObj);
+  var mime = _fileMime(nameOrObj);
+  if (['mp3','wav','ogg','oga','m4a','aac','flac','opus','weba','wma','aiff','aif','alac','amr','mid','midi'].indexOf(ext) !== -1) return true;
+  return mime.indexOf('audio/') === 0;
+}
+function isImageFile(nameOrObj) {
+  var ext = _fileExt(nameOrObj);
+  var mime = _fileMime(nameOrObj);
+  if (['jpg','jpeg','png','gif','webp','svg','bmp','ico','avif','jfif','apng'].indexOf(ext) !== -1) return true;
+  return mime.indexOf('image/') === 0;
+}
+function isPdfFile(nameOrObj) {
+  var ext = _fileExt(nameOrObj);
+  var mime = _fileMime(nameOrObj);
+  return ext === 'pdf' || mime === 'application/pdf';
+}
+function isTextFile(nameOrObj) {
+  var ext = _fileExt(nameOrObj);
+  var mime = _fileMime(nameOrObj);
+  if (['txt','md','markdown','json','js','mjs','cjs','ts','tsx','jsx','py','sh','bash','zsh','html','htm','css','scss','xml','yaml','yml','toml','ini','conf','cfg','env','log','csv','sql','dockerfile','gitignore'].indexOf(ext) !== -1) return true;
+  return mime.indexOf('text/') === 0 || mime === 'application/json' || mime === 'application/xml';
+}
+function getMediaMime(nameOrObj) {
+  const ext = _fileExt(nameOrObj);
   const map = {
     mp4:'video/mp4', m4v:'video/mp4', mov:'video/mp4',
     webm:'video/webm', mkv:'video/webm', ogv:'video/ogg', avi:'video/mp4',
     mp3:'audio/mpeg', wav:'audio/wav', ogg:'audio/ogg', oga:'audio/ogg',
-    opus:'audio/ogg', m4a:'audio/mp4', aac:'audio/aac', flac:'audio/flac'
+    opus:'audio/ogg', m4a:'audio/mp4', aac:'audio/aac', flac:'audio/flac',
+    weba:'audio/webm', wma:'audio/mpeg', aiff:'audio/aiff', aif:'audio/aiff'
   };
-  return map[ext] || (isVideoFile(name) ? 'video/mp4' : 'audio/mpeg');
+  return map[ext] || (isVideoFile(nameOrObj) ? 'video/mp4' : 'audio/mpeg');
 }
 function mediaApiUrl(f, type) {
   var t = encodeURIComponent(_token || '');
@@ -901,12 +932,18 @@ async function fallbackStreamMedia(src, f, player, statusWrap, statusText, statu
   cleanupActiveMedia();
   const ctrl = new AbortController();
   _activeMediaAbort = ctrl;
-  const ext = _fileExt(f.name);
-  const needsTranscode = ['mkv', 'avi'].includes(ext);
-  const fetchUrl = needsTranscode ? (src + '&transcode=1') : src;
+  const ext = _fileExt(f);
+  const isVid = isVideoFile(f);
+  const needsVidTranscode = isVid && ['mkv', 'avi', 'wmv', 'flv', 'ts', 'm2ts'].includes(ext);
+  const needsAudTranscode = !isVid && ['wma', 'aiff', 'aif', 'alac', 'flac'].includes(ext);
+  const fetchUrl = needsVidTranscode
+    ? (src + '&transcode=1')
+    : (needsAudTranscode ? (src + '&transcode=audio') : src);
 
   statusWrap.style.display = 'flex';
-  statusText.textContent = needsTranscode ? 'Transcoding & buffering stream…' : 'Buffering media stream…';
+  statusText.textContent = (needsVidTranscode || needsAudTranscode)
+    ? 'Transcoding & buffering stream…'
+    : 'Buffering media stream…';
   statusPct.textContent = '0%';
   statusFill.classList.remove('indeterminate', 'error', 'done');
   statusFill.style.width = '0%';
@@ -936,11 +973,14 @@ async function fallbackStreamMedia(src, f, player, statusWrap, statusText, statu
       }
     }
 
-    const mime = needsTranscode ? 'video/mp4' : getMediaMime(f.name);
+    const mime = needsVidTranscode
+      ? 'video/mp4'
+      : (needsAudTranscode ? 'audio/mpeg' : getMediaMime(f));
     const blob = new Blob(chunks, { type: mime });
     _activeMediaBlobUrl = URL.createObjectURL(blob);
     player.onerror = null;
     player.src = _activeMediaBlobUrl;
+    player.playbackRate = _playbackRate;
     statusWrap.style.display = 'none';
     player.play().catch(() => {});
   } catch (err) {
@@ -986,7 +1026,7 @@ function nextMediaTrack(type) {
 function openMedia(fJson, type) {
   cleanupActiveMedia();
   var f   = parseFileArg(fJson);
-  _mediaPlaylist = _currentFiles.filter(item => item.type !== 'folder' && (isVideoFile(item.name) || isAudioFile(item.name)));
+  _mediaPlaylist = _currentFiles.filter(item => item.type !== 'folder' && (isVideoFile(item) || isAudioFile(item)));
   _mediaIndex = _mediaPlaylist.findIndex(item => itemKey(item, type) === itemKey(f, type));
   if (_mediaIndex === -1) {
     _mediaPlaylist = [f];
@@ -994,15 +1034,27 @@ function openMedia(fJson, type) {
   }
 
   var src = mediaApiUrl(f, type);
-  var isVid = isVideoFile(f.name);
+  var isVid = isVideoFile(f);
+  var extBadge = (_fileExt(f) || (isVid ? 'video' : 'audio')).toUpperCase();
   var mediaEl = isVid
     ? '<video id="active-media-player" controls autoplay playsinline preload="auto" src="' + src + '" '
         + 'style="width:100%;max-height:66vh;background:#000;'
         + 'border-radius:var(--radius-md);display:block">'
         + 'Your browser cannot play this video.</video>'
-    : '<audio id="active-media-player" controls autoplay preload="auto" src="' + src + '" '
-        + 'style="width:100%;margin:var(--space-3) 0;display:block">'
-        + 'Your browser cannot play this audio.</audio>';
+    : '<div style="display:flex;flex-direction:column;gap:var(--space-3);background:var(--color-surface-offset);padding:var(--space-4);border-radius:var(--radius-lg);border:1px solid var(--color-border)">'
+        + '<div style="display:flex;align-items:center;gap:var(--space-3)">'
+        +   '<div style="width:48px;height:48px;border-radius:var(--radius-md);background:var(--color-primary-highlight);color:var(--color-primary);display:flex;align-items:center;justify-content:center;flex-shrink:0">'
+        +     '<svg data-lucide="music" width="24" height="24"></svg>'
+        +   '</div>'
+        +   '<div style="overflow:hidden;flex:1">'
+        +     '<div style="font-weight:600;font-size:var(--text-sm);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escHtml(f.name) + '</div>'
+        +     '<div style="font-size:var(--text-xs);color:var(--color-text-muted);font-family:var(--font-mono);margin-top:2px">' + escHtml(extBadge) + ' Audio Stream • ' + fmtSize(f.size) + '</div>'
+        +   '</div>'
+        + '</div>'
+        + '<audio id="active-media-player" controls autoplay preload="auto" src="' + src + '" '
+        +   'style="width:100%;display:block">'
+        +   'Your browser cannot play this audio.</audio>'
+      + '</div>';
   var styleW = isVid ? 'max-width:860px' : 'max-width:560px';
   var fjEsc  = encodeFileArg(f);
   var rates  = [0.5, 0.75, 1, 1.25, 1.5, 2];
@@ -1088,14 +1140,14 @@ function openMedia(fJson, type) {
       }
     };
     player.onerror = () => {
-      if (isVid && !triedTranscode) {
+      if (!triedTranscode) {
         triedTranscode = true;
         if (statusWrap) {
           statusWrap.style.display = 'flex';
           statusText.textContent = 'Transcoding stream for browser playback…';
           statusFill.classList.add('indeterminate');
         }
-        player.src = src + '&transcode=1';
+        player.src = src + (isVid ? '&transcode=1' : '&transcode=audio');
         player.load();
         player.play().catch(() => {});
         return;
@@ -1108,6 +1160,208 @@ function openMedia(fJson, type) {
   }
 }
 
+// ── In-Browser Image Lightbox Viewer ──────────────────────────────────────────
+let _imagePlaylist = [];
+let _imageIndex = -1;
+let _imageZoom = 1;
+
+function adjustImageZoom(delta, reset = false) {
+  if (reset) _imageZoom = 1;
+  else _imageZoom = Math.max(0.25, Math.min(4, Math.round((_imageZoom + delta) * 100) / 100));
+  const img = document.getElementById('active-image-preview');
+  const lbl = document.getElementById('image-zoom-label');
+  if (img) img.style.transform = `scale(${_imageZoom})`;
+  if (lbl) lbl.textContent = Math.round(_imageZoom * 100) + '%';
+}
+
+function prevImage(type) {
+  if (_imagePlaylist.length <= 1) return;
+  const idx = (_imageIndex - 1 + _imagePlaylist.length) % _imagePlaylist.length;
+  openImageViewer(encodeFileArg(_imagePlaylist[idx]), type);
+}
+
+function nextImage(type) {
+  if (_imagePlaylist.length <= 1) return;
+  const idx = (_imageIndex + 1) % _imagePlaylist.length;
+  openImageViewer(encodeFileArg(_imagePlaylist[idx]), type);
+}
+
+function openImageViewer(fJson, type) {
+  cleanupActiveMedia();
+  _imageZoom = 1;
+  const f = parseFileArg(fJson);
+  _imagePlaylist = _currentFiles.filter(item => item.type !== 'folder' && isImageFile(item));
+  _imageIndex = _imagePlaylist.findIndex(item => itemKey(item, type) === itemKey(f, type));
+  if (_imageIndex === -1) {
+    _imagePlaylist = [f];
+    _imageIndex = 0;
+  }
+
+  const src = mediaApiUrl(f, type);
+  const fjEsc = encodeFileArg(f);
+
+  showModal(`
+    <div class="modal-header">
+      <div style="display:flex;align-items:center;gap:var(--space-2);overflow:hidden;max-width:calc(100% - 48px)">
+        <svg data-lucide="image" width="16" height="16" style="color:var(--color-primary);flex-shrink:0"></svg>
+        <h3 style="font-size:var(--text-sm);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(f.name)}</h3>
+      </div>
+      <button class="btn btn-ghost btn-icon" onclick="closeModal()" title="Close">
+        <svg data-lucide="x" width="18" height="18"></svg>
+      </button>
+    </div>
+    <div class="modal-body" style="padding-top:var(--space-3);gap:var(--space-3)">
+      <div style="position:relative;width:100%;height:65vh;background:var(--color-bg);border:1px solid var(--color-border);border-radius:var(--radius-md);overflow:auto;display:flex;align-items:center;justify-content:center">
+        <div id="img-loading-spinner" class="spinner" style="position:absolute"></div>
+        <img id="active-image-preview" src="${src}" alt="${escHtml(f.name)}"
+             style="max-width:100%;max-height:100%;object-fit:contain;transition:transform 150ms ease;transform-origin:center center;cursor:zoom-in;display:none"
+             onclick="adjustImageZoom(_imageZoom === 1 ? 0.75 : 0, _imageZoom !== 1)"
+             onload="document.getElementById('img-loading-spinner')?.remove();this.style.display='block'"
+             onerror="const sp=document.getElementById('img-loading-spinner');if(sp)sp.outerHTML='<span style=\\'color:var(--color-error);font-size:var(--text-sm)\\'>Unable to preview image</span>'" />
+      </div>
+      <div class="media-controls-bar">
+        <div class="media-nav-group">
+          <button class="btn btn-secondary btn-sm" onclick="prevImage('${type}')" ${_imagePlaylist.length <= 1 ? 'disabled style="opacity:.45;cursor:not-allowed"' : ''} title="Previous image">
+            <svg data-lucide="chevron-left" width="14" height="14"></svg> Prev
+          </button>
+          <span class="media-track-badge">${_imageIndex + 1} / ${_imagePlaylist.length}</span>
+          <button class="btn btn-secondary btn-sm" onclick="nextImage('${type}')" ${_imagePlaylist.length <= 1 ? 'disabled style="opacity:.45;cursor:not-allowed"' : ''} title="Next image">
+            Next <svg data-lucide="chevron-right" width="14" height="14"></svg>
+          </button>
+        </div>
+        <div style="display:flex;align-items:center;gap:var(--space-1)">
+          <button class="btn btn-secondary btn-sm" onclick="adjustImageZoom(-0.25)" title="Zoom out">
+            <svg data-lucide="zoom-out" width="14" height="14"></svg>
+          </button>
+          <button class="btn btn-ghost btn-sm" id="image-zoom-label" onclick="adjustImageZoom(0, true)" style="font-family:var(--font-mono);min-width:52px" title="Reset zoom">100%</button>
+          <button class="btn btn-secondary btn-sm" onclick="adjustImageZoom(0.25)" title="Zoom in">
+            <svg data-lucide="zoom-in" width="14" height="14"></svg>
+          </button>
+        </div>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:var(--space-2)">
+        <span style="font-size:var(--text-xs);color:var(--color-text-muted);font-family:var(--font-mono)">${fmtSize(f.size)}</span>
+        <div style="display:flex;gap:var(--space-2)">
+          <a class="btn btn-secondary btn-sm" href="${src}" target="_blank" rel="noopener noreferrer" style="text-decoration:none">
+            <svg data-lucide="external-link" width="14" height="14"></svg> Open in New Tab
+          </a>
+          <button class="btn btn-primary btn-sm" onclick="dlFile('${fjEsc}','${type}')">
+            <svg data-lucide="download" width="14" height="14"></svg> Download
+          </button>
+        </div>
+      </div>
+    </div>
+  `, 'max-width:920px');
+  lucide.createIcons();
+}
+
+// ── In-Browser Document / Text / Generic Preview Modal ────────────────────────
+async function openBrowserPreview(fJson, type) {
+  cleanupActiveMedia();
+  const f = parseFileArg(fJson);
+  const src = mediaApiUrl(f, type);
+  const fjEsc = encodeFileArg(f);
+  const isPdf = isPdfFile(f);
+  const isTxt = isTextFile(f);
+
+  if (isPdf) {
+    showModal(`
+      <div class="modal-header">
+        <div style="display:flex;align-items:center;gap:var(--space-2);overflow:hidden;max-width:calc(100% - 48px)">
+          <svg data-lucide="file-text" width="16" height="16" style="color:var(--color-primary);flex-shrink:0"></svg>
+          <h3 style="font-size:var(--text-sm);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(f.name)}</h3>
+        </div>
+        <button class="btn btn-ghost btn-icon" onclick="closeModal()" title="Close">
+          <svg data-lucide="x" width="18" height="18"></svg>
+        </button>
+      </div>
+      <div class="modal-body" style="padding-top:var(--space-3);gap:var(--space-3)">
+        <iframe src="${src}" style="width:100%;height:70vh;border:1px solid var(--color-border);border-radius:var(--radius-md);background:#fff"></iframe>
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:var(--space-2)">
+          <span style="font-size:var(--text-xs);color:var(--color-text-muted);font-family:var(--font-mono)">${fmtSize(f.size)}</span>
+          <div style="display:flex;gap:var(--space-2)">
+            <a class="btn btn-secondary btn-sm" href="${src}" target="_blank" rel="noopener noreferrer" style="text-decoration:none">
+              <svg data-lucide="external-link" width="14" height="14"></svg> Open in New Tab
+            </a>
+            <button class="btn btn-primary btn-sm" onclick="dlFile('${fjEsc}','${type}')">
+              <svg data-lucide="download" width="14" height="14"></svg> Download
+            </button>
+          </div>
+        </div>
+      </div>
+    `, 'max-width:920px');
+    lucide.createIcons();
+    return;
+  }
+
+  if (isTxt) {
+    showModal(`
+      <div class="modal-header">
+        <div style="display:flex;align-items:center;gap:var(--space-2);overflow:hidden;max-width:calc(100% - 48px)">
+          <svg data-lucide="file-code" width="16" height="16" style="color:var(--color-primary);flex-shrink:0"></svg>
+          <h3 style="font-size:var(--text-sm);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(f.name)}</h3>
+        </div>
+        <button class="btn btn-ghost btn-icon" onclick="closeModal()" title="Close">
+          <svg data-lucide="x" width="18" height="18"></svg>
+        </button>
+      </div>
+      <div class="modal-body" style="padding-top:var(--space-3);gap:var(--space-3)">
+        <pre id="text-preview-box" style="width:100%;height:62vh;overflow:auto;padding:var(--space-4);background:var(--color-bg);border:1px solid var(--color-border);border-radius:var(--radius-md);font-family:var(--font-mono);font-size:var(--text-xs);line-height:1.55;white-space:pre-wrap;word-break:break-word;color:var(--color-text)">Loading file preview…</pre>
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:var(--space-2)">
+          <span style="font-size:var(--text-xs);color:var(--color-text-muted);font-family:var(--font-mono)">${fmtSize(f.size)}</span>
+          <div style="display:flex;gap:var(--space-2)">
+            <a class="btn btn-secondary btn-sm" href="${src}" target="_blank" rel="noopener noreferrer" style="text-decoration:none">
+              <svg data-lucide="external-link" width="14" height="14"></svg> Open in New Tab
+            </a>
+            <button class="btn btn-primary btn-sm" onclick="dlFile('${fjEsc}','${type}')">
+              <svg data-lucide="download" width="14" height="14"></svg> Download
+            </button>
+          </div>
+        </div>
+      </div>
+    `, 'max-width:860px');
+    lucide.createIcons();
+    try {
+      const r = await apiFetch(src);
+      const txt = await r.text();
+      const pre = document.getElementById('text-preview-box');
+      if (pre) pre.textContent = txt;
+    } catch (e) {
+      const pre = document.getElementById('text-preview-box');
+      if (pre) pre.textContent = 'Unable to load text preview: ' + e.message;
+    }
+    return;
+  }
+
+  // Fallback for any other file type: open in an in-browser preview frame with options to open in a new tab or download
+  showModal(`
+    <div class="modal-header">
+      <div style="display:flex;align-items:center;gap:var(--space-2);overflow:hidden;max-width:calc(100% - 48px)">
+        <svg data-lucide="${fileIcon(f)}" width="16" height="16" style="color:var(--color-primary);flex-shrink:0"></svg>
+        <h3 style="font-size:var(--text-sm);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(f.name)}</h3>
+      </div>
+      <button class="btn btn-ghost btn-icon" onclick="closeModal()" title="Close">
+        <svg data-lucide="x" width="18" height="18"></svg>
+      </button>
+    </div>
+    <div class="modal-body" style="padding-top:var(--space-3);gap:var(--space-3)">
+      <iframe src="${src}" style="width:100%;height:60vh;border:1px solid var(--color-border);border-radius:var(--radius-md);background:var(--color-bg)"></iframe>
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:var(--space-2)">
+        <span style="font-size:var(--text-xs);color:var(--color-text-muted);font-family:var(--font-mono)">${fmtSize(f.size)}</span>
+        <div style="display:flex;gap:var(--space-2)">
+          <a class="btn btn-secondary btn-sm" href="${src}" target="_blank" rel="noopener noreferrer" style="text-decoration:none">
+            <svg data-lucide="external-link" width="14" height="14"></svg> Open in New Tab
+          </a>
+          <button class="btn btn-primary btn-sm" onclick="dlFile('${fjEsc}','${type}')">
+            <svg data-lucide="download" width="14" height="14"></svg> Download
+          </button>
+        </div>
+      </div>
+    </div>
+  `, 'max-width:860px');
+  lucide.createIcons();
+}
+
 function fileClick(fJson, type, ev) {
   if (ev && (ev.shiftKey || ev.metaKey || ev.ctrlKey)) {
     toggleSelectItem(fJson, type, ev);
@@ -1115,8 +1369,10 @@ function fileClick(fJson, type, ev) {
   }
   const f = parseFileArg(fJson);
   if (f.type !== 'folder') {
-    if (isVideoFile(f.name) || isAudioFile(f.name)) { openMedia(fJson, type); return; }
-    dlFile(fJson, type); return;
+    if (isVideoFile(f) || isAudioFile(f)) { openMedia(fJson, type); return; }
+    if (isImageFile(f)) { openImageViewer(fJson, type); return; }
+    openBrowserPreview(fJson, type);
+    return;
   }
   if (type==='smb') {
     _path = f.path || (_path.replace(/\/$/,'') + '/' + f.name);
@@ -1309,7 +1565,8 @@ function openContextMenu(e, fJson, type) {
   const f = parseFileArg(fJson);
   const key = itemKey(f, type);
   const isSel = _selectedItems.has(key);
-  const isMedia = f.type !== 'folder' && (isVideoFile(f.name) || isAudioFile(f.name));
+  const isMedia = f.type !== 'folder' && (isVideoFile(f) || isAudioFile(f));
+  const isImg = f.type !== 'folder' && isImageFile(f);
   const menu = document.getElementById('context-menu');
 
   let html = '';
@@ -1319,7 +1576,15 @@ function openContextMenu(e, fJson, type) {
     </button>`;
   } else if (isMedia) {
     html += `<button class="ctx-item" onclick="closeContextMenu();openMedia('${fJson}','${type}')">
-      <svg data-lucide="play"></svg> Stream Media
+      <svg data-lucide="play"></svg> ${isAudioFile(f) ? 'Stream Audio' : 'Stream Video'}
+    </button>`;
+  } else if (isImg) {
+    html += `<button class="ctx-item" onclick="closeContextMenu();openImageViewer('${fJson}','${type}')">
+      <svg data-lucide="image"></svg> View Image
+    </button>`;
+  } else {
+    html += `<button class="ctx-item" onclick="closeContextMenu();openBrowserPreview('${fJson}','${type}')">
+      <svg data-lucide="eye"></svg> Open in Browser
     </button>`;
   }
 

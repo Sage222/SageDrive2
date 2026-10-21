@@ -7,6 +7,8 @@
   <meta name="description" content="Self-hosted browser-based file manager providing unified access to SMB/NAS shares and Google Drive from a single interface." />
   <meta property="og:title" content="SageDrive" />
   <meta property="og:description" content="Self-hosted browser-based file manager providing unified access to SMB/NAS shares and Google Drive from a single interface." />
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' fill='none'%3E%3Crect width='64' height='64' rx='16' fill='%2301696f'/%3E%3Crect x='4' y='4' width='56' height='56' rx='13' stroke='%234f98a3' stroke-opacity='0.35' stroke-width='2'/%3E%3Cpath d='M14 45L25.5 19L32.5 35L39.5 23.5L51 45' stroke='%23ffffff' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='49' cy='19' r='4.5' fill='%237fd8e6'/%3E%3C/svg%3E" />
+  <link rel="alternate icon" href="/favicon.svg" />
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300..700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -315,7 +317,7 @@
 <div id="app" style="display:none">
   <aside class="sidebar" id="sidebar">
     <div class="sidebar-header">
-      <a class="sidebar-header-link" href="https://github.com/Sage222/SageDrive" target="_blank" rel="noopener noreferrer" title="Open SageDrive on GitHub">
+      <a class="sidebar-header-link" href="https://github.com/Sage222/SageDrive2" target="_blank" rel="noopener noreferrer" title="Open SageDrive on GitHub">
         <svg class="sidebar-logo" viewBox="0 0 28 28" fill="none">
           <rect width="28" height="28" rx="7" fill="currentColor" opacity=".12"/>
           <path d="M6 20L11 8l3 7 3-5 5 10" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -963,16 +965,20 @@ async function authedDownload(path, name, knownSize = 0) {
         const speedStr = fmtSize(Math.round(receivedBytes / elapsedSec)) + '/s';
 
         if (totalBytes > 0) {
-          const pct = Math.min(100, Math.round((receivedBytes / totalBytes) * 100));
+          const pct = receivedBytes >= totalBytes ? 100 : Math.min(99, Math.floor((receivedBytes / totalBytes) * 100));
           fillEl.style.width = pct + '%';
           pctEl.textContent = pct + '%';
           statusEl.textContent = `${fmtSize(receivedBytes)} / ${fmtSize(totalBytes)} • ${speedStr}`;
+          if (receivedBytes >= totalBytes) {
+            try { reader.cancel(); } catch (_) {}
+            break;
+          }
         } else {
           pctEl.textContent = speedStr;
           statusEl.textContent = `${fmtSize(receivedBytes)} downloaded`;
         }
       }
-      blob = new Blob(chunks, { type: r.headers.get('Content-Type') || 'application/octet-stream' });
+      blob = new Blob(chunks, { type: 'application/octet-stream' });
     } else {
       fillEl.classList.add('indeterminate');
       statusEl.textContent = 'Downloading…';
@@ -986,17 +992,25 @@ async function authedDownload(path, name, knownSize = 0) {
     pctEl.textContent = '100%';
     statusEl.textContent = `Complete • ${fmtSize(blob.size)}`;
     card.classList.add('success');
-    if (cancelBtn) cancelBtn.style.display = 'none';
 
     const objUrl = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = objUrl;
     a.download = name;
+    a.style.display = 'none';
     document.body.appendChild(a);
     a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(objUrl), 10000);
-    setTimeout(() => card.remove(), 2800);
+
+    // Provide a direct Save button on the completed card in case browser popup/activation rules suppressed auto-save after a long transfer
+    if (cancelBtn) {
+      cancelBtn.outerHTML = `<a href="${objUrl}" download="${escHtml(name)}" class="btn btn-primary btn-sm" style="text-decoration:none;padding:2px 8px;font-size:11px" onclick="setTimeout(()=>document.getElementById('${dlId}')?.remove(), 500)">Save</a>`;
+    }
+
+    setTimeout(() => {
+      try { a.remove(); } catch (_) {}
+    }, 2000);
+    setTimeout(() => URL.revokeObjectURL(objUrl), 300000);
+    setTimeout(() => card.remove(), 6000);
   } catch (e) {
     _activeDownloads.delete(dlId);
     if (e.name === 'AbortError') {
@@ -1259,6 +1273,8 @@ async function renderSettings() {
           </button>` : ``}
         </div>
       </div>
+    </div>
+
     <!-- SMB Proxy Credentials -->
     <div class="card">
       <div class="card-header">
@@ -1295,6 +1311,22 @@ async function renderSettings() {
           Map a drive in PowerShell (run as Administrator):<br/>
           <code style="font-family:var(--font-mono)">net use G: &#92;&#92;10.0.0.152&#92;GoogleDrive /user:${escHtml(smbProxyCreds.username)} * /persistent:yes</code>
         </div>
+      </div>
+    </div>
+
+    <!-- About / Version -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">About SageDrive</span>
+        <span class="badge badge-primary">Version 1.0</span>
+      </div>
+      <div class="card-body" style="display:flex;align-items:center;justify-content:space-between;gap:var(--space-4);flex-wrap:wrap">
+        <div style="font-size:var(--text-sm);color:var(--color-text-muted)">
+          Unified self-hosted SMB/NAS &amp; Google Drive file manager.
+        </div>
+        <a class="btn btn-secondary btn-sm" href="https://github.com/Sage222/SageDrive2" target="_blank" rel="noopener noreferrer" style="text-decoration:none">
+          <svg data-lucide="external-link" width="14" height="14"></svg> GitHub Repository
+        </a>
       </div>
     </div>
 

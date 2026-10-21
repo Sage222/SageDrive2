@@ -61,8 +61,8 @@ All file access is proxied through your own server — no data touches any third
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/Sage222/SageDrive.git
-cd SageDrive
+git clone https://github.com/Sage222/SageDrive2.git
+cd SageDrive2
 ```
 
 ### 2. Configure environment variables

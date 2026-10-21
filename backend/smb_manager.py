@@ -1,4 +1,4 @@
-import json, os, io, socket, tempfile
+import json, os, io, socket, tempfile, queue, threading
 from pathlib import Path
 from smb.SMBConnection import SMBConnection
 
@@ -64,27 +64,78 @@ def get_file_size(share_id, path):
 
 def stream_file_range(share_id, path, start=0, length=None, chunk_size=262144):
     """
-    Generator that streams a byte range [start, start + length) directly from SMB
-    using retrieveFileFromOffset without downloading the whole file to /tmp first.
+    Streams a byte range [start, start + length) from SMB using a single
+    retrieveFileFromOffset (or retrieveFile) call in a background thread.
+    Flushes the final chunk and signals completion before closing the SMB socket
+    so HTTP downloads never hang at 100%.
     """
-    cfg = _cfg(share_id)
-    c = _conn(cfg)
-    try:
-        offset = start
-        remaining = length
-        while remaining is None or remaining > 0:
-            to_read = chunk_size if remaining is None else min(chunk_size, remaining)
-            buf = io.BytesIO()
-            c.retrieveFileFromOffset(cfg["share"], path, buf, offset=offset, max_length=to_read)
-            data = buf.getvalue()
+    q = queue.Queue(maxsize=32)
+    sentinel = object()
+
+    class _QueueWriter:
+        def __init__(self, max_bytes):
+            self.remaining = max_bytes
+            self.buf = bytearray()
+
+        def write(self, data):
             if not data:
-                break
-            offset += len(data)
-            if remaining is not None:
-                remaining -= len(data)
-            yield data
-    finally:
-        c.close()
+                return 0
+            if self.remaining is not None:
+                if self.remaining <= 0:
+                    return 0
+                if len(data) > self.remaining:
+                    data = data[:self.remaining]
+                self.remaining -= len(data)
+            self.buf.extend(data)
+            while len(self.buf) >= chunk_size:
+                q.put(bytes(self.buf[:chunk_size]))
+                del self.buf[:chunk_size]
+            return len(data)
+
+        def flush(self):
+            if self.buf:
+                q.put(bytes(self.buf))
+                self.buf.clear()
+
+    def _producer():
+        c = None
+        try:
+            cfg = _cfg(share_id)
+            c = _conn(cfg)
+            writer = _QueueWriter(length)
+            if start == 0 and length is None:
+                c.retrieveFile(cfg["share"], path, writer)
+            else:
+                max_len = length if (length is not None and length > 0) else -1
+                c.retrieveFileFromOffset(cfg["share"], path, writer, offset=start, max_length=max_len)
+            writer.flush()
+        except Exception as e:
+            try:
+                writer.flush()
+            except Exception:
+                pass
+            q.put(e)
+        finally:
+            q.put(sentinel)
+            if c is not None:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+
+    threading.Thread(target=_producer, daemon=True).start()
+
+    sent = 0
+    while True:
+        item = q.get()
+        if item is sentinel:
+            break
+        if isinstance(item, Exception):
+            raise item
+        sent += len(item)
+        yield item
+        if length is not None and sent >= length:
+            break
 
 def retrieve_to_tmpfile(share_id, path):
     """

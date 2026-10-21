@@ -300,11 +300,11 @@
     <form id="login-form" style="display:flex;flex-direction:column;gap:var(--space-4)">
       <div class="form-group">
         <label class="form-label" for="login-user">Username</label>
-        <input class="form-input" id="login-user" type="text" value="admin" placeholder="admin" required />
+        <input class="form-input" id="login-user" type="text" required />
       </div>
       <div class="form-group">
         <label class="form-label" for="login-pass">Password</label>
-        <input class="form-input" id="login-pass" type="password" value="changeme" placeholder="changeme" required />
+        <input class="form-input" id="login-pass" type="password" required />
       </div>
       <div id="login-error" style="color:var(--color-error);font-size:var(--text-sm);display:none"></div>
       <button class="btn btn-primary" type="submit" id="login-btn" style="margin-top:var(--space-2)">Sign in</button>
@@ -788,14 +788,12 @@ function openMedia(fJson, type) {
   var f   = parseFileArg(fJson);
   var src = mediaApiUrl(f, type);
   var isVid = isVideoFile(f.name);
-  var ext = _fileExt(f.name);
-  var initialSrc = ['mkv', 'avi'].includes(ext) ? (src + '&transcode=1') : src;
   var mediaEl = isVid
-    ? '<video id="active-media-player" controls autoplay playsinline preload="auto" src="' + initialSrc + '" '
+    ? '<video id="active-media-player" controls autoplay playsinline preload="auto" src="' + src + '" '
         + 'style="width:100%;max-height:70vh;background:#000;'
         + 'border-radius:var(--radius-md);display:block">'
         + 'Your browser cannot play this video.</video>'
-    : '<audio id="active-media-player" controls autoplay preload="auto" src="' + initialSrc + '" '
+    : '<audio id="active-media-player" controls autoplay preload="auto" src="' + src + '" '
         + 'style="width:100%;margin:var(--space-4) 0;display:block">'
         + 'Your browser cannot play this audio.</audio>';
   var styleW = isVid ? 'max-width:860px' : '';
@@ -830,6 +828,7 @@ function openMedia(fJson, type) {
   const statusFill = document.getElementById('media-stream-fill');
 
   if (player) {
+    let triedTranscode = false;
     let triedFallback = false;
     player.onloadeddata = () => {
       if (statusWrap) statusWrap.style.display = 'none';
@@ -838,7 +837,7 @@ function openMedia(fJson, type) {
       if (statusWrap) statusWrap.style.display = 'none';
     };
     player.onwaiting = () => {
-      if (statusWrap && ! _activeMediaBlobUrl) {
+      if (statusWrap && !_activeMediaBlobUrl) {
         statusWrap.style.display = 'flex';
         statusText.textContent = 'Buffering…';
         statusFill.classList.add('indeterminate');
@@ -848,9 +847,22 @@ function openMedia(fJson, type) {
       if (statusWrap) statusWrap.style.display = 'none';
     };
     player.onerror = () => {
-      if (triedFallback) return;
-      triedFallback = true;
-      fallbackStreamMedia(src, f, player, statusWrap, statusText, statusPct, statusFill);
+      if (isVid && !triedTranscode) {
+        triedTranscode = true;
+        if (statusWrap) {
+          statusWrap.style.display = 'flex';
+          statusText.textContent = 'Transcoding stream for browser playback…';
+          statusFill.classList.add('indeterminate');
+        }
+        player.src = src + '&transcode=1';
+        player.load();
+        player.play().catch(() => {});
+        return;
+      }
+      if (!triedFallback) {
+        triedFallback = true;
+        fallbackStreamMedia(src, f, player, statusWrap, statusText, statusPct, statusFill);
+      }
     };
   }
 }

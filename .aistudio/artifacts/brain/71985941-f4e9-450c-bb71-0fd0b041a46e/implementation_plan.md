@@ -1,100 +1,98 @@
-# SageDrive Feature & Workflow Expansion Plan
+# Multi-Drive SMB Proxy (Per-Drive Shares, Custom SMB Names & Live Mount Controls)
 
-This upgrade equips SageDrive with desktop-grade file management—in-place renaming, multi-select batch actions with streaming ZIP downloads, recursive folder uploads, server-to-server cross-drive transfers between SMB and Google Drive, a right-click context menu, and media player playlist and speed controls.
+Upgrade the SageDrive SMB Proxy so every connected Google Drive account can be individually toggled on or off as its own network SMB share, given a custom SMB share name in Settings, and mounted/unmounted live via `rclone` + Samba without restarting the Docker container.
 
-### User Review & Critical Decisions
+## User Review & Critical Decisions
 
 > [!IMPORTANT]
-> All core feature selections below reflect your confirmed choices and will be implemented across both the Docker production backend and the live preview server so everything stays in sync.
+> The following architectural and UX choices incorporate your selections from our clarification questions:
 
-- **Confirmed Decision — File Operations**: In-place rename for files and folders, multi-select checkboxes with batch delete and ZIP download, recursive drag-and-drop folder uploads, and direct cross-drive copy between SMB shares and Google Drive.
-- **Confirmed Decision — Media Player Upgrades**: Next/Previous track navigation across media files in the active directory plus playback speed controls (`0.5x` to `2x`).
-- **Confirmed Decision — Desktop UI Interaction**: Custom right-click context menu on files and folders in both list and grid views.
-
----
-
-### 1. Overview & Core Concept
-
-- **What It Does**: Transforms SageDrive from a basic single-file browser into a complete multi-drive workspace where users can manage batches of files, upload whole folder hierarchies, transfer files directly between NAS shares and Google Drive on the server, and step through media playlists without leaving the player.
-- **Target Audience / Persona**: Self-hosted home lab and NAS operators managing media libraries, backups, and documents across local SMB servers and Google Drive.
-- **Key Value**: Eliminates tedious one-by-one file operations and avoids routing cross-drive transfers through the client browser.
+- **Confirmed Decision 1 — Separate SMB Share per Google Drive**: Each enabled Google Drive account is mounted to its own dedicated FUSE directory (`/mnt/gdrive/<account_id>`) via `rclone` and exported as an independent `[<ShareName>]` block in Samba (`\\<host>\<ShareName>`).
+- **Confirmed Decision 2 — Custom SMB Share Name per Drive in Settings**: In the **SMB Proxy** settings card, each connected Google Drive has an editable **SMB Share Name** input (e.g., `GoogleDrive`, `PersonalDrive`, `WorkDrive`) sanitized for Windows/macOS/Linux network share compatibility.
+- **Confirmed Decision 3 — Per-Drive Enable/Disable Toggle**: Each connected Google Drive has an on/off toggle in the **SMB Proxy** section of Settings. Toggling a drive on/off or renaming its SMB share immediately reconciles the `rclone` FUSE mount and reloads Samba (`smbcontrol all reload-config` / `smbd`) live without requiring a container restart.
 
 ---
 
-### 2. User Experience & Visual Design
+## 1. Overview & Core Concept
+
+- **What It Does**: Transforms the static single-drive boot-time SMB Proxy into a dynamic, multi-account SMB Proxy manager. Users can expose one, several, or all of their connected Google Drive accounts as distinct Windows/macOS/NAS network shares on port `445`.
+- **Target Audience / Persona**: Self-hosted home lab and NAS users who connect multiple Google Drive accounts in SageDrive and want to mount specific drives directly in Windows Explorer, macOS Finder, or media players (Plex/Infuse/Kodi) over SMB.
+- **Key Value**: Eliminates the single-drive bottleneck (`gdrive_token.json` / `/mnt/gdrive`) and removes the need to restart the Docker container after connecting or reconfiguring a Google Drive.
+
+---
+
+## 2. User Experience & Visual Design
 
 - **Key User Flows**:
-  1. **Right-Click Context Menu**: Right-clicking any file or folder card/row opens a floating menu positioned at the cursor (automatically clamped to viewport edges) with instant actions: *Open / Play*, *Download (or Download ZIP)*, *Rename*, *Copy to Drive…*, *Select*, and *Delete*.
-  2. **In-Place Rename**: Selecting *Rename* opens a pre-filled modal with the filename stem highlighted so the user can type a new name and press `Enter` to rename on SMB or Google Drive immediately.
-  3. **Multi-Select & Batch Action Bar**: Clicking a row/card checkbox (or choosing *Select* from the context menu) activates a contextual batch toolbar in the top action area showing the selected count alongside **Select All**, **Download ZIP**, **Copy to Drive…**, **Delete Selected**, and **Clear**.
-  4. **Recursive Folder Drag-and-Drop Upload**: Dropping one or more folders onto the upload dropzone (or clicking *Choose Folder*) recursively traverses all nested files, automatically creates the required subfolder structure on the target SMB share or Google Drive folder, and displays overall + per-file progress in the upload progress bar.
-  5. **Cross-Drive Server Transfer**: Choosing *Copy to Drive…* on a single item or multi-selection opens a destination picker modal where the user selects any configured SMB share or Google Drive (and optional target subfolder). The backend streams the file directly from source to destination and reports transfer completion.
-  6. **Enhanced Media Player Modal**: Opening any video or audio file detects all sibling media files in the current folder, adding **Previous** and **Next** track buttons, a track position counter (`2 / 8`), an auto-play next toggle, and a segmented **Playback Speed** control (`0.5x`, `0.75x`, `1x`, `1.25x`, `1.5x`, `2x`).
+  1. **Viewing SMB Proxy Shares (`Settings → SMB Proxy`)**:
+     - The **SMB Proxy — Windows Network Drives** card displays:
+       - **Global Samba Credentials**: The shared SMB username & password used to authenticate from Windows Explorer / Finder.
+       - **Per-Drive SMB Shares Table/List**: A dedicated row for each connected Google Drive account showing:
+         - Drive display name & Google account email.
+         - Live status indicator (`Mounted & Shared`, `Disabled`, or `Mount Pending`).
+         - **Enable SMB Share** toggle switch.
+         - **SMB Share Name** input field (defaults to a clean slug of the drive's name, e.g., `GoogleDrive` for the primary drive, `WorkDrive`, etc.) with a **Save / Apply** button.
+         - One-click **Copy UNC Path** (`\\<host>\<smb_share_name>`) and **Copy PowerShell Map Command** (`net use Z: \\<host>\<smb_share_name> /user:<user> <password> /persistent:yes`).
+  2. **Toggling or Renaming a Share Live**:
+     - Flipping the toggle or updating the SMB share name calls the backend SMB Proxy reconciliation endpoint.
+     - The backend writes the updated `rclone.conf`, starts or stops the corresponding `rclone mount` daemon for that account, regenerates `/etc/samba/smb.conf` with a share stanza per enabled drive, and signals `smbd` to reload its configuration immediately.
+  3. **Container Startup & Self-Healing**:
+     - On container boot (and when the Flask backend starts), SageDrive automatically reconciles all enabled Google Drives from `gdrive_accounts.json` so all configured SMB shares come online automatically.
+
 - **Visual Identity & Theme**:
-  - *Aesthetic Direction*: Clean utilitarian dark/light workspace preserving SageDrive's existing warm-slate surface hierarchy (`--color-bg`, `--color-surface`, `--color-surface-offset`) and deep teal accent (`--color-primary: #01696f` / `#4f98a3`).
-  - *Typography & Tabular Discipline*: `JetBrains Mono` and `tabular-nums` for byte counters, transfer speeds, media timestamps, playback speed indicators, and batch selection counts so numbers never jitter during updates.
-  - *Component Styling & Layout*: Single-elevation surfaces with `1px solid var(--color-border)`, compact 40px list rows, and smooth `180ms cubic-bezier(.16, 1, .3, 1)` transitions.
+  - **Aesthetic Direction**: Clean, high-density utilitarian dashboard matching SageDrive's existing dark/light theme variables (`--color-surface`, `--color-surface-offset`, `--color-primary`, `--font-mono`).
+  - **Typography & Hierarchy**: Monospace tabular figures (`--font-mono`) for UNC paths (`\\host\ShareName`), mount paths, and PowerShell `net use` commands; crisp sans-serif labels for drive names and controls.
+  - **Interactive Feedback**: Instant loading/applying state on the per-drive row while `rclone` mounts the FUSE filesystem, followed by a toast confirmation and live status update.
 
 ---
 
-### 3. Key Product Decisions & Trade-Offs
+## 3. Key Product Decisions & Trade-Offs
 
-- **Decision 1: Server-Side Cross-Drive Transfer vs. Client Relay**
-  - *Chosen Approach*: Perform SMB-to-Google-Drive, Google-Drive-to-SMB, and SMB-to-SMB transfers directly on the backend server via a dedicated `/api/transfer` endpoint.
-  - *Why*: Downloading a large NAS file to the browser just to re-upload it to Google Drive wastes local bandwidth and fails if the browser tab closes. Server-side streaming pipes bytes directly between `pysmb` and the Google Drive API.
-- **Decision 2: On-the-Fly ZIP Archive Generation for Multi-Select & Folder Downloads**
-  - *Chosen Approach*: Stream a dynamically assembled `.zip` archive from the backend (`/api/smb/zip` and `/api/gdrive/zip`) into the existing download progress bar manager.
-  - *Why*: Browsers block triggering dozens of simultaneous single-file downloads, whereas a single streamed `.zip` archive preserves folder paths and works seamlessly with the download progress bar.
-- **Decision 3: Directory Tree Preservation on Folder Upload**
-  - *Chosen Approach*: Use the standard HTML5 `webkitGetAsEntry()` recursive directory reader for drag-and-drop and `<input webkitdirectory>` for the folder picker, passing each file's relative path to the backend so intermediate folders are created automatically.
-  - *Why*: Works across all modern desktop browsers without requiring external client libraries.
+- **Decision 1: Backend-Driven Live Reconciliation vs. Boot-Time `entrypoint.sh` Script**
+  - *Chosen Approach*: Move `rclone.conf` generation, FUSE mount lifecycle management, and `/etc/samba/smb.conf` generation into a dedicated backend manager that runs both at startup and on-demand via API whenever accounts or SMB proxy settings change.
+  - *Why*: Previously, `entrypoint.sh` only ran once when the container started — meaning newly connected Google Drives could never be mounted without restarting the container, and only `gdrive_token.json` was read. Furthermore, because `docker-compose.yml` bind-mounts the backend directly, handling multi-drive reconciliation inside the Python backend ensures existing deployments get multi-drive SMB Proxy support immediately without needing to rebuild the base Docker image.
+  - *Alternatives Considered*: Only updating `entrypoint.sh` — rejected because changes in the web UI wouldn't take effect until a manual container restart and would require image rebuilds.
+
+- **Decision 2: Share Name Sanitization & Uniqueness Validation**
+  - *Chosen Approach*: Validate SMB share names to allow alphanumeric characters, hyphens, and underscores (`[A-Za-z0-9_-]{1,32}`), prevent reserved names (`global`, `homes`, `printers`, `IPC$`), and enforce case-insensitive uniqueness across all connected Google Drives.
+  - *Why*: Prevents invalid `/etc/samba/smb.conf` section headers and Windows Explorer UNC path resolution conflicts.
 
 ---
 
-### 4. Technical Architecture & Data Strategy *(Technical Reference)*
+## 4. Technical Architecture & Data Strategy *(Technical Reference)*
 
 - **Architecture & Component Diagram**:
-
-```
-┌────────────────────────────────────────────────────────────────────────────┐
-│                         SageDrive Frontend SPA                             │
-│                                                                            │
-│  ┌──────────────────────┐  ┌──────────────────────┐  ┌──────────────────┐  │
-│  │   File Browser UI    │  │  Context Menu &      │  │  Media Player    │  │
-│  │  • List & Grid Views │  │  Batch Action Bar    │  │  Modal           │  │
-│  │  • Multi-Select      │  │  • Rename Modal      │  │  • Prev / Next   │  │
-│  │    Checkboxes        │  │  • Copy-to-Drive     │  │    Playlist      │  │
-│  │  • Folder Dropzone   │  │    Destination Modal │  │  • Speed (0.5-2x)│  │
-│  └──────────┬───────────┘  └──────────┬───────────┘  └────────┬─────────┘  │
-└─────────────┼─────────────────────────┼───────────────────────┼────────────┘
-              │                         │                       │
-              ▼                         ▼                       ▼
-┌────────────────────────────────────────────────────────────────────────────┐
-│                        Backend API Layer (REST)                            │
-│                                                                            │
-│  • POST /api/smb/rename/<id>        • POST /api/gdrive/rename/<file_id>    │
-│  • POST /api/smb/zip/<id>           • POST /api/gdrive/zip                 │
-│  • POST /api/smb/upload/<id>        • POST /api/gdrive/upload              │
-│    (with relative_path tree)          (with relative_path folder cache)    │
-│  • POST /api/transfer (SMB ↔ Google Drive & SMB ↔ SMB recursive copy)      │
-└─────────────────────────┬─────────────────────────────┬────────────────────┘
-                          │                             │
-                          ▼                             ▼
-           ┌─────────────────────────────┐ ┌─────────────────────────┐
-           │     SMB Manager (pysmb)     │ │  Google Drive Manager   │
-           │  • rename()                 │ │  • rename_file()        │
-           │  • recursive walk & zip     │ │  • recursive walk & zip │
-           │  • ensure_parent_dirs()     │ │  • ensure_folder_path() │
-           └─────────────────────────────┘ └─────────────────────────┘
+```text
+┌───────────────────────────────────────────────────────────────────────────┐
+│                   Settings → SMB Proxy UI (Frontend SPA)                  │
+│  ┌───────────────────────────────┐  ┌──────────────────────────────────┐  │
+│  │ Global Samba Auth Credentials │  │ Per-Drive SMB Share Rows         │  │
+│  │ • Username / Password         │  │ • [Toggle] Enable SMB Share      │  │
+│  └──────────────┬────────────────┘  │ • [Input]  Custom SMB Share Name │  │
+│                 │                   │ • [Copy]   UNC & PowerShell Cmd  │  │
+│                 ▼                   └─────────────────┬────────────────┘  │
+└─────────────────┼─────────────────────────────────────┼───────────────────┘
+                  │ POST /api/smb/proxy-credentials     │ POST /api/smb/proxy-shares
+                  ▼                                     ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│                     SageDrive Backend (SMB Proxy Manager)                 │
+│  1. Reads & updates `gdrive_accounts.json` (`smb_enabled`, `smb_share`)   │
+│  2. Writes `/root/.config/rclone/rclone.conf` with `[gdrive_<id>]` blocks │
+│  3. Mounts enabled drives to `/mnt/gdrive/<id>` via `rclone mount` FUSE   │
+│     and unmounts disabled/removed drives (`fusermount -u` / `umount -l`)  │
+│  4. Generates `/etc/samba/smb.conf` with `[<smb_share_name>]` stanzas     │
+│  5. Reloads Samba (`smbcontrol all reload-config` / `pkill -HUP smbd`)    │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Data Model & State**:
-  - `_currentFiles`: Array of file/folder metadata objects in the active directory, used by the browser view, multi-select state, and media playlist filter.
-  - `_selectedItems`: `Map` of selected item keys (`path` for SMB, `id` for Google Drive) to item metadata. Automatically cleared when navigating to a different folder or drive.
-  - `_mediaPlaylist` & `_mediaIndex`: Filtered list of playable video/audio items from `_currentFiles` and the active index, enabling instant Previous/Next track switching while preserving the chosen `_playbackRate`.
+- **Data Model & State (`gdrive_accounts.json`)**:
+  - Each account object in `gdrive_accounts.json` is extended with two optional fields:
+    - `smb_enabled` (`boolean`): Defaults to `true` for the first/default drive (preserving backward compatibility) and configurable per drive.
+    - `smb_share_name` (`string`): Custom Samba share name (defaults to `GoogleDrive` for the primary drive, or a sanitized unique name such as `GoogleDrive_2` or the sanitized custom drive name).
+
 - **Interactive Component & State Mapping**:
-  - **Right-Click Context Menu**: Listens to `contextmenu` on file cards/rows, prevents default browser menu, highlights the target item, and renders context-sensitive actions (`Stream` only on media files, `Download ZIP` on folders, `Rename`, `Copy to Drive…`, `Select`, `Delete`). Dismisses on outside click, scroll, or `Escape`.
-  - **Rename Flow**: Validates non-empty and changed name, calls `/api/smb/rename/<share_id>` (`{ path, new_name }`) or `/api/gdrive/rename/<file_id>` (`{ name }`), updates the current view, and shows a completion toast.
-  - **Batch Delete & ZIP Download**: Iterates selected items for batch deletion or posts selected paths/IDs to `/api/smb/zip/<share_id>` or `/api/gdrive/zip`, piping the response directly into `authedDownload()` so the progress bar tracks the archive download.
-  - **Folder Upload Flow**: Collects `[File, relativePath]` pairs from `webkitGetAsEntry()` or `file.webkitRelativePath`, resolves/creates parent subfolders sequentially (caching created folder IDs on Google Drive to avoid duplicate folders), and streams each file with `uploadFileWithProgress()`.
-  - **Cross-Drive Copy Flow**: Opens a modal listing available target drives (Google Drive + all configured SMB shares) and lets the user browse/pick a destination folder, then invokes `POST /api/transfer` (`{ src_type, src_drive, items, dest_type, dest_drive, dest_folder }`) which streams files and recursively copies folders between drives.
+  - `GET /api/smb/proxy-shares`: Returns global Samba credential status plus the list of all connected Google Drives with their `id`, `name`, `email`, `smb_enabled`, `smb_share_name`, and live `mounted` status.
+  - `POST /api/smb/proxy-shares/<account_id>`: Updates `smb_enabled` and/or `smb_share_name` for a specific Google Drive account, validates share name uniqueness, triggers live `rclone` + `smb.conf` reconciliation, and returns the updated share state.
+  - `POST /api/smb/proxy-reconcile`: Forces a full re-sync of all `rclone` mounts and Samba share definitions.
+  - Automatic Hooks: Connecting a new Google Drive, refreshing OAuth tokens, or disconnecting a Google Drive automatically triggers SMB Proxy reconciliation so mounts and shares stay in sync.
+  - Documentation Update: `README.md` will also be updated to document the multi-drive SMB Proxy configuration and per-drive share naming.

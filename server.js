@@ -1201,9 +1201,65 @@ function isGDriveConfigured() {
   return Boolean(cfg.client_id && cfg.client_secret && cfg.redirect_uri);
 }
 
+const RESERVED_SMB_NAMES = new Set(['global', 'homes', 'printers', 'print$', 'ipc$']);
+
+function sanitizeSmbShareName(rawName, fallback = 'GoogleDrive') {
+  let cleaned = String(rawName || '')
+    .trim()
+    .replace(/[^A-Za-z0-9_-]+/g, '_')
+    .replace(/^[_-]+|[_-]+$/g, '');
+  if (!cleaned || RESERVED_SMB_NAMES.has(cleaned.toLowerCase())) {
+    cleaned = fallback;
+  }
+  return cleaned.slice(0, 32);
+}
+
+function ensureSmbProxyFields(accounts) {
+  const used = new Set();
+  let changed = false;
+  accounts.forEach((a, idx) => {
+    if (typeof a.smb_enabled !== 'boolean') {
+      a.smb_enabled = true;
+      changed = true;
+    }
+    const rawShare = String(a.smb_share_name || '').trim();
+    if (!rawShare) {
+      const defaultBase =
+        idx === 0 || a.id === 'default'
+          ? 'GoogleDrive'
+          : a.custom_name || a.name || `GoogleDrive_${idx + 1}`;
+      let candidate = sanitizeSmbShareName(defaultBase, `GoogleDrive_${idx + 1}`);
+      const baseCand = candidate;
+      let suffix = 2;
+      while (used.has(candidate.toLowerCase())) {
+        candidate = `${baseCand.slice(0, 28)}_${suffix}`;
+        suffix++;
+      }
+      a.smb_share_name = candidate;
+      changed = true;
+    } else {
+      let sanitized = sanitizeSmbShareName(rawShare, `GoogleDrive_${idx + 1}`);
+      if (used.has(sanitized.toLowerCase())) {
+        sanitized = `${sanitized.slice(0, 28)}_${idx + 1}`;
+      }
+      if (sanitized !== rawShare) {
+        a.smb_share_name = sanitized;
+        changed = true;
+      }
+    }
+    used.add(a.smb_share_name.toLowerCase());
+  });
+  return changed;
+}
+
 function loadGDriveAccountsRaw() {
   const list = loadJson(GDRIVE_ACCOUNTS_FILE, null);
-  if (Array.isArray(list)) return list;
+  if (Array.isArray(list)) {
+    if (ensureSmbProxyFields(list)) {
+      saveJson(GDRIVE_ACCOUNTS_FILE, list);
+    }
+    return list;
+  }
   const legacy = loadJson(GDRIVE_CREDS_FILE, null);
   if (legacy && legacy.token) {
     const migrated = [
@@ -1213,6 +1269,8 @@ function loadGDriveAccountsRaw() {
         custom_name: '',
         original_name: 'Google Drive',
         email: legacy.email || 'user@gmail.com',
+        smb_enabled: true,
+        smb_share_name: 'GoogleDrive',
         creds: legacy,
       },
     ];
@@ -1223,6 +1281,7 @@ function loadGDriveAccountsRaw() {
 }
 
 function saveGDriveAccountsRaw(accounts) {
+  ensureSmbProxyFields(accounts);
   saveJson(GDRIVE_ACCOUNTS_FILE, accounts);
   if (accounts.length > 0 && accounts[0].creds) {
     saveJson(GDRIVE_CREDS_FILE, accounts[0].creds);
@@ -1240,6 +1299,8 @@ function listGDriveAccounts() {
     custom_name: a.custom_name || '',
     original_name: a.original_name || a.name || 'Google Drive',
     email: a.email || '',
+    smb_enabled: Boolean(a.smb_enabled ?? true),
+    smb_share_name: a.smb_share_name || 'GoogleDrive',
   }));
 }
 
@@ -1838,13 +1899,78 @@ app.post('/api/transfer', requireAuth, (req, res) => {
   }
 });
 
-// ── SMB Proxy Credentials ─────────────────────────────────────────────────────
-app.get('/api/smb/proxy-credentials', requireAuth, (req, res) => {
+// ── Multi-Drive SMB Proxy Credentials & Share Management ─────────────────────
+function getSmbProxyStatus() {
   const d = loadJson(SMB_PROXY_FILE, null);
-  if (d) {
-    return res.json({ username: d.username || 'sagedrive', configured: true });
+  const username = d && d.username ? d.username : 'sagedrive';
+  const configured = Boolean(d);
+  const accounts = loadGDriveAccountsRaw();
+  const shares = accounts.map((a) => {
+    const rcId = String(a.id || 'default').replace(/[^A-Za-z0-9_]/g, '_');
+    const enabled = Boolean(a.smb_enabled ?? true);
+    return {
+      account_id: a.id,
+      account_name: a.custom_name || a.name || 'Google Drive',
+      email: a.email || '',
+      smb_enabled: enabled,
+      smb_share_name: a.smb_share_name || 'GoogleDrive',
+      mount_path: `/mnt/gdrive_mounts/${rcId}`,
+      mounted: enabled,
+    };
+  });
+  return { username, configured, shares };
+}
+
+app.get('/api/smb/proxy-credentials', requireAuth, (req, res) => {
+  return res.json(getSmbProxyStatus());
+});
+
+app.get('/api/smb/proxy-shares', requireAuth, (req, res) => {
+  return res.json(getSmbProxyStatus());
+});
+
+app.post('/api/smb/proxy-shares/:account_id', requireAuth, (req, res) => {
+  const { account_id } = req.params;
+  const b = req.body || {};
+  const accounts = loadGDriveAccountsRaw();
+  const target = accounts.find(
+    (a) => a.id === account_id || ((account_id === 'root' || account_id === 'default') && a === accounts[0])
+  );
+  if (!target) {
+    return res.status(404).json({ error: `Google Drive account '${account_id}' not found` });
   }
-  return res.json({ username: 'sagedrive', configured: false });
+  if (b.smb_share_name !== undefined) {
+    const raw = String(b.smb_share_name || '').trim();
+    if (!raw) {
+      return res.status(400).json({ error: 'SMB share name cannot be empty' });
+    }
+    const cleaned = raw.replace(/[^A-Za-z0-9_-]+/g, '_').replace(/^[_-]+|[_-]+$/g, '').slice(0, 32);
+    if (!cleaned || RESERVED_SMB_NAMES.has(cleaned.toLowerCase())) {
+      return res.status(400).json({ error: `Invalid or reserved SMB share name: '${raw}'` });
+    }
+    const conflict = accounts.find(
+      (other) => other.id !== target.id && String(other.smb_share_name || '').toLowerCase() === cleaned.toLowerCase()
+    );
+    if (conflict) {
+      return res.status(400).json({ error: `SMB share name '${cleaned}' is already used by another Google Drive` });
+    }
+    target.smb_share_name = cleaned;
+  }
+  if (b.smb_enabled !== undefined) {
+    target.smb_enabled = Boolean(b.smb_enabled);
+  }
+  saveGDriveAccountsRaw(accounts);
+  const status = getSmbProxyStatus();
+  const updatedShare = status.shares.find((s) => s.account_id === target.id);
+  return res.json({
+    ok: true,
+    share: updatedShare,
+    shares: status.shares,
+  });
+});
+
+app.post('/api/smb/proxy-reconcile', requireAuth, (req, res) => {
+  return res.json({ ok: true, ...getSmbProxyStatus() });
 });
 
 app.post('/api/smb/proxy-credentials', requireAuth, (req, res) => {

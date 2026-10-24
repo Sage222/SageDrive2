@@ -75,11 +75,53 @@ def _creds_to_dict(c):
         "expiry": expiry_str,
     }
 
+import re
+
+_RESERVED_SMB_NAMES = {"global", "homes", "printers", "print$", "ipc$"}
+
+def sanitize_smb_share_name(raw_name, fallback="GoogleDrive"):
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", (raw_name or "").strip()).strip("_-")
+    if not cleaned or cleaned.lower() in _RESERVED_SMB_NAMES:
+        cleaned = fallback
+    return cleaned[:32]
+
+def _ensure_smb_fields(accounts):
+    used = set()
+    changed = False
+    for idx, a in enumerate(accounts):
+        if "smb_enabled" not in a:
+            a["smb_enabled"] = True
+            changed = True
+        raw_share = (a.get("smb_share_name") or "").strip()
+        if not raw_share:
+            default_base = "GoogleDrive" if (idx == 0 or a.get("id") == "default") else (
+                a.get("custom_name") or a.get("name") or f"GoogleDrive_{idx + 1}"
+            )
+            candidate = sanitize_smb_share_name(default_base, fallback=f"GoogleDrive_{idx + 1}")
+            base_cand = candidate
+            suffix = 2
+            while candidate.lower() in used:
+                candidate = f"{base_cand[:28]}_{suffix}"
+                suffix += 1
+            a["smb_share_name"] = candidate
+            changed = True
+        else:
+            sanitized = sanitize_smb_share_name(raw_share, fallback=f"GoogleDrive_{idx + 1}")
+            if sanitized.lower() in used:
+                sanitized = f"{sanitized[:28]}_{idx + 1}"
+            if sanitized != raw_share:
+                a["smb_share_name"] = sanitized
+                changed = True
+        used.add(a["smb_share_name"].lower())
+    return changed
+
 def _load_accounts_raw():
     if ACCOUNTS_FILE.exists():
         try:
             data = json.loads(ACCOUNTS_FILE.read_text())
             if isinstance(data, list):
+                if _ensure_smb_fields(data):
+                    ACCOUNTS_FILE.write_text(json.dumps(data, indent=2))
                 return data
         except Exception:
             pass
@@ -91,7 +133,10 @@ def _load_accounts_raw():
                     "id": "default",
                     "name": "Google Drive",
                     "custom_name": "",
+                    "original_name": "Google Drive",
                     "email": legacy.get("email", ""),
+                    "smb_enabled": True,
+                    "smb_share_name": "GoogleDrive",
                     "creds": legacy,
                 }]
                 ACCOUNTS_FILE.write_text(json.dumps(migrated, indent=2))
@@ -101,6 +146,7 @@ def _load_accounts_raw():
     return []
 
 def _save_accounts_raw(accounts):
+    _ensure_smb_fields(accounts)
     ACCOUNTS_FILE.write_text(json.dumps(accounts, indent=2))
     if accounts and accounts[0].get("creds"):
         CREDS_FILE.write_text(json.dumps(accounts[0]["creds"], indent=2))
@@ -115,6 +161,8 @@ def list_accounts():
         "custom_name": a.get("custom_name", ""),
         "original_name": a.get("original_name") or a.get("name") or "Google Drive",
         "email": a.get("email", ""),
+        "smb_enabled": bool(a.get("smb_enabled", True)),
+        "smb_share_name": a.get("smb_share_name") or "GoogleDrive",
     } for a in accounts]
 
 def _resolve_account_entry(account_id=None):
@@ -204,12 +252,15 @@ def _save_creds(c, account_id=None, custom_name=None, email=None):
             if email and not custom_name:
                 default_label = f"Google Drive ({email.split('@')[0]})"
             disp_name = (custom_name or "").strip() or default_label
+            base_smb = "GoogleDrive" if not accounts else sanitize_smb_share_name(disp_name, fallback=f"GoogleDrive_{len(accounts) + 1}")
             accounts.append({
                 "id": new_id,
                 "name": disp_name,
                 "custom_name": (custom_name or "").strip(),
                 "original_name": default_label,
                 "email": email or "",
+                "smb_enabled": True,
+                "smb_share_name": base_smb,
                 "creds": c_dict,
             })
         _save_accounts_raw(accounts)
@@ -237,6 +288,40 @@ def rename_account(account_id, new_name):
             "name": target["name"],
             "custom_name": target.get("custom_name", ""),
             "email": target.get("email", ""),
+            "smb_enabled": bool(target.get("smb_enabled", True)),
+            "smb_share_name": target.get("smb_share_name") or "GoogleDrive",
+        }
+
+def update_account_smb_proxy(account_id, smb_enabled=None, smb_share_name=None):
+    with _creds_lock:
+        accounts = _load_accounts_raw()
+        target = None
+        for a in accounts:
+            if a["id"] == account_id or (account_id in ("root", "default") and a == accounts[0]):
+                target = a
+                break
+        if not target:
+            raise ValueError(f"Google Drive account {account_id!r} not found")
+        if smb_share_name is not None:
+            raw = str(smb_share_name).strip()
+            if not raw:
+                raise ValueError("SMB share name cannot be empty")
+            cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", raw).strip("_-")[:32]
+            if not cleaned or cleaned.lower() in _RESERVED_SMB_NAMES:
+                raise ValueError(f"Invalid or reserved SMB share name: {raw!r}")
+            for other in accounts:
+                if other["id"] != target["id"] and (other.get("smb_share_name") or "").lower() == cleaned.lower():
+                    raise ValueError(f"SMB share name '{cleaned}' is already used by another Google Drive")
+            target["smb_share_name"] = cleaned
+        if smb_enabled is not None:
+            target["smb_enabled"] = bool(smb_enabled)
+        _save_accounts_raw(accounts)
+        return {
+            "id": target["id"],
+            "name": target.get("custom_name") or target.get("name") or "Google Drive",
+            "email": target.get("email", ""),
+            "smb_enabled": bool(target.get("smb_enabled", True)),
+            "smb_share_name": target.get("smb_share_name") or "GoogleDrive",
         }
 
 def remove_account(account_id=None):

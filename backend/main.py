@@ -153,11 +153,51 @@ def _gd_creds_to_dict(c):
         "expiry": expiry_str,
     }
 
+_RESERVED_SMB_NAMES = {"global", "homes", "printers", "print$", "ipc$"}
+
+def _gd_sanitize_smb_share_name(raw_name, fallback="GoogleDrive"):
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", (raw_name or "").strip()).strip("_-")
+    if not cleaned or cleaned.lower() in _RESERVED_SMB_NAMES:
+        cleaned = fallback
+    return cleaned[:32]
+
+def _gd_ensure_smb_fields(accounts):
+    used = set()
+    changed = False
+    for idx, a in enumerate(accounts):
+        if "smb_enabled" not in a:
+            a["smb_enabled"] = True
+            changed = True
+        raw_share = (a.get("smb_share_name") or "").strip()
+        if not raw_share:
+            default_base = "GoogleDrive" if (idx == 0 or a.get("id") == "default") else (
+                a.get("custom_name") or a.get("name") or f"GoogleDrive_{idx + 1}"
+            )
+            candidate = _gd_sanitize_smb_share_name(default_base, fallback=f"GoogleDrive_{idx + 1}")
+            base_cand = candidate
+            suffix = 2
+            while candidate.lower() in used:
+                candidate = f"{base_cand[:28]}_{suffix}"
+                suffix += 1
+            a["smb_share_name"] = candidate
+            changed = True
+        else:
+            sanitized = _gd_sanitize_smb_share_name(raw_share, fallback=f"GoogleDrive_{idx + 1}")
+            if sanitized.lower() in used:
+                sanitized = f"{sanitized[:28]}_{idx + 1}"
+            if sanitized != raw_share:
+                a["smb_share_name"] = sanitized
+                changed = True
+        used.add(a["smb_share_name"].lower())
+    return changed
+
 def _gd_load_accounts_raw():
     if _GD_ACCOUNTS_FILE.exists():
         try:
             data = json.loads(_GD_ACCOUNTS_FILE.read_text())
             if isinstance(data, list):
+                if _gd_ensure_smb_fields(data):
+                    _GD_ACCOUNTS_FILE.write_text(json.dumps(data, indent=2))
                 return data
         except Exception:
             pass
@@ -171,6 +211,8 @@ def _gd_load_accounts_raw():
                     "custom_name": "",
                     "original_name": "Google Drive",
                     "email": legacy.get("email", ""),
+                    "smb_enabled": True,
+                    "smb_share_name": "GoogleDrive",
                     "creds": legacy,
                 }]
                 _GD_ACCOUNTS_FILE.write_text(json.dumps(migrated, indent=2))
@@ -180,6 +222,7 @@ def _gd_load_accounts_raw():
     return []
 
 def _gd_save_accounts_raw(accounts):
+    _gd_ensure_smb_fields(accounts)
     _GD_ACCOUNTS_FILE.write_text(json.dumps(accounts, indent=2))
     if accounts and accounts[0].get("creds"):
         gdrive_manager.CREDS_FILE.write_text(json.dumps(accounts[0]["creds"], indent=2))
@@ -194,6 +237,8 @@ def _gd_list_accounts():
         "custom_name": a.get("custom_name", ""),
         "original_name": a.get("original_name") or a.get("name") or "Google Drive",
         "email": a.get("email", ""),
+        "smb_enabled": bool(a.get("smb_enabled", True)),
+        "smb_share_name": a.get("smb_share_name") or "GoogleDrive",
     } for a in accounts]
 
 def _gd_resolve_account_entry(account_id=None):
@@ -232,12 +277,15 @@ def _gd_save_creds(c, account_id=None, custom_name=None, email=None):
             if email and not custom_name:
                 default_label = f"Google Drive ({email.split('@')[0]})"
             disp_name = (custom_name or "").strip() or default_label
+            base_smb = "GoogleDrive" if not accounts else _gd_sanitize_smb_share_name(disp_name, fallback=f"GoogleDrive_{len(accounts) + 1}")
             accounts.append({
                 "id": new_id,
                 "name": disp_name,
                 "custom_name": (custom_name or "").strip(),
                 "original_name": default_label,
                 "email": email or "",
+                "smb_enabled": True,
+                "smb_share_name": base_smb,
                 "creds": c_dict,
             })
         _gd_save_accounts_raw(accounts)
@@ -306,6 +354,40 @@ def _gd_rename_account(account_id, new_name):
             "name": target["name"],
             "custom_name": target.get("custom_name", ""),
             "email": target.get("email", ""),
+            "smb_enabled": bool(target.get("smb_enabled", True)),
+            "smb_share_name": target.get("smb_share_name") or "GoogleDrive",
+        }
+
+def _gd_update_account_smb_proxy(account_id, smb_enabled=None, smb_share_name=None):
+    with _gd_creds_lock:
+        accounts = _gd_load_accounts_raw()
+        target = None
+        for a in accounts:
+            if a["id"] == account_id or (account_id in ("root", "default") and a == accounts[0]):
+                target = a
+                break
+        if not target:
+            raise ValueError(f"Google Drive account {account_id!r} not found")
+        if smb_share_name is not None:
+            raw = str(smb_share_name).strip()
+            if not raw:
+                raise ValueError("SMB share name cannot be empty")
+            cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", raw).strip("_-")[:32]
+            if not cleaned or cleaned.lower() in _RESERVED_SMB_NAMES:
+                raise ValueError(f"Invalid or reserved SMB share name: {raw!r}")
+            for other in accounts:
+                if other["id"] != target["id"] and (other.get("smb_share_name") or "").lower() == cleaned.lower():
+                    raise ValueError(f"SMB share name '{cleaned}' is already used by another Google Drive")
+            target["smb_share_name"] = cleaned
+        if smb_enabled is not None:
+            target["smb_enabled"] = bool(smb_enabled)
+        _gd_save_accounts_raw(accounts)
+        return {
+            "id": target["id"],
+            "name": target.get("custom_name") or target.get("name") or "Google Drive",
+            "email": target.get("email", ""),
+            "smb_enabled": bool(target.get("smb_enabled", True)),
+            "smb_share_name": target.get("smb_share_name") or "GoogleDrive",
         }
 
 def _gd_remove_account(account_id=None):
@@ -596,6 +678,8 @@ gdrive_manager._load_creds = _gd_load_creds
 gdrive_manager.is_authenticated = _gd_is_authenticated
 gdrive_manager.list_accounts = _gd_list_accounts
 gdrive_manager.rename_account = _gd_rename_account
+gdrive_manager.update_account_smb_proxy = _gd_update_account_smb_proxy
+gdrive_manager.sanitize_smb_share_name = _gd_sanitize_smb_share_name
 gdrive_manager.remove_account = _gd_remove_account
 gdrive_manager.get_auth_url = _gd_get_auth_url
 gdrive_manager.handle_callback = _gd_handle_callback
@@ -1628,6 +1712,10 @@ def gdrive_rename_account(account_id):
 @auth.require_auth
 def gdrive_delete_account(account_id):
     gdrive_manager.remove_account(account_id)
+    try:
+        _reconcile_smb_proxy()
+    except Exception:
+        pass
     return jsonify({"ok": True})
 
 @app.get("/api/gdrive/config")
@@ -1663,6 +1751,10 @@ def gdrive_callback():
         return "Missing code", 400
     try:
         gdrive_manager.handle_callback(code, state)
+        try:
+            _reconcile_smb_proxy()
+        except Exception:
+            pass
         return redirect("/#gdrive-connected")
     except Exception as e:
         return f"OAuth error: {e}", 500
@@ -1672,6 +1764,10 @@ def gdrive_callback():
 def gdrive_revoke():
     account_id = request.args.get("account_id", "").strip() or None
     gdrive_manager.revoke(account_id=account_id)
+    try:
+        _reconcile_smb_proxy()
+    except Exception:
+        pass
     return jsonify({"ok": True})
 
 @app.get("/api/gdrive/files")
@@ -2011,15 +2107,276 @@ def transfer_items():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ── SMB Proxy Credentials ─────────────────────────────────────────────────────
+# ── Multi-Drive SMB Proxy Manager & Credentials ───────────────────────────────
+_smb_proxy_lock = threading.Lock()
+_SMB_MOUNTS_BASE = Path("/mnt/gdrive_mounts")
+
+def _safe_rclone_id(account_id):
+    return re.sub(r"[^A-Za-z0-9_]", "_", str(account_id or "default"))
+
+def _get_active_mount_points():
+    mounted = set()
+    try:
+        if Path("/proc/mounts").exists():
+            for line in Path("/proc/mounts").read_text().splitlines():
+                parts = line.split()
+                if len(parts) >= 2:
+                    mounted.add(parts[1])
+    except Exception:
+        pass
+    return mounted
+
+def _unmount_path(mount_path):
+    mp = str(mount_path)
+    for cmd in (["fusermount", "-uz", mp], ["fusermount3", "-uz", mp], ["umount", "-l", mp]):
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.run(cmd, check=False, capture_output=True, timeout=5)
+            except Exception:
+                pass
+    if mp not in _get_active_mount_points():
+        return True
+    return False
+
+def _reconcile_smb_proxy():
+    with _smb_proxy_lock:
+        accounts = _gd_load_accounts_raw()
+        cfg = gdrive_manager.get_config()
+
+        # 1. Write multi-account rclone.conf
+        rclone_blocks = []
+        for idx, acc in enumerate(accounts):
+            d = acc.get("creds") or {}
+            if not (d.get("token") or d.get("refresh_token")):
+                continue
+            rc_id = _safe_rclone_id(acc["id"])
+            rclone_token = json.dumps({
+                "access_token": d.get("token", ""),
+                "token_type": "Bearer",
+                "refresh_token": d.get("refresh_token", ""),
+                "expiry": "2020-01-01T00:00:00Z",
+            })
+            client_id = d.get("client_id") or cfg.get("client_id", "")
+            client_secret = d.get("client_secret") or cfg.get("client_secret", "")
+            block = (
+                f"[gdrive_{rc_id}]\n"
+                f"type = drive\n"
+                f"client_id = {client_id}\n"
+                f"client_secret = {client_secret}\n"
+                f"scope = drive\n"
+                f"token = {rclone_token}\n"
+            )
+            rclone_blocks.append(block)
+            if idx == 0:
+                rclone_blocks.append(
+                    f"[gdrive]\n"
+                    f"type = drive\n"
+                    f"client_id = {client_id}\n"
+                    f"client_secret = {client_secret}\n"
+                    f"scope = drive\n"
+                    f"token = {rclone_token}\n"
+                )
+
+        try:
+            os.makedirs("/root/.config/rclone", exist_ok=True)
+            Path("/root/.config/rclone/rclone.conf").write_text("\n".join(rclone_blocks))
+        except Exception as e:
+            print(f"SMB Proxy rclone.conf write warning: {e}", flush=True)
+
+        # 2. Reconcile FUSE mounts under /mnt/gdrive_mounts/<id>
+        has_rclone = bool(shutil.which("rclone"))
+        try:
+            _SMB_MOUNTS_BASE.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        mounted_paths = _get_active_mount_points()
+        # Unmount legacy single-drive /mnt/gdrive if mounted so per-drive shares take over cleanly
+        if "/mnt/gdrive" in mounted_paths:
+            _unmount_path("/mnt/gdrive")
+            mounted_paths = _get_active_mount_points()
+
+        desired_mounts = {}
+        for acc in accounts:
+            d = acc.get("creds") or {}
+            if bool(acc.get("smb_enabled", True)) and (d.get("token") or d.get("refresh_token")):
+                rc_id = _safe_rclone_id(acc["id"])
+                mpath = str(_SMB_MOUNTS_BASE / rc_id)
+                desired_mounts[mpath] = f"gdrive_{rc_id}:"
+
+        # Unmount any stale or disabled mounts under /mnt/gdrive_mounts/
+        for mp in list(mounted_paths):
+            if mp.startswith(str(_SMB_MOUNTS_BASE) + "/") and mp not in desired_mounts:
+                _unmount_path(mp)
+
+        mounted_paths = _get_active_mount_points()
+        if has_rclone:
+            newly_started = False
+            for mpath, remote_name in desired_mounts.items():
+                if mpath not in mounted_paths:
+                    try:
+                        os.makedirs(mpath, exist_ok=True)
+                        subprocess.run(
+                            [
+                                "rclone", "mount", remote_name, mpath,
+                                "--allow-other",
+                                "--vfs-cache-mode", "writes",
+                                "--vfs-cache-max-size", "512M",
+                                "--dir-cache-time", "5m",
+                                "--daemon",
+                            ],
+                            check=False,
+                            capture_output=True,
+                            timeout=10,
+                        )
+                        newly_started = True
+                    except Exception as e:
+                        print(f"SMB Proxy rclone mount warning for {remote_name}: {e}", flush=True)
+            if newly_started:
+                for _ in range(6):
+                    time.sleep(0.25)
+                    mounted_paths = _get_active_mount_points()
+                    if all(mp in mounted_paths for mp in desired_mounts):
+                        break
+
+        # 3. Generate /etc/samba/smb.conf with a separate share stanza per enabled Google Drive
+        smb_conf_lines = [
+            "[global]",
+            "   workgroup = WORKGROUP",
+            "   server string = SageDrive SMB Proxy",
+            "   security = user",
+            "   map to guest = Never",
+            "   log file = /var/log/samba/%m.log",
+            "   max log size = 50",
+            "   oplocks = no",
+            "   kernel oplocks = no",
+            "   strict allocate = yes",
+            "   ntlm auth = yes",
+            "   server min protocol = NT1",
+            "",
+        ]
+        for acc in accounts:
+            if not bool(acc.get("smb_enabled", True)):
+                continue
+            share_name = _gd_sanitize_smb_share_name(acc.get("smb_share_name") or "GoogleDrive")
+            rc_id = _safe_rclone_id(acc["id"])
+            mpath = str(_SMB_MOUNTS_BASE / rc_id)
+            try:
+                os.makedirs(mpath, exist_ok=True)
+            except Exception:
+                pass
+            smb_conf_lines.extend([
+                f"[{share_name}]",
+                f"   path = {mpath}",
+                f"   comment = SageDrive - {acc.get('custom_name') or acc.get('name') or share_name}",
+                "   valid users = @sambausers",
+                "   writable = yes",
+                "   browseable = yes",
+                "   create mask = 0775",
+                "   directory mask = 0775",
+                "",
+            ])
+
+        smb_conf_text = "\n".join(smb_conf_lines)
+        for conf_target in (Path("/etc/samba/smb.conf"), Path("/app/smb.conf")):
+            try:
+                if conf_target.parent.exists():
+                    conf_target.write_text(smb_conf_text)
+            except Exception:
+                pass
+
+        # 4. Reload or start smbd
+        if shutil.which("smbcontrol"):
+            try:
+                subprocess.run(["smbcontrol", "all", "reload-config"], check=False, capture_output=True, timeout=4)
+            except Exception:
+                pass
+        if shutil.which("pkill"):
+            try:
+                subprocess.run(["pkill", "-HUP", "smbd"], check=False, capture_output=True, timeout=4)
+            except Exception:
+                pass
+
+        return _get_smb_proxy_status_unlocked()
+
+def _get_smb_proxy_status_unlocked():
+    creds_file = Path(os.environ.get("DATA_DIR", "/app/data")) / "smb_proxy_credentials.json"
+    username = "sagedrive"
+    configured = False
+    if creds_file.exists():
+        try:
+            d = json.loads(creds_file.read_text())
+            username = d.get("username", "sagedrive")
+            configured = True
+        except Exception:
+            pass
+    accounts = _gd_load_accounts_raw()
+    mounted_paths = _get_active_mount_points()
+    has_rclone = bool(shutil.which("rclone"))
+    shares = []
+    for acc in accounts:
+        rc_id = _safe_rclone_id(acc["id"])
+        mpath = str(_SMB_MOUNTS_BASE / rc_id)
+        enabled = bool(acc.get("smb_enabled", True))
+        is_mounted = (mpath in mounted_paths) if has_rclone else enabled
+        shares.append({
+            "account_id": acc["id"],
+            "account_name": acc.get("custom_name") or acc.get("name") or "Google Drive",
+            "email": acc.get("email", ""),
+            "smb_enabled": enabled,
+            "smb_share_name": acc.get("smb_share_name") or "GoogleDrive",
+            "mount_path": mpath,
+            "mounted": is_mounted,
+        })
+    return {
+        "username": username,
+        "configured": configured,
+        "shares": shares,
+    }
+
 @app.get("/api/smb/proxy-credentials")
 @auth.require_auth
 def get_smb_proxy_creds():
-    creds_file = Path(os.environ.get("DATA_DIR", "/app/data")) / "smb_proxy_credentials.json"
-    if creds_file.exists():
-        d = json.loads(creds_file.read_text())
-        return jsonify({"username": d.get("username", "sagedrive"), "configured": True})
-    return jsonify({"username": "sagedrive", "configured": False})
+    with _smb_proxy_lock:
+        return jsonify(_get_smb_proxy_status_unlocked())
+
+@app.get("/api/smb/proxy-shares")
+@auth.require_auth
+def get_smb_proxy_shares():
+    with _smb_proxy_lock:
+        return jsonify(_get_smb_proxy_status_unlocked())
+
+@app.post("/api/smb/proxy-shares/<account_id>")
+@auth.require_auth
+def update_smb_proxy_share(account_id):
+    b = request.get_json(force=True) or {}
+    smb_enabled = b.get("smb_enabled") if "smb_enabled" in b else None
+    smb_share_name = b.get("smb_share_name") if "smb_share_name" in b else None
+    try:
+        updated = gdrive_manager.update_account_smb_proxy(
+            account_id,
+            smb_enabled=smb_enabled,
+            smb_share_name=smb_share_name,
+        )
+        status = _reconcile_smb_proxy()
+        return jsonify({
+            "ok": True,
+            "share": updated,
+            "shares": status.get("shares", []),
+        })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.post("/api/smb/proxy-reconcile")
+@auth.require_auth
+def reconcile_smb_proxy_route():
+    try:
+        status = _reconcile_smb_proxy()
+        return jsonify({"ok": True, **status})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.post("/api/smb/proxy-credentials")
 @auth.require_auth
@@ -2044,9 +2401,13 @@ def set_smb_proxy_creds():
             input=f"{password}\n{password}\n",
             text=True, capture_output=True
         )
+        _reconcile_smb_proxy()
         return jsonify({"ok": True, "message": f"Credentials saved. Reconnect as '{username}'."})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+# Trigger initial multi-drive SMB proxy reconciliation in background on startup
+threading.Thread(target=lambda: _reconcile_smb_proxy(), daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080, debug=False, threaded=True)

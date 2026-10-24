@@ -1,6 +1,6 @@
 {
-  "summary":  "Implementation plan for SageDrive enhancements: in-place file/folder renaming, multi-select with batch delete and ZIP archive downloads, recursive drag-and-drop folder uploads, server-side cross-drive copy between SMB and Google Drive, media player playlist (next/previous track) and playback speed controls, and a custom right-click context menu.",
-  "updatedAt":  "2026-10-21T09:16:10.920616013Z",
+  "summary":  "Implementation plan for Multi-Drive SMB Proxy supporting separate Samba shares per Google Drive, custom SMB share names per drive, and per-drive enable/disable toggles in Settings without requiring container restarts.",
+  "updatedAt":  "2026-10-24T06:59:03.852646991Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

@@ -373,6 +373,24 @@
     .share-host{font-size:var(--text-xs);color:var(--color-text-muted);
                 font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px}
     .share-actions{display:flex;align-items:center;gap:var(--space-1);flex-shrink:0}
+    .proxy-share-card{background:var(--color-surface-2);border:1px solid var(--color-border);
+                      border-radius:var(--radius-lg);padding:var(--space-4);
+                      display:flex;flex-direction:column;gap:var(--space-3);
+                      transition:border-color var(--transition-interactive)}
+    .proxy-share-card.disabled{opacity:.72}
+    .proxy-share-top{display:flex;align-items:center;justify-content:space-between;gap:var(--space-3);flex-wrap:wrap}
+    .proxy-share-controls{display:grid;grid-template-columns:1fr auto;gap:var(--space-2);align-items:center}
+    .proxy-switch-label{display:inline-flex;align-items:center;gap:var(--space-2);cursor:pointer;
+                        font-size:var(--text-xs);font-weight:600;color:var(--color-text);user-select:none}
+    .proxy-switch{position:relative;width:38px;height:22px;background:var(--color-surface-dynamic);
+                  border:1px solid var(--color-border);border-radius:var(--radius-full);
+                  transition:all var(--transition-interactive);flex-shrink:0}
+    .proxy-switch::after{content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;
+                         border-radius:50%;background:var(--color-text-muted);
+                         transition:all var(--transition-interactive)}
+    .proxy-switch-input{position:absolute;opacity:0;width:0;height:0}
+    .proxy-switch-input:checked + .proxy-switch{background:var(--color-primary);border-color:var(--color-primary)}
+    .proxy-switch-input:checked + .proxy-switch::after{transform:translateX(16px);background:#fff}
     .lockout-alert{background:oklch(from var(--color-error) l c h/.12);border:1px solid var(--color-error);
                    color:var(--color-error);border-radius:var(--radius-md);padding:var(--space-3);
                    font-size:var(--text-xs);line-height:1.45;display:flex;align-items:flex-start;gap:var(--space-2)}
@@ -545,7 +563,7 @@ let _shares    = [];
 let _gdStatus  = {configured:false, authenticated:false, accounts:[]};
 let _gdAccounts = [];
 let _gdConfig  = {client_id:'', client_secret:'', redirect_uri:''};
-let smbProxyCreds = {username:'sagedrive', configured:false};
+let smbProxyCreds = {username:'sagedrive', configured:false, shares:[]};
 let _settingsTab = 'all';
 let _oauthFormExpanded = false;
 let _loginLockoutTimer = null;
@@ -2812,7 +2830,20 @@ async function renderSettings() {
   const showSystem = _settingsTab === 'all' || _settingsTab === 'system';
   const oauthOpen  = !_gdStatus.configured || _oauthFormExpanded || _settingsTab === 'oauth';
   const defaultRedir = _gdConfig.redirect_uri || `${location.origin}/api/gdrive/callback`;
-  const psCmd = `net use G: \\\\10.0.0.152\\GoogleDrive /user:${smbProxyCreds.username || 'sagedrive'} * /persistent:yes`;
+  const proxyHost = (location.hostname && location.hostname !== 'localhost' && !location.hostname.endsWith('.run.app'))
+    ? location.hostname
+    : '10.0.0.152';
+  const proxyShares = Array.isArray(smbProxyCreds.shares) && smbProxyCreds.shares.length
+    ? smbProxyCreds.shares
+    : _gdAccounts.map(acc => ({
+        account_id: acc.id,
+        account_name: acc.name,
+        email: acc.email || '',
+        smb_enabled: acc.smb_enabled !== false,
+        smb_share_name: acc.smb_share_name || 'GoogleDrive',
+        mounted: acc.smb_enabled !== false,
+      }));
+  const enabledProxyCount = proxyShares.filter(s => s.smb_enabled).length;
 
   document.getElementById('content-area').innerHTML = `
   <div class="settings-wrap">
@@ -3024,47 +3055,142 @@ async function renderSettings() {
     ` : ''}
 
     ${showProxy ? `
-    <!-- SMB Proxy Credentials -->
+    <!-- Multi-Drive SMB Proxy Card -->
     <div class="card">
       <div class="card-header">
-        <div style="display:flex;align-items:center;gap:var(--space-2)">
+        <div style="display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap">
           <svg data-lucide="network" width="16" height="16" style="color:var(--color-primary)"></svg>
-          <span class="card-title">SMB Proxy — Windows Network Drive</span>
+          <span class="card-title">SMB Proxy — Multi-Drive Network Shares</span>
+          <span class="badge ${enabledProxyCount > 0 ? 'badge-success' : 'badge-primary'}">
+            ${proxyShares.length ? `${enabledProxyCount} of ${proxyShares.length} Shared` : 'No Drives'}
+          </span>
         </div>
-        <span class="badge ${smbProxyCreds.configured ? 'badge-success' : 'badge-primary'}">
-          ${smbProxyCreds.configured ? 'Custom Credentials' : 'Default (sagedrive)'}
-        </span>
+        <div style="display:flex;align-items:center;gap:var(--space-2)">
+          <button class="btn btn-secondary btn-sm" onclick="reconcileSmbProxy()" title="Re-sync rclone mounts and reload Samba shares">
+            <svg data-lucide="refresh-cw" width="13" height="13"></svg> Sync Shares
+          </button>
+        </div>
       </div>
-      <div class="card-body" style="display:flex;flex-direction:column;gap:var(--space-4)">
-        <p style="font-size:var(--text-xs);color:var(--color-text-muted)">
-          Configure the local Samba proxy username &amp; password used when mapping
-          <code style="font-family:var(--font-mono);background:var(--color-surface-offset);padding:2px 6px;border-radius:var(--radius-sm)">&#92;&#92;10.0.0.152&#92;GoogleDrive</code> in Windows Explorer.
-        </p>
-        <div class="form-row">
-          <div class="form-group">
-            <label class="form-label">Windows SMB Username</label>
-            <input class="form-input" id="smb-proxy-user" type="text"
-                   value="${escHtml(smbProxyCreds.username)}" placeholder="sagedrive" />
+      <div class="card-body" style="display:flex;flex-direction:column;gap:var(--space-5)">
+        <div style="display:flex;flex-direction:column;gap:var(--space-3)">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:var(--space-2);flex-wrap:wrap">
+            <div>
+              <div style="font-size:var(--text-xs);font-weight:600;color:var(--color-text)">Per-Drive SMB Shares (Separate Network Share per Google Drive)</div>
+              <div style="font-size:var(--text-xs);color:var(--color-text-muted);margin-top:2px">
+                Toggle the SMB Proxy on or off for each connected Google Drive and assign a custom network share name (<code style="font-family:var(--font-mono)">\\\\${escHtml(proxyHost)}\\&lt;ShareName&gt;</code>).
+              </div>
+            </div>
           </div>
-          <div class="form-group">
-            <label class="form-label">New Password</label>
-            <input class="form-input" id="smb-proxy-pass" type="password" placeholder="Enter new proxy password" />
+
+          ${proxyShares.length ? `
+          <div class="share-list">
+            ${proxyShares.map((ps, idx) => {
+              const uncPath = `\\\\${proxyHost}\\${ps.smb_share_name || 'GoogleDrive'}`;
+              const driveLetter = String.fromCharCode(71 + (idx % 15)); // G:, H:, I:, ...
+              const drivePsCmd = `net use ${driveLetter}: ${uncPath} /user:${smbProxyCreds.username || 'sagedrive'} * /persistent:yes`;
+              return `
+              <div class="proxy-share-card ${ps.smb_enabled ? '' : 'disabled'}">
+                <div class="proxy-share-top">
+                  <div style="display:flex;align-items:center;gap:var(--space-3);min-width:0">
+                    <div class="share-icon-box">
+                      <svg data-lucide="hard-drive" width="18" height="18"></svg>
+                    </div>
+                    <div style="min-width:0">
+                      <div style="display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap">
+                        <span style="font-weight:600;font-size:var(--text-sm)">${escHtml(ps.account_name)}</span>
+                        <span style="font-size:var(--text-xs);color:var(--color-text-muted)">·</span>
+                        <span style="font-size:var(--text-xs);font-family:var(--font-mono);color:${ps.smb_enabled ? 'var(--color-success)' : 'var(--color-text-muted)'}">
+                          ${ps.smb_enabled ? (ps.mounted ? 'Shared & Mounted' : 'Enabled') : 'SMB Disabled'}
+                        </span>
+                      </div>
+                      <div style="font-size:var(--text-xs);color:var(--color-text-muted);font-family:var(--font-mono);margin-top:2px">
+                        ${escHtml(ps.email || `Account: ${ps.account_id}`)}
+                      </div>
+                    </div>
+                  </div>
+                  <label class="proxy-switch-label" title="Toggle SMB Proxy share for this Google Drive">
+                    <input type="checkbox" class="proxy-switch-input"
+                           ${ps.smb_enabled ? 'checked' : ''}
+                           onchange="toggleDriveSmbProxy('${escAttr(ps.account_id)}', this.checked)" />
+                    <span class="proxy-switch"></span>
+                    <span>${ps.smb_enabled ? 'SMB Enabled' : 'SMB Off'}</span>
+                  </label>
+                </div>
+
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:var(--space-3);align-items:end;padding-top:var(--space-2);border-top:1px solid var(--color-divider)">
+                  <div class="form-group">
+                    <label class="form-label" for="smb-share-name-${escAttr(ps.account_id)}">Custom SMB Share Name</label>
+                    <div class="proxy-share-controls">
+                      <input class="form-input" id="smb-share-name-${escAttr(ps.account_id)}" type="text"
+                             value="${escHtml(ps.smb_share_name || 'GoogleDrive')}"
+                             placeholder="e.g. PersonalDrive, WorkDrive"
+                             style="font-family:var(--font-mono)"
+                             onkeydown="if(event.key==='Enter'){event.preventDefault();saveDriveSmbShareName('${escAttr(ps.account_id)}')}" />
+                      <button class="btn btn-secondary btn-sm" onclick="saveDriveSmbShareName('${escAttr(ps.account_id)}')">
+                        <svg data-lucide="check" width="13" height="13"></svg> Apply Name
+                      </button>
+                    </div>
+                  </div>
+
+                  <div style="background:var(--color-surface-offset);border:1px solid var(--color-divider);border-radius:var(--radius-md);padding:var(--space-2) var(--space-3);display:flex;align-items:center;justify-content:space-between;gap:var(--space-2);flex-wrap:wrap">
+                    <div style="min-width:0;flex:1">
+                      <div style="font-size:11px;color:var(--color-text-muted)">Network UNC Path (${driveLetter}:)</div>
+                      <code style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--color-text);word-break:break-all">${escHtml(uncPath)}</code>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:var(--space-1);flex-shrink:0">
+                      <button class="btn btn-secondary btn-sm" onclick="copyTextToClipboard('${escAttr(uncPath.replace(/\\/g, '\\\\'))}', 'UNC path copied')" title="Copy UNC path">
+                        <svg data-lucide="copy" width="12" height="12"></svg> UNC
+                      </button>
+                      <button class="btn btn-secondary btn-sm" onclick="copyTextToClipboard('${escAttr(drivePsCmd.replace(/\\/g, '\\\\'))}', 'PowerShell command copied')" title="Copy PowerShell net use command">
+                        <svg data-lucide="terminal" width="12" height="12"></svg> PowerShell
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>`;
+            }).join('')}
           </div>
+          ` : `
+          <div class="empty-state" style="padding:var(--space-6) var(--space-4);border:1px dashed var(--color-border);border-radius:var(--radius-lg)">
+            <svg data-lucide="cloud-off" width="28" height="28"></svg>
+            <h3 style="font-size:var(--text-sm)">No Google Drives connected yet</h3>
+            <p style="font-size:var(--text-xs);margin-bottom:var(--space-3)">Connect one or more Google Drive accounts first to expose them as individual SMB network shares.</p>
+            <button class="btn btn-primary btn-sm" onclick="showAddGDriveModal()">
+              <svg data-lucide="plus" width="14" height="14"></svg> Connect Google Drive
+            </button>
+          </div>
+          `}
         </div>
-        <div style="display:flex;align-items:center;gap:var(--space-3);flex-wrap:wrap">
-          <button class="btn btn-primary btn-sm" onclick="saveSmbProxyCreds()">
-            <svg data-lucide="save" width="14" height="14"></svg> Update Proxy Credentials
-          </button>
-          <span id="smb-proxy-msg" style="font-size:var(--text-xs);color:var(--color-text-muted)"></span>
-        </div>
-        <div style="background:var(--color-surface-offset);border:1px solid var(--color-divider);border-radius:var(--radius-md);padding:var(--space-3) var(--space-4);display:flex;align-items:center;justify-content:space-between;gap:var(--space-3);flex-wrap:wrap">
-          <div style="font-size:var(--text-xs);color:var(--color-text-muted);min-width:0">
-            <div style="font-weight:600;color:var(--color-text);margin-bottom:2px">PowerShell Drive Map Command:</div>
-            <code style="font-family:var(--font-mono);word-break:break-all">${escHtml(psCmd)}</code>
+
+        <div style="border-top:1px solid var(--color-divider);padding-top:var(--space-4);display:flex;flex-direction:column;gap:var(--space-3)">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:var(--space-2);flex-wrap:wrap">
+            <div>
+              <div style="font-size:var(--text-xs);font-weight:600;color:var(--color-text)">Samba Authentication Credentials</div>
+              <div style="font-size:var(--text-xs);color:var(--color-text-muted);margin-top:2px">
+                Shared username &amp; password used when connecting to any enabled Google Drive SMB share above.
+              </div>
+            </div>
+            <span class="badge ${smbProxyCreds.configured ? 'badge-success' : 'badge-primary'}">
+              ${smbProxyCreds.configured ? `User: ${escHtml(smbProxyCreds.username)}` : 'Default (sagedrive)'}
+            </span>
           </div>
-          <button class="btn btn-secondary btn-sm" onclick="copyTextToClipboard('${escAttr(psCmd.replace(/\\/g, '\\\\'))}', 'PowerShell command copied')">
-            <svg data-lucide="copy" width="13" height="13"></svg> Copy
-          </button>
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label">Windows SMB Username</label>
+              <input class="form-input" id="smb-proxy-user" type="text"
+                     value="${escHtml(smbProxyCreds.username)}" placeholder="sagedrive" />
+            </div>
+            <div class="form-group">
+              <label class="form-label">New Password</label>
+              <input class="form-input" id="smb-proxy-pass" type="password" placeholder="Enter new proxy password" />
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:var(--space-3);flex-wrap:wrap">
+            <button class="btn btn-primary btn-sm" onclick="saveSmbProxyCreds()">
+              <svg data-lucide="save" width="14" height="14"></svg> Update Proxy Credentials
+            </button>
+            <span id="smb-proxy-msg" style="font-size:var(--text-xs);color:var(--color-text-muted)"></span>
+          </div>
         </div>
       </div>
     </div>
@@ -3239,10 +3365,54 @@ async function saveSmbProxyCreds() {
     msg.style.color = 'var(--color-success)';
     msg.textContent = r.message || 'Saved!';
     document.getElementById('smb-proxy-pass').value = '';
-    setTimeout(() => renderSettings(), 1500);
+    setTimeout(() => renderSettings(), 1200);
   } catch(e) {
     msg.style.color = 'var(--color-error)';
     msg.textContent = 'Failed: ' + e.message;
+  }
+}
+
+async function toggleDriveSmbProxy(accountId, enabled) {
+  try {
+    await apiJSON(`/api/smb/proxy-shares/${encodeURIComponent(accountId)}`, {
+      method: 'POST',
+      json: { smb_enabled: Boolean(enabled) },
+    });
+    toast(enabled ? 'SMB Proxy share enabled & mounted' : 'SMB Proxy share disabled', 'success');
+    await renderSettings();
+  } catch (e) {
+    toast('Failed to update SMB Proxy: ' + e.message, 'error');
+    await renderSettings();
+  }
+}
+
+async function saveDriveSmbShareName(accountId) {
+  const inp = document.getElementById(`smb-share-name-${accountId}`);
+  const rawName = (inp ? inp.value : '').trim();
+  if (!rawName) {
+    toast('SMB share name cannot be empty', 'error');
+    return;
+  }
+  try {
+    const res = await apiJSON(`/api/smb/proxy-shares/${encodeURIComponent(accountId)}`, {
+      method: 'POST',
+      json: { smb_share_name: rawName },
+    });
+    const finalName = res.share?.smb_share_name || rawName;
+    toast(`SMB share name updated to "${finalName}"`, 'success');
+    await renderSettings();
+  } catch (e) {
+    toast('Failed: ' + e.message, 'error');
+  }
+}
+
+async function reconcileSmbProxy() {
+  try {
+    await apiJSON('/api/smb/proxy-reconcile', { method: 'POST' });
+    toast('SMB Proxy mounts & Samba shares synchronized', 'success');
+    await renderSettings();
+  } catch (e) {
+    toast('Sync failed: ' + e.message, 'error');
   }
 }
 

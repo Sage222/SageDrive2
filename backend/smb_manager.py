@@ -67,10 +67,15 @@ def stream_file_range(share_id, path, start=0, length=None, chunk_size=262144):
     Streams a byte range [start, start + length) from SMB using a single
     retrieveFileFromOffset (or retrieveFile) call in a background thread.
     Flushes the final chunk and signals completion before closing the SMB socket
-    so HTTP downloads never hang at 100%.
+    so HTTP downloads never hang at 100%, and aborts immediately if the caller
+    closes the generator early (e.g. during Range seeking or ffprobe).
     """
     q = queue.Queue(maxsize=32)
     sentinel = object()
+    aborted = threading.Event()
+
+    class _AbortStream(Exception):
+        pass
 
     class _QueueWriter:
         def __init__(self, max_bytes):
@@ -78,24 +83,36 @@ def stream_file_range(share_id, path, start=0, length=None, chunk_size=262144):
             self.buf = bytearray()
 
         def write(self, data):
+            if aborted.is_set():
+                raise _AbortStream()
             if not data:
                 return 0
             if self.remaining is not None:
                 if self.remaining <= 0:
-                    return 0
+                    raise _AbortStream()
                 if len(data) > self.remaining:
                     data = data[:self.remaining]
                 self.remaining -= len(data)
             self.buf.extend(data)
             while len(self.buf) >= chunk_size:
-                q.put(bytes(self.buf[:chunk_size]))
-                del self.buf[:chunk_size]
+                if aborted.is_set():
+                    raise _AbortStream()
+                try:
+                    q.put(bytes(self.buf[:chunk_size]), timeout=0.5)
+                    del self.buf[:chunk_size]
+                except queue.Full:
+                    if aborted.is_set():
+                        raise _AbortStream()
             return len(data)
 
         def flush(self):
-            if self.buf:
-                q.put(bytes(self.buf))
-                self.buf.clear()
+            while self.buf and not aborted.is_set():
+                try:
+                    q.put(bytes(self.buf), timeout=0.5)
+                    self.buf.clear()
+                except queue.Full:
+                    if aborted.is_set():
+                        break
 
     def _producer():
         c = None
@@ -109,14 +126,23 @@ def stream_file_range(share_id, path, start=0, length=None, chunk_size=262144):
                 max_len = length if (length is not None and length > 0) else -1
                 c.retrieveFileFromOffset(cfg["share"], path, writer, offset=start, max_length=max_len)
             writer.flush()
+        except _AbortStream:
+            pass
         except Exception as e:
+            if not aborted.is_set():
+                try:
+                    writer.flush()
+                except Exception:
+                    pass
+                try:
+                    q.put(e, timeout=1.0)
+                except Exception:
+                    pass
+        finally:
             try:
-                writer.flush()
+                q.put(sentinel, timeout=1.0)
             except Exception:
                 pass
-            q.put(e)
-        finally:
-            q.put(sentinel)
             if c is not None:
                 try:
                     c.close()
@@ -125,17 +151,21 @@ def stream_file_range(share_id, path, start=0, length=None, chunk_size=262144):
 
     threading.Thread(target=_producer, daemon=True).start()
 
-    sent = 0
-    while True:
-        item = q.get()
-        if item is sentinel:
-            break
-        if isinstance(item, Exception):
-            raise item
-        sent += len(item)
-        yield item
-        if length is not None and sent >= length:
-            break
+    try:
+        sent = 0
+        while True:
+            item = q.get()
+            if item is sentinel:
+                break
+            if isinstance(item, Exception):
+                raise item
+            sent += len(item)
+            yield item
+            if length is not None and sent >= length:
+                break
+    finally:
+        aborted.set()
+
 
 def retrieve_to_tmpfile(share_id, path):
     """

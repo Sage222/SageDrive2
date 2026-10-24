@@ -522,12 +522,8 @@ function makeDispositionHeader(filename, isDownload) {
   return `${dispositionType}; filename="${safeAsciiName}"; filename*=UTF-8''${encodedName}`;
 }
 
-// Unified streaming & Range response handler for both SMB and Google Drive files
-function streamFileResponse(req, res, item) {
-  if (!item || item.type === 'folder') {
-    return res.status(404).json({ error: 'File not found' });
-  }
-
+function resolveItemBlobPath(item) {
+  if (!item || item.type === 'folder') return null;
   let blobPath = item.blobPath;
   if (!blobPath || !fs.existsSync(blobPath)) {
     if (item.data) {
@@ -535,8 +531,142 @@ function streamFileResponse(req, res, item) {
       fs.writeFileSync(blobPath, Buffer.from(item.data));
       item.blobPath = blobPath;
     } else {
-      return res.status(404).json({ error: 'File content not found on disk' });
+      return null;
     }
+  }
+  return blobPath;
+}
+
+function probeMediaItem(item) {
+  return new Promise((resolve) => {
+    const filename = (item && item.name) || '';
+    const ext = String(filename).includes('.') ? String(filename).split('.').pop().toLowerCase() : '';
+    const blobPath = resolveItemBlobPath(item);
+    if (!blobPath) {
+      return resolve({
+        has_video: false,
+        video_codec: '',
+        video_pix_fmt: '',
+        has_audio: false,
+        audio_codec: '',
+        audio_channels: 0,
+        audio_streams: [],
+        duration: 0,
+        needs_audio_transcode: false,
+        needs_video_transcode: false,
+        can_remux_video: false,
+        recommended_mode: 'direct',
+      });
+    }
+
+    const ff = spawn('ffprobe', [
+      '-v', 'error',
+      '-probesize', '4000000',
+      '-analyzeduration', '4000000',
+      '-show_entries', 'stream=index,codec_type,codec_name,profile,pix_fmt,channels,sample_rate:stream_tags=language,title:format=format_name,duration',
+      '-of', 'json',
+      blobPath,
+    ]);
+    let out = '';
+    ff.stdout.on('data', (d) => { out += d.toString(); });
+    ff.on('error', () => {
+      resolve({
+        has_video: false,
+        video_codec: '',
+        video_pix_fmt: '',
+        has_audio: false,
+        audio_codec: '',
+        audio_channels: 0,
+        audio_streams: [],
+        duration: 0,
+        needs_audio_transcode: false,
+        needs_video_transcode: false,
+        can_remux_video: false,
+        recommended_mode: 'direct',
+      });
+    });
+    ff.on('close', () => {
+      let data = {};
+      try { data = JSON.parse(out || '{}'); } catch (_) {}
+      const streams = Array.isArray(data.streams) ? data.streams : [];
+      const fmt = data.format || {};
+      const nonCoverVideos = streams.filter(
+        (s) => s.codec_type === 'video' && !['mjpeg', 'png', 'bmp', 'gif', 'webp'].includes(String(s.codec_name || '').toLowerCase())
+      );
+      const videoStreams = nonCoverVideos.length ? nonCoverVideos : streams.filter((s) => s.codec_type === 'video');
+      const audioStreams = streams.filter((s) => s.codec_type === 'audio');
+      const v0 = videoStreams[0] || null;
+      const a0 = audioStreams[0] || null;
+      const videoCodec = v0 ? String(v0.codec_name || '').toLowerCase() : '';
+      const videoPixFmt = v0 ? String(v0.pix_fmt || '').toLowerCase() : '';
+      const audioCodec = a0 ? String(a0.codec_name || '').toLowerCase() : '';
+      const audioChannels = a0 ? parseInt(a0.channels || 0, 10) || 0 : 0;
+      const hasVideo = Boolean(v0);
+      const hasAudio = Boolean(a0);
+
+      const safeAudio = new Set(['aac', 'mp3', 'opus']);
+      if (['webm', 'ogg', 'ogv', 'oga'].includes(ext)) safeAudio.add('vorbis');
+      if (!hasVideo && ['wav', 'flac'].includes(ext)) {
+        ['pcm_s16le', 'pcm_s24le', 'pcm_f32le', 'pcm_u8', 'flac'].forEach((c) => safeAudio.add(c));
+      }
+
+      let needsAudioTranscode = false;
+      if (hasAudio) {
+        if (!safeAudio.has(audioCodec)) needsAudioTranscode = true;
+        else if (audioChannels > 2 && audioCodec !== 'aac') needsAudioTranscode = true;
+      }
+
+      const is10BitH264 = videoCodec === 'h264' && /(10le|10be|12le|12be)$/.test(videoPixFmt);
+      const needsVideoTranscode = hasVideo && (!['h264', 'hevc', 'vp8', 'vp9', 'av1'].includes(videoCodec) || is10BitH264);
+      const nonNativeContainer = ['avi', 'wmv', 'flv', 'ts', 'm2ts', 'mpg', 'mpeg', 'vob', 'divx'].includes(ext);
+      const canRemuxVideo = hasVideo && ['h264', 'hevc'].includes(videoCodec) && !is10BitH264;
+
+      let recommendedMode = 'direct';
+      if (hasVideo) {
+        if (needsVideoTranscode) recommendedMode = 'full';
+        else if (needsAudioTranscode || nonNativeContainer) recommendedMode = canRemuxVideo ? 'remux' : 'full';
+      } else if (needsAudioTranscode || ['eac3', 'ec3', 'ac3', 'dts', 'wma', 'aiff', 'aif', 'alac', 'mka', 'mp2'].includes(ext)) {
+        recommendedMode = 'audio';
+      }
+
+      const audioTracksOut = audioStreams.map((s, idx) => {
+        const tags = s.tags || {};
+        return {
+          index: idx,
+          codec: String(s.codec_name || 'unknown').toLowerCase(),
+          channels: parseInt(s.channels || 0, 10) || 0,
+          language: tags.language || tags.LANGUAGE || '',
+          title: tags.title || tags.TITLE || '',
+        };
+      });
+
+      resolve({
+        has_video: hasVideo,
+        video_codec: videoCodec,
+        video_pix_fmt: videoPixFmt,
+        has_audio: hasAudio,
+        audio_codec: audioCodec,
+        audio_channels: audioChannels,
+        audio_streams: audioTracksOut,
+        duration: parseFloat(fmt.duration || 0) || 0,
+        needs_audio_transcode: needsAudioTranscode,
+        needs_video_transcode: needsVideoTranscode,
+        can_remux_video: canRemuxVideo,
+        recommended_mode: recommendedMode,
+      });
+    });
+  });
+}
+
+// Unified streaming & Range response handler for both SMB and Google Drive files
+async function streamFileResponse(req, res, item) {
+  if (!item || item.type === 'folder') {
+    return res.status(404).json({ error: 'File not found' });
+  }
+
+  const blobPath = resolveItemBlobPath(item);
+  if (!blobPath) {
+    return res.status(404).json({ error: 'File content not found on disk' });
   }
 
   const stat = fs.statSync(blobPath);
@@ -545,19 +675,42 @@ function streamFileResponse(req, res, item) {
   const disposition = makeDispositionHeader(filename, Boolean(req.query.dl));
 
   if (req.query.transcode === '1') {
+    let mode = String(req.query.mode || 'auto');
+    const audioTrack = Math.max(0, parseInt(req.query.audio_track || '0', 10) || 0);
+    const startTime = parseFloat(req.query.ss || '0') || 0;
+    const probeInfo = await probeMediaItem(item);
+    if (mode === 'auto') {
+      mode = probeInfo.can_remux_video ? 'remux' : 'full';
+    }
+
     res.writeHead(200, {
       'Content-Type': 'video/mp4',
       'Content-Disposition': disposition,
       'Cache-Control': 'no-cache',
     });
-    const ff = spawn('ffmpeg', [
-      '-i', blobPath,
-      '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
-      '-c:a', 'aac', '-b:a', '128k',
+
+    const args = ['-hide_banner', '-loglevel', 'error'];
+    if (startTime > 0) args.push('-ss', String(startTime));
+    args.push('-i', blobPath, '-map', '0:V:0', '-map', `0:a:${audioTrack}?`, '-sn', '-dn');
+    if (mode === 'remux') {
+      const vtag = probeInfo.video_codec === 'hevc' ? 'hvc1' : 'avc1';
+      args.push('-c:v', 'copy', '-tag:v', vtag);
+    } else {
+      args.push(
+        '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p'
+      );
+    }
+    args.push(
+      '-af', 'aresample=async=1:first_pts=0',
+      '-c:a', 'aac', '-ac', '2', '-ar', '48000', '-b:a', '192k',
+      '-avoid_negative_ts', 'make_zero',
       '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
       '-f', 'mp4',
-      'pipe:1',
-    ]);
+      'pipe:1'
+    );
+
+    const ff = spawn('ffmpeg', args);
     ff.stdout.pipe(res);
     req.on('close', () => {
       try { ff.kill('SIGKILL'); } catch (_) {}
@@ -572,9 +725,11 @@ function streamFileResponse(req, res, item) {
       'Cache-Control': 'no-cache',
     });
     const ff = spawn('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error',
       '-i', blobPath,
       '-vn',
-      '-c:a', 'libmp3lame', '-b:a', '192k',
+      '-af', 'aresample=async=1:first_pts=0',
+      '-c:a', 'libmp3lame', '-ac', '2', '-ar', '48000', '-b:a', '192k',
       '-f', 'mp3',
       'pipe:1',
     ]);
@@ -771,6 +926,16 @@ app.get('/api/smb/browse/:share_id', requireAuth, (req, res) => {
     }
   }
   return res.json(results);
+});
+
+app.get('/api/smb/probe/:share_id', requireAuth, async (req, res) => {
+  const { share_id } = req.params;
+  const filePath = req.query.path || '';
+  const entries = ensureShareFS(share_id);
+  const item = entries[filePath];
+  if (!item) return res.status(404).json({ error: 'File not found' });
+  const info = await probeMediaItem(item);
+  return res.json(info);
 });
 
 app.get('/api/smb/download/:share_id', requireAuth, (req, res) => {
@@ -1067,6 +1232,13 @@ app.get('/api/gdrive/files', requireAuth, (req, res) => {
     }
   }
   return res.json(out);
+});
+
+app.get('/api/gdrive/probe/:file_id', requireAuth, async (req, res) => {
+  const f = gdriveFSData[req.params.file_id];
+  if (!f) return res.status(404).json({ error: 'File not found' });
+  const info = await probeMediaItem(f);
+  return res.json(info);
 });
 
 app.get('/api/gdrive/download/:file_id', requireAuth, (req, res) => {

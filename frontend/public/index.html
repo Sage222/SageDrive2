@@ -920,13 +920,13 @@ function _fileMime(nameOrObj) {
 function isVideoFile(nameOrObj) {
   var ext = _fileExt(nameOrObj);
   var mime = _fileMime(nameOrObj);
-  if (['mp4','webm','ogg','ogv','mov','m4v','mkv','avi','3gp','ts','m2ts','flv','wmv'].indexOf(ext) !== -1) return true;
+  if (['mp4','webm','ogg','ogv','mov','m4v','mkv','avi','3gp','ts','m2ts','flv','wmv','mpg','mpeg','vob','divx'].indexOf(ext) !== -1) return true;
   return mime.indexOf('video/') === 0;
 }
 function isAudioFile(nameOrObj) {
   var ext = _fileExt(nameOrObj);
   var mime = _fileMime(nameOrObj);
-  if (['mp3','wav','ogg','oga','m4a','aac','flac','opus','weba','wma','aiff','aif','alac','amr','mid','midi'].indexOf(ext) !== -1) return true;
+  if (['mp3','wav','ogg','oga','m4a','aac','flac','opus','weba','wma','aiff','aif','alac','amr','mid','midi','eac3','ec3','ac3','dts','mka','mp2'].indexOf(ext) !== -1) return true;
   return mime.indexOf('audio/') === 0;
 }
 function isImageFile(nameOrObj) {
@@ -950,10 +950,11 @@ function getMediaMime(nameOrObj) {
   const ext = _fileExt(nameOrObj);
   const map = {
     mp4:'video/mp4', m4v:'video/mp4', mov:'video/mp4',
-    webm:'video/webm', mkv:'video/webm', ogv:'video/ogg', avi:'video/mp4',
+    webm:'video/webm', mkv:'video/mp4', ogv:'video/ogg', avi:'video/mp4',
     mp3:'audio/mpeg', wav:'audio/wav', ogg:'audio/ogg', oga:'audio/ogg',
     opus:'audio/ogg', m4a:'audio/mp4', aac:'audio/aac', flac:'audio/flac',
-    weba:'audio/webm', wma:'audio/mpeg', aiff:'audio/aiff', aif:'audio/aiff'
+    weba:'audio/webm', wma:'audio/mpeg', aiff:'audio/aiff', aif:'audio/aiff',
+    eac3:'audio/mpeg', ec3:'audio/mpeg', ac3:'audio/mpeg', dts:'audio/mpeg'
   };
   return map[ext] || (isVideoFile(nameOrObj) ? 'video/mp4' : 'audio/mpeg');
 }
@@ -965,11 +966,19 @@ function mediaApiUrl(f, type) {
   }
   return '/api/gdrive/download/' + f.id + '?token=' + t;
 }
+function mediaProbeUrl(f, type) {
+  if (type === 'smb') {
+    return '/api/smb/probe/' + _activeDrive.id + '?path=' + encodeURIComponent(f.path);
+  }
+  return '/api/gdrive/probe/' + f.id;
+}
 
 let _activeMediaAbort = null;
 let _activeMediaBlobUrl = null;
+let _activeMediaState = null;
 
 function cleanupActiveMedia() {
+  _activeMediaState = null;
   if (_activeMediaAbort) {
     try { _activeMediaAbort.abort(); } catch(_) {}
     _activeMediaAbort = null;
@@ -983,6 +992,7 @@ function cleanupActiveMedia() {
       player.onwaiting = null;
       player.onplaying = null;
       player.onended = null;
+      player.ontimeupdate = null;
       player.pause();
       player.removeAttribute('src');
       player.load();
@@ -994,7 +1004,7 @@ function cleanupActiveMedia() {
   }
 }
 
-async function fallbackStreamMedia(src, f, player, statusWrap, statusText, statusPct, statusFill) {
+async function fallbackStreamMedia(src, f, player, statusWrap, statusText, statusPct, statusFill, forceTranscodeMode) {
   if (_activeMediaAbort) {
     try { _activeMediaAbort.abort(); } catch(_) {}
     _activeMediaAbort = null;
@@ -1007,10 +1017,11 @@ async function fallbackStreamMedia(src, f, player, statusWrap, statusText, statu
   _activeMediaAbort = ctrl;
   const ext = _fileExt(f);
   const isVid = isVideoFile(f);
-  const needsVidTranscode = isVid && ['mkv', 'avi', 'wmv', 'flv', 'ts', 'm2ts'].includes(ext);
-  const needsAudTranscode = !isVid && ['wma', 'aiff', 'aif', 'alac'].includes(ext);
+  const needsVidTranscode = isVid && (forceTranscodeMode || ['mkv', 'avi', 'wmv', 'flv', 'ts', 'm2ts', 'mpg', 'mpeg', 'vob', 'divx'].includes(ext));
+  const needsAudTranscode = !isVid && (forceTranscodeMode || ['wma', 'aiff', 'aif', 'alac', 'eac3', 'ec3', 'ac3', 'dts', 'mka', 'mp2'].includes(ext));
+  const audioTrackIdx = _activeMediaState ? (_activeMediaState.audioTrack || 0) : 0;
   const fetchUrl = needsVidTranscode
-    ? (src + '&transcode=1')
+    ? (src + '&transcode=1&mode=full&audio_track=' + audioTrackIdx)
     : (needsAudTranscode ? (src + '&transcode=audio') : src);
 
   statusWrap.style.display = 'flex';
@@ -1026,7 +1037,7 @@ async function fallbackStreamMedia(src, f, player, statusWrap, statusText, statu
     if (!r.ok) throw new Error('Stream failed (' + r.status + ')');
 
     const total = parseInt(r.headers.get('Content-Length') || '0', 10) || f.size || 0;
-    if (!total) statusFill.classList.add('indeterminate');
+    if (!total || needsVidTranscode || needsAudTranscode) statusFill.classList.add('indeterminate');
 
     const reader = r.body.getReader();
     const chunks = [];
@@ -1037,7 +1048,7 @@ async function fallbackStreamMedia(src, f, player, statusWrap, statusText, statu
       if (done) break;
       chunks.push(value);
       received += value.byteLength;
-      if (total > 0) {
+      if (total > 0 && !needsVidTranscode && !needsAudTranscode) {
         const pct = Math.min(100, Math.round((received / total) * 100));
         statusFill.style.width = pct + '%';
         statusPct.textContent = `${pct}% (${fmtSize(received)} / ${fmtSize(total)})`;
@@ -1052,6 +1063,7 @@ async function fallbackStreamMedia(src, f, player, statusWrap, statusText, statu
     const blob = new Blob(chunks, { type: mime });
     _activeMediaBlobUrl = URL.createObjectURL(blob);
     player.onerror = null;
+    player.ontimeupdate = null;
     player.src = _activeMediaBlobUrl;
     player.playbackRate = _playbackRate;
     statusWrap.style.display = 'none';
@@ -1096,6 +1108,28 @@ function nextMediaTrack(type) {
   playMediaAtIndex(nextIdx, type);
 }
 
+function changeMediaAudioTrack(trackIdxStr) {
+  if (!_activeMediaState) return;
+  const idx = parseInt(trackIdxStr, 10) || 0;
+  _activeMediaState.audioTrack = idx;
+  const targetMode = (_activeMediaState.mode === 'direct')
+    ? (_activeMediaState.canRemux ? 'remux' : 'full')
+    : _activeMediaState.mode;
+  _activeMediaState.switchMode(targetMode, true);
+}
+
+function forceMediaCompatMode() {
+  if (!_activeMediaState) return;
+  if (_activeMediaState.isVid) {
+    const nextMode = _activeMediaState.mode === 'direct'
+      ? (_activeMediaState.canRemux ? 'remux' : 'full')
+      : (_activeMediaState.mode === 'remux' ? 'full' : 'remux');
+    _activeMediaState.switchMode(nextMode, true);
+  } else {
+    _activeMediaState.switchMode('audio', true);
+  }
+}
+
 function openMedia(fJson, type) {
   cleanupActiveMedia();
   var f   = parseFileArg(fJson);
@@ -1110,7 +1144,7 @@ function openMedia(fJson, type) {
   var isVid = isVideoFile(f);
   var extBadge = (_fileExt(f) || (isVid ? 'video' : 'audio')).toUpperCase();
   var mediaEl = isVid
-    ? '<video id="active-media-player" controls autoplay playsinline preload="auto" src="' + src + '" '
+    ? '<video id="active-media-player" controls autoplay playsinline preload="auto" '
         + 'style="width:100%;max-height:66vh;background:#000;'
         + 'border-radius:var(--radius-md);display:block">'
         + 'Your browser cannot play this video.</video>'
@@ -1121,10 +1155,10 @@ function openMedia(fJson, type) {
         +   '</div>'
         +   '<div style="overflow:hidden;flex:1">'
         +     '<div style="font-weight:600;font-size:var(--text-sm);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escHtml(f.name) + '</div>'
-        +     '<div style="font-size:var(--text-xs);color:var(--color-text-muted);font-family:var(--font-mono);margin-top:2px">' + escHtml(extBadge) + ' Audio Stream • ' + fmtSize(f.size) + '</div>'
+        +     '<div id="audio-stream-subtitle" style="font-size:var(--text-xs);color:var(--color-text-muted);font-family:var(--font-mono);margin-top:2px">' + escHtml(extBadge) + ' Audio Stream • ' + fmtSize(f.size) + '</div>'
         +   '</div>'
         + '</div>'
-        + '<audio id="active-media-player" controls autoplay preload="auto" src="' + src + '" '
+        + '<audio id="active-media-player" controls autoplay preload="auto" '
         +   'style="width:100%;display:block">'
         +   'Your browser cannot play this audio.</audio>'
       + '</div>';
@@ -1146,7 +1180,7 @@ function openMedia(fJson, type) {
     +   '<svg data-lucide="x" width="18" height="18"></svg></button></div>'
     + '<div class="modal-body" style="padding-top:var(--space-3);gap:var(--space-3)">'
     + '<div id="media-stream-status" style="display:flex;flex-direction:column;gap:var(--space-2);padding:var(--space-2) 0">'
-    +   '<div class="dl-toast-meta"><span id="media-stream-text">Connecting to media stream…</span><span id="media-stream-pct"></span></div>'
+    +   '<div class="dl-toast-meta"><span id="media-stream-text">Inspecting audio &amp; video streams…</span><span id="media-stream-pct"></span></div>'
     +   '<div class="progress-track"><div id="media-stream-fill" class="progress-fill indeterminate"></div></div>'
     + '</div>'
     + mediaEl
@@ -1164,17 +1198,27 @@ function openMedia(fJson, type) {
               + '<input type="checkbox" ' + (_autoPlayNext ? 'checked' : '') + ' onchange="toggleAutoNext(this)" style="accent-color:var(--color-primary)"/> Auto-next</label>'
             : '')
     +   '</div>'
-    +   '<div style="display:flex;align-items:center;gap:var(--space-2)">'
+    +   '<div style="display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap">'
+    +     '<select id="media-audio-track-select" class="form-input" style="display:none;width:auto;padding:2px 8px;font-size:var(--text-xs);height:26px" onchange="changeMediaAudioTrack(this.value)" title="Audio track"></select>'
     +     '<span style="font-size:var(--text-xs);color:var(--color-text-muted)">Speed</span>'
     +     '<div class="speed-group">' + speedBtns + '</div>'
     +   '</div>'
     + '</div>'
-    + '<div style="display:flex;justify-content:space-between;align-items:center">'
-    +   '<span style="font-size:var(--text-xs);color:var(--color-text-muted);font-family:var(--font-mono)">' + fmtSize(f.size) + '</span>'
-    +   '<button class="btn btn-secondary btn-sm" '
-    +     'onclick="dlFile(\'' + fjEsc + '\',\'' + type + '\')">'
-    +     '<svg data-lucide="download" width="14" height="14"></svg> Download'
-    +   '</button></div></div>',
+    + '<div style="display:flex;justify-content:space-between;align-items:center;gap:var(--space-2);flex-wrap:wrap">'
+    +   '<div style="display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap">'
+    +     '<span style="font-size:var(--text-xs);color:var(--color-text-muted);font-family:var(--font-mono)">' + fmtSize(f.size) + '</span>'
+    +     '<span id="media-codec-badge" class="badge badge-primary" style="font-family:var(--font-mono);font-size:11px">' + escHtml(extBadge) + '</span>'
+    +   '</div>'
+    +   '<div style="display:flex;align-items:center;gap:var(--space-2)">'
+    +     '<button id="media-compat-btn" class="btn btn-secondary btn-sm" onclick="forceMediaCompatMode()" title="Convert unsupported audio (EAC3/AC3/DTS) to stereo AAC">'
+    +       '<svg data-lucide="volume-2" width="14" height="14"></svg> <span id="media-compat-label">AAC Audio Fix</span>'
+    +     '</button>'
+    +     '<button class="btn btn-secondary btn-sm" '
+    +       'onclick="dlFile(\'' + fjEsc + '\',\'' + type + '\')">'
+    +       '<svg data-lucide="download" width="14" height="14"></svg> Download'
+    +     '</button>'
+    +   '</div>'
+    + '</div></div>',
     styleW
   );
   lucide.createIcons();
@@ -1184,53 +1228,228 @@ function openMedia(fJson, type) {
   const statusText = document.getElementById('media-stream-text');
   const statusPct = document.getElementById('media-stream-pct');
   const statusFill = document.getElementById('media-stream-fill');
+  const codecBadge = document.getElementById('media-codec-badge');
+  const compatBtn = document.getElementById('media-compat-btn');
+  const compatLabel = document.getElementById('media-compat-label');
+  const trackSelect = document.getElementById('media-audio-track-select');
 
-  if (player) {
+  if (!player) return;
+
+  const state = {
+    f,
+    type,
+    src,
+    isVid,
+    mode: 'direct',
+    audioTrack: 0,
+    canRemux: true,
+    probeInfo: null,
+    triedFallback: false,
+    silentCheckDone: false,
+    switchMode: null,
+  };
+  _activeMediaState = state;
+
+  function updateCodecUi() {
+    if (!codecBadge) return;
+    const p = state.probeInfo;
+    const ac = p && p.audio_codec ? p.audio_codec.toUpperCase() : '';
+    const vc = p && p.video_codec ? p.video_codec.toUpperCase() : extBadge;
+    const ch = p && p.audio_channels > 2 ? ` ${p.audio_channels}ch` : '';
+    if (state.mode === 'remux') {
+      codecBadge.textContent = `${vc} • ${ac || 'Audio'}${ch} → AAC Stereo`;
+      if (compatBtn) compatBtn.classList.add('btn-primary');
+      if (compatBtn) compatBtn.classList.remove('btn-secondary');
+      if (compatLabel) compatLabel.textContent = 'AAC Stereo Active';
+    } else if (state.mode === 'full') {
+      codecBadge.textContent = `${vc}${ac ? ' + ' + ac : ''} → H264 + AAC`;
+      if (compatBtn) compatBtn.classList.add('btn-primary');
+      if (compatBtn) compatBtn.classList.remove('btn-secondary');
+      if (compatLabel) compatLabel.textContent = 'Full Transcode Active';
+    } else if (state.mode === 'audio') {
+      codecBadge.textContent = `${ac || extBadge}${ch} → MP3 Stereo`;
+      if (compatBtn) compatBtn.classList.add('btn-primary');
+      if (compatBtn) compatBtn.classList.remove('btn-secondary');
+      if (compatLabel) compatLabel.textContent = 'Compat Audio Active';
+    } else {
+      codecBadge.textContent = ac ? `${vc} • ${ac}${ch}` : vc;
+      if (compatBtn) compatBtn.classList.remove('btn-primary');
+      if (compatBtn) compatBtn.classList.add('btn-secondary');
+      if (compatLabel) compatLabel.textContent = 'AAC Audio Fix';
+    }
+  }
+
+  function switchMode(newMode, isManual) {
+    if (_activeMediaState !== state) return;
+    state.mode = newMode;
+    updateCodecUi();
+    if (statusWrap) {
+      statusWrap.style.display = 'flex';
+      statusFill.classList.add('indeterminate');
+      if (newMode === 'remux') {
+        const acName = (state.probeInfo && state.probeInfo.audio_codec) ? state.probeInfo.audio_codec.toUpperCase() : 'surround/unsupported';
+        statusText.textContent = `Converting ${acName} audio to stereo AAC…`;
+      } else if (newMode === 'full') {
+        statusText.textContent = 'Transcoding video & audio for browser playback…';
+      } else if (newMode === 'audio') {
+        statusText.textContent = 'Transcoding audio stream to stereo MP3…';
+      } else {
+        statusText.textContent = 'Connecting to media stream…';
+      }
+    }
+
+    let targetUrl = src;
+    if (newMode === 'remux') {
+      targetUrl = `${src}&transcode=1&mode=remux&audio_track=${state.audioTrack}`;
+    } else if (newMode === 'full') {
+      targetUrl = `${src}&transcode=1&mode=full&audio_track=${state.audioTrack}`;
+    } else if (newMode === 'audio') {
+      targetUrl = `${src}&transcode=audio`;
+    }
+
+    player.src = targetUrl;
+    player.load();
     player.playbackRate = _playbackRate;
-    let triedTranscode = false;
-    let triedFallback = false;
-    player.onloadeddata = () => {
-      player.playbackRate = _playbackRate;
-      if (statusWrap) statusWrap.style.display = 'none';
-    };
-    player.oncanplay = () => {
-      player.playbackRate = _playbackRate;
-      if (statusWrap) statusWrap.style.display = 'none';
-    };
-    player.onwaiting = () => {
-      if (statusWrap && !_activeMediaBlobUrl) {
-        statusWrap.style.display = 'flex';
-        statusText.textContent = 'Buffering…';
-        statusFill.classList.add('indeterminate');
-      }
-    };
-    player.onplaying = () => {
-      if (statusWrap) statusWrap.style.display = 'none';
-    };
-    player.onended = () => {
-      if (_autoPlayNext && _mediaPlaylist.length > 1) {
-        nextMediaTrack(type);
-      }
-    };
-    player.onerror = () => {
-      if (!triedTranscode) {
-        triedTranscode = true;
-        if (statusWrap) {
-          statusWrap.style.display = 'flex';
-          statusText.textContent = 'Transcoding stream for browser playback…';
-          statusFill.classList.add('indeterminate');
-        }
-        player.src = src + (isVid ? '&transcode=1' : '&transcode=audio');
-        player.load();
-        player.play().catch(() => {});
+    player.play().catch(() => {});
+  }
+  state.switchMode = switchMode;
+
+  player.playbackRate = _playbackRate;
+  player.onloadeddata = () => {
+    player.playbackRate = _playbackRate;
+    if (statusWrap) statusWrap.style.display = 'none';
+  };
+  player.oncanplay = () => {
+    player.playbackRate = _playbackRate;
+    if (statusWrap) statusWrap.style.display = 'none';
+  };
+  player.onwaiting = () => {
+    if (statusWrap && !_activeMediaBlobUrl) {
+      statusWrap.style.display = 'flex';
+      statusText.textContent = 'Buffering…';
+      statusFill.classList.add('indeterminate');
+    }
+  };
+  player.onplaying = () => {
+    if (statusWrap) statusWrap.style.display = 'none';
+  };
+  player.onended = () => {
+    if (_autoPlayNext && _mediaPlaylist.length > 1) {
+      nextMediaTrack(type);
+    }
+  };
+
+  // Detect if browser plays video track but silently drops unsupported audio (e.g. EAC3/AC3/DTS)
+  player.ontimeupdate = () => {
+    if (_activeMediaState !== state || !isVid || state.mode !== 'direct' || state.silentCheckDone) return;
+    if (player.currentTime < 0.5) return;
+    state.silentCheckDone = true;
+
+    const expectAudio = !state.probeInfo || state.probeInfo.has_audio !== false;
+    if (!expectAudio) return;
+
+    const noAudioTracks = Boolean(player.audioTracks && player.audioTracks.length === 0);
+    const mozNoAudio = player.mozHasAudio === false;
+    const webkitZeroAudio = (
+      typeof player.webkitAudioDecodedByteCount === 'number' &&
+      player.webkitAudioDecodedByteCount === 0 &&
+      (typeof player.webkitVideoDecodedByteCount !== 'number' || player.webkitVideoDecodedByteCount > 0)
+    );
+
+    if (noAudioTracks || mozNoAudio || webkitZeroAudio) {
+      switchMode(state.canRemux ? 'remux' : 'full', false);
+    }
+  };
+
+  player.onerror = () => {
+    if (_activeMediaState !== state) return;
+    if (isVid) {
+      if (state.mode === 'direct') {
+        switchMode(state.canRemux ? 'remux' : 'full', false);
         return;
       }
-      if (!triedFallback) {
-        triedFallback = true;
-        fallbackStreamMedia(src, f, player, statusWrap, statusText, statusPct, statusFill);
+      if (state.mode === 'remux') {
+        switchMode('full', false);
+        return;
       }
-    };
-  }
+    } else {
+      if (state.mode === 'direct') {
+        switchMode('audio', false);
+        return;
+      }
+    }
+    if (!state.triedFallback) {
+      state.triedFallback = true;
+      fallbackStreamMedia(src, f, player, statusWrap, statusText, statusPct, statusFill, true);
+    }
+  };
+
+  // Probe stream codecs first so EAC3/AC3/DTS/surround audio plays with AAC from the very first frame
+  (async () => {
+    const ext = _fileExt(f);
+    let probe = null;
+    try {
+      const probeCtrl = new AbortController();
+      const timer = setTimeout(() => probeCtrl.abort(), 5000);
+      const r = await apiFetch(mediaProbeUrl(f, type), { signal: probeCtrl.signal });
+      clearTimeout(timer);
+      if (r.ok) {
+        probe = await r.json();
+      }
+    } catch (_) {}
+
+    if (_activeMediaState !== state) return;
+    state.probeInfo = probe;
+
+    if (probe && Array.isArray(probe.audio_streams) && probe.audio_streams.length > 1 && trackSelect) {
+      trackSelect.innerHTML = probe.audio_streams.map((t, i) => {
+        const lang = t.language ? t.language.toUpperCase() : `Track ${i + 1}`;
+        const codec = (t.codec || '').toUpperCase();
+        const ch = t.channels ? `${t.channels}ch` : '';
+        const title = t.title ? ` (${t.title})` : '';
+        return `<option value="${i}">${escHtml(`${lang} • ${codec} ${ch}${title}`.trim())}</option>`;
+      }).join('');
+      trackSelect.style.display = 'inline-block';
+    }
+
+    if (isVid) {
+      const canPlayHevc = Boolean(
+        player.canPlayType('video/mp4; codecs="hvc1.1.6.L93.B0"') ||
+        player.canPlayType('video/mp4; codecs="hev1.1.6.L93.B0"')
+      );
+      if (probe && probe.video_codec) {
+        const vcodec = probe.video_codec.toLowerCase();
+        const isHevcUnsupported = vcodec === 'hevc' && !canPlayHevc;
+        state.canRemux = Boolean(probe.can_remux_video && !isHevcUnsupported);
+
+        if (probe.needs_video_transcode || isHevcUnsupported) {
+          switchMode('full', false);
+          return;
+        }
+        if (probe.needs_audio_transcode || probe.recommended_mode === 'remux') {
+          switchMode(state.canRemux ? 'remux' : 'full', false);
+          return;
+        }
+        if (probe.recommended_mode === 'full') {
+          switchMode('full', false);
+          return;
+        }
+      } else if (['avi', 'wmv', 'flv', 'ts', 'm2ts', 'mpg', 'mpeg', 'vob', 'divx'].includes(ext)) {
+        switchMode('full', false);
+        return;
+      }
+      switchMode('direct', false);
+    } else {
+      if (
+        (probe && (probe.needs_audio_transcode || probe.recommended_mode === 'audio')) ||
+        ['eac3', 'ec3', 'ac3', 'dts', 'wma', 'aiff', 'aif', 'alac', 'mka', 'mp2'].includes(ext)
+      ) {
+        switchMode('audio', false);
+        return;
+      }
+      switchMode('direct', false);
+    }
+  })();
 }
 
 // ── In-Browser Image Lightbox Viewer ──────────────────────────────────────────

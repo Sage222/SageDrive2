@@ -1,4 +1,4 @@
-import json, os, io, time, threading, tempfile, zipfile, requests
+import json, os, io, time, threading, tempfile, zipfile, secrets, requests
 from datetime import datetime, timezone
 from pathlib import Path
 from google_auth_oauthlib.flow import Flow
@@ -9,12 +9,14 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 CREDS_FILE = DATA_DIR / "gdrive_token.json"
+ACCOUNTS_FILE = DATA_DIR / "gdrive_accounts.json"
 CONFIG_FILE = DATA_DIR / "gdrive_client.json"
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 _creds_lock = threading.Lock()
 _meta_cache = {}
 _META_TTL = 120.0
+_PENDING_OAUTH = {}
 
 def _env_defaults():
     return {
@@ -48,12 +50,94 @@ def is_configured():
     cfg = get_config()
     return bool(cfg["client_id"] and cfg["client_secret"] and cfg["redirect_uri"])
 
-def is_authenticated():
-    if not CREDS_FILE.exists():
+def _parse_expiry(raw_expiry):
+    if not raw_expiry:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw_expiry).replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+    except Exception:
+        return None
+
+def _creds_to_dict(c):
+    expiry_str = None
+    if getattr(c, "expiry", None) is not None:
+        expiry_str = c.expiry.isoformat()
+    return {
+        "token": c.token,
+        "refresh_token": c.refresh_token,
+        "token_uri": c.token_uri,
+        "client_id": c.client_id,
+        "client_secret": c.client_secret,
+        "scopes": list(c.scopes or SCOPES),
+        "expiry": expiry_str,
+    }
+
+def _load_accounts_raw():
+    if ACCOUNTS_FILE.exists():
+        try:
+            data = json.loads(ACCOUNTS_FILE.read_text())
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+    if CREDS_FILE.exists():
+        try:
+            legacy = json.loads(CREDS_FILE.read_text())
+            if legacy and (legacy.get("token") or legacy.get("refresh_token")):
+                migrated = [{
+                    "id": "default",
+                    "name": "Google Drive",
+                    "custom_name": "",
+                    "email": legacy.get("email", ""),
+                    "creds": legacy,
+                }]
+                ACCOUNTS_FILE.write_text(json.dumps(migrated, indent=2))
+                return migrated
+        except Exception:
+            pass
+    return []
+
+def _save_accounts_raw(accounts):
+    ACCOUNTS_FILE.write_text(json.dumps(accounts, indent=2))
+    if accounts and accounts[0].get("creds"):
+        CREDS_FILE.write_text(json.dumps(accounts[0]["creds"], indent=2))
+    elif not accounts and CREDS_FILE.exists():
+        CREDS_FILE.unlink(missing_ok=True)
+
+def list_accounts():
+    accounts = _load_accounts_raw()
+    return [{
+        "id": a["id"],
+        "name": a.get("custom_name") or a.get("name") or "Google Drive",
+        "custom_name": a.get("custom_name", ""),
+        "original_name": a.get("original_name") or a.get("name") or "Google Drive",
+        "email": a.get("email", ""),
+    } for a in accounts]
+
+def _resolve_account_entry(account_id=None):
+    accounts = _load_accounts_raw()
+    if not accounts:
+        return None, accounts
+    if not account_id or account_id in ("root", "default"):
+        for a in accounts:
+            if a["id"] == "default":
+                return a, accounts
+        return accounts[0], accounts
+    for a in accounts:
+        if a["id"] == account_id:
+            return a, accounts
+    return accounts[0], accounts
+
+def is_authenticated(account_id=None):
+    accounts = _load_accounts_raw()
+    if not accounts:
         return False
     try:
-        c = _load_creds()
-        return c is not None and (c.valid or bool(c.refresh_token))
+        c = _load_creds(account_id=account_id)
+        return c is not None and (c.valid or bool(c.refresh_token) or bool(c.token))
     except Exception:
         return False
 
@@ -67,22 +151,12 @@ def _client_config():
         "token_uri": "https://oauth2.googleapis.com/token",
     }}
 
-def _parse_expiry(raw_expiry):
-    if not raw_expiry:
-        return None
-    try:
-        dt = datetime.fromisoformat(str(raw_expiry).replace("Z", "+00:00"))
-        if dt.tzinfo is not None:
-            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-        return dt
-    except Exception:
-        return None
-
-def _load_creds(force_refresh=False):
+def _load_creds(force_refresh=False, account_id=None):
     with _creds_lock:
-        if not CREDS_FILE.exists():
+        acc, accounts = _resolve_account_entry(account_id)
+        if not acc:
             return None
-        d = json.loads(CREDS_FILE.read_text())
+        d = acc.get("creds") or {}
         cfg = get_config()
         expiry_dt = _parse_expiry(d.get("expiry"))
         c = Credentials(
@@ -104,47 +178,123 @@ def _load_creds(force_refresh=False):
         )
         if needs_refresh and c.refresh_token:
             c.refresh(Request())
-            _save_creds(c)
+            acc["creds"] = _creds_to_dict(c)
+            _save_accounts_raw(accounts)
         return c if (c.token or c.valid) else None
 
-def _save_creds(c):
-    expiry_str = None
-    if getattr(c, "expiry", None) is not None:
-        expiry_str = c.expiry.isoformat()
-    CREDS_FILE.write_text(json.dumps({
-        "token": c.token,
-        "refresh_token": c.refresh_token,
-        "token_uri": c.token_uri,
-        "client_id": c.client_id,
-        "client_secret": c.client_secret,
-        "scopes": list(c.scopes or SCOPES),
-        "expiry": expiry_str,
-    }, indent=2))
+def _save_creds(c, account_id=None, custom_name=None, email=None):
+    with _creds_lock:
+        accounts = _load_accounts_raw()
+        c_dict = _creds_to_dict(c)
+        target = None
+        if account_id:
+            target = next((a for a in accounts if a["id"] == account_id), None)
+        if not target and email:
+            target = next((a for a in accounts if a.get("email") and a.get("email") == email), None)
+        if target:
+            target["creds"] = c_dict
+            if email:
+                target["email"] = email
+            if custom_name:
+                target["custom_name"] = custom_name.strip()
+                target["name"] = custom_name.strip()
+        else:
+            new_id = "default" if not accounts else f"gdrive_{secrets.token_hex(3)}"
+            default_label = "Google Drive" if not accounts else f"Google Drive {len(accounts) + 1}"
+            if email and not custom_name:
+                default_label = f"Google Drive ({email.split('@')[0]})"
+            disp_name = (custom_name or "").strip() or default_label
+            accounts.append({
+                "id": new_id,
+                "name": disp_name,
+                "custom_name": (custom_name or "").strip(),
+                "original_name": default_label,
+                "email": email or "",
+                "creds": c_dict,
+            })
+        _save_accounts_raw(accounts)
 
-def _svc():
-    c = _load_creds()
+def rename_account(account_id, new_name):
+    new_name = (new_name or "").strip()
+    if not new_name:
+        raise ValueError("Custom name cannot be empty")
+    with _creds_lock:
+        accounts = _load_accounts_raw()
+        target = None
+        for a in accounts:
+            if a["id"] == account_id or (account_id in ("root", "default") and a == accounts[0]):
+                if not a.get("original_name"):
+                    a["original_name"] = a.get("name", "Google Drive")
+                a["name"] = new_name
+                a["custom_name"] = new_name
+                target = a
+                break
+        if not target:
+            raise ValueError(f"Google Drive account {account_id!r} not found")
+        _save_accounts_raw(accounts)
+        return {
+            "id": target["id"],
+            "name": target["name"],
+            "custom_name": target.get("custom_name", ""),
+            "email": target.get("email", ""),
+        }
+
+def remove_account(account_id=None):
+    _meta_cache.clear()
+    with _creds_lock:
+        accounts = _load_accounts_raw()
+        if not account_id:
+            _save_accounts_raw([])
+            return
+        accounts = [a for a in accounts if a["id"] != account_id]
+        _save_accounts_raw(accounts)
+
+def _svc(account_id=None):
+    c = _load_creds(account_id=account_id)
     if not c:
         raise RuntimeError("Not authenticated with Google Drive")
     return build("drive", "v3", credentials=c, cache_discovery=False)
 
-def get_auth_url():
+def get_auth_url(custom_name=None, account_id=None):
     cfg = get_config()
     flow = Flow.from_client_config(_client_config(), scopes=SCOPES, redirect_uri=cfg["redirect_uri"])
-    url, _ = flow.authorization_url(access_type="offline", prompt="consent")
+    url, state = flow.authorization_url(access_type="offline", prompt="select_account consent")
+    if state:
+        _PENDING_OAUTH[state] = {
+            "custom_name": (custom_name or "").strip(),
+            "account_id": (account_id or "").strip(),
+            "ts": time.time(),
+        }
     return url
 
 def handle_callback(code, state):
     cfg = get_config()
     flow = Flow.from_client_config(_client_config(), scopes=SCOPES, redirect_uri=cfg["redirect_uri"])
     flow.fetch_token(code=code)
-    _save_creds(flow.credentials)
+    c = flow.credentials
+    pending = _PENDING_OAUTH.pop(state, {}) if state else {}
+    email = ""
+    try:
+        svc = build("drive", "v3", credentials=c, cache_discovery=False)
+        about = svc.about().get(fields="user(displayName,emailAddress)").execute()
+        email = (about.get("user") or {}).get("emailAddress", "")
+    except Exception:
+        pass
+    _save_creds(
+        c,
+        account_id=pending.get("account_id") or None,
+        custom_name=pending.get("custom_name") or None,
+        email=email,
+    )
 
-def revoke():
-    _meta_cache.clear()
-    CREDS_FILE.unlink(missing_ok=True)
+def revoke(account_id=None):
+    remove_account(account_id=account_id)
 
-def list_files(folder_id="root"):
-    res = _svc().files().list(
+def _cache_key(account_id, file_id):
+    return f"{account_id or 'default'}:{file_id}"
+
+def list_files(folder_id="root", account_id=None):
+    res = _svc(account_id=account_id).files().list(
         q=f"'{folder_id}' in parents and trashed=false",
         fields="files(id,name,mimeType,size,modifiedTime,parents)",
         pageSize=200,
@@ -156,11 +306,13 @@ def list_files(folder_id="root"):
     for f in res.get("files", []):
         is_folder = f["mimeType"] == "application/vnd.google-apps.folder"
         size_val = int(f.get("size", 0) or 0)
-        _meta_cache[f["id"]] = (now, {
+        info = {
             "name": f["name"],
             "mimeType": f["mimeType"],
             "size": size_val,
-        })
+        }
+        _meta_cache[_cache_key(account_id, f["id"])] = (now, info)
+        _meta_cache[f["id"]] = (now, info)
         out.append({
             "id": f["id"],
             "name": f["name"],
@@ -171,12 +323,13 @@ def list_files(folder_id="root"):
         })
     return out
 
-def get_file_meta(file_id):
+def get_file_meta(file_id, account_id=None):
     now = time.time()
-    cached = _meta_cache.get(file_id)
+    ck = _cache_key(account_id, file_id)
+    cached = _meta_cache.get(ck) or _meta_cache.get(file_id)
     if cached and (now - cached[0]) < _META_TTL:
         return cached[1]
-    svc = _svc()
+    svc = _svc(account_id=account_id)
     meta = svc.files().get(
         fileId=file_id,
         fields="name,mimeType,size",
@@ -187,16 +340,17 @@ def get_file_meta(file_id):
         "mimeType": meta.get("mimeType", "application/octet-stream"),
         "size": int(meta.get("size", 0) or 0),
     }
+    _meta_cache[ck] = (now, info)
     _meta_cache[file_id] = (now, info)
     return info
 
-def _open_media_response(file_id, start=None, end=None):
+def _open_media_response(file_id, start=None, end=None, account_id=None):
     url = (
         f"https://www.googleapis.com/drive/v3/files/{file_id}"
         f"?alt=media&supportsAllDrives=true&acknowledgeAbuse=true"
     )
     for attempt in range(2):
-        c = _load_creds(force_refresh=(attempt > 0))
+        c = _load_creds(force_refresh=(attempt > 0), account_id=account_id)
         if not c:
             raise RuntimeError("Not authenticated with Google Drive")
         headers = {"Authorization": f"Bearer {c.token}"}
@@ -219,8 +373,8 @@ def _open_media_response(file_id, start=None, end=None):
         return r
     raise RuntimeError("Google Drive authentication failed after token refresh")
 
-def stream_file_range(file_id, start=0, end=None, chunk_size=262144):
-    r = _open_media_response(file_id, start=start, end=end)
+def stream_file_range(file_id, start=0, end=None, chunk_size=262144, account_id=None):
+    r = _open_media_response(file_id, start=start, end=end, account_id=account_id)
     def _gen():
         try:
             for chunk in r.iter_content(chunk_size=chunk_size):
@@ -233,8 +387,8 @@ def stream_file_range(file_id, start=0, end=None, chunk_size=262144):
                 pass
     return _gen()
 
-def download_file(file_id):
-    svc = _svc()
+def download_file(file_id, account_id=None):
+    svc = _svc(account_id=account_id)
     meta = svc.files().get(
         fileId=file_id,
         fields="name,mimeType",
@@ -258,12 +412,12 @@ def download_file(file_id):
         _, done = dl.next_chunk()
     return buf.getvalue(), name, mime
 
-def ensure_folder_path(base_folder_id, parts):
+def ensure_folder_path(base_folder_id, parts, account_id=None):
     """
     Ensures nested folder segments exist under base_folder_id on Google Drive,
     returning the leaf folder ID.
     """
-    svc = _svc()
+    svc = _svc(account_id=account_id)
     curr_id = base_folder_id or "root"
     for part in parts:
         if not part:
@@ -296,15 +450,15 @@ def ensure_folder_path(base_folder_id, parts):
             curr_id = created["id"]
     return curr_id
 
-def upload_file(parent_id, filename, data, mime_type="application/octet-stream", relative_path=None):
-    svc = _svc()
+def upload_file(parent_id, filename, data, mime_type="application/octet-stream", relative_path=None, account_id=None):
+    svc = _svc(account_id=account_id)
     target_parent = parent_id or "root"
     actual_name = filename
     if relative_path:
         norm_rel = relative_path.replace("\\", "/").lstrip("/")
         segments = [s for s in norm_rel.split("/") if s]
         if len(segments) > 1:
-            target_parent = ensure_folder_path(target_parent, segments[:-1])
+            target_parent = ensure_folder_path(target_parent, segments[:-1], account_id=account_id)
             actual_name = segments[-1]
         elif segments:
             actual_name = segments[0]
@@ -316,21 +470,23 @@ def upload_file(parent_id, filename, data, mime_type="application/octet-stream",
         supportsAllDrives=True,
     ).execute()
 
-def rename_file(file_id, new_name):
+def rename_file(file_id, new_name, account_id=None):
+    _meta_cache.pop(_cache_key(account_id, file_id), None)
     _meta_cache.pop(file_id, None)
-    return _svc().files().update(
+    return _svc(account_id=account_id).files().update(
         fileId=file_id,
         body={"name": new_name},
         fields="id,name",
         supportsAllDrives=True,
     ).execute()
 
-def delete_file(file_id):
+def delete_file(file_id, account_id=None):
+    _meta_cache.pop(_cache_key(account_id, file_id), None)
     _meta_cache.pop(file_id, None)
-    _svc().files().delete(fileId=file_id, supportsAllDrives=True).execute()
+    _svc(account_id=account_id).files().delete(fileId=file_id, supportsAllDrives=True).execute()
 
-def create_folder(parent_id, name):
-    f = _svc().files().create(
+def create_folder(parent_id, name, account_id=None):
+    f = _svc(account_id=account_id).files().create(
         body={
             "name": name,
             "parents": [parent_id],
@@ -341,7 +497,7 @@ def create_folder(parent_id, name):
     ).execute()
     return f["id"]
 
-def create_zip_tmpfile(file_ids):
+def create_zip_tmpfile(file_ids, account_id=None):
     """
     Creates a temporary .zip archive containing the specified Google Drive
     files and folders (recursively). Returns (tmp_path, zip_size).
@@ -350,18 +506,18 @@ def create_zip_tmpfile(file_ids):
     tmp.close()
 
     def _add_item(zf, fid, arc_prefix):
-        meta = get_file_meta(fid)
+        meta = get_file_meta(fid, account_id=account_id)
         name = meta["name"]
         mime = meta["mimeType"]
         arc_path = f"{arc_prefix}/{name}" if arc_prefix else name
         if mime == "application/vnd.google-apps.folder":
-            children = list_files(fid)
+            children = list_files(fid, account_id=account_id)
             if not children:
                 zf.writestr(arc_path.rstrip("/") + "/", b"")
             for ch in children:
                 _add_item(zf, ch["id"], arc_path)
         else:
-            data, _, _ = download_file(fid)
+            data, _, _ = download_file(fid, account_id=account_id)
             zf.writestr(arc_path, data)
 
     try:
@@ -376,3 +532,4 @@ def create_zip_tmpfile(file_ids):
         except Exception:
             pass
         raise
+

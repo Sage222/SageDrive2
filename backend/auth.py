@@ -1,4 +1,4 @@
-import json, os, time, secrets, bcrypt
+import json, os, time, math, secrets, bcrypt
 from pathlib import Path
 from functools import wraps
 from flask import request, jsonify
@@ -8,6 +8,10 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 USERS_FILE = DATA_DIR / "users.json"
 SESSIONS: dict = {}
 SESSION_TTL = int(os.environ.get("SESSION_TTL_HOURS", "24")) * 3600
+
+MAX_FAILED_ATTEMPTS = 5
+LOCKOUT_SECONDS = 15 * 60  # 15 minutes (900 seconds)
+_UNKNOWN_LOCKOUTS: dict = {}
 
 def _load_users():
     return json.loads(USERS_FILE.read_text()) if USERS_FILE.exists() else {}
@@ -22,13 +26,60 @@ def bootstrap_admin():
         h = bcrypt.hashpw(p.encode(), bcrypt.gensalt()).decode()
         _save_users({u: {"hash": h, "role": "admin"}})
 
-def login(username, password):
-    user = _load_users().get(username)
-    if user and bcrypt.checkpw(password.encode(), user["hash"].encode()):
+def login_with_status(username, password):
+    """
+    Authenticates a user with anti-hammering protection:
+    5 incorrect login attempts locks the account for 15 minutes (900s).
+    Returns (token, error_msg, http_status, meta_dict).
+    """
+    uname = (username or "").strip()
+    now = time.time()
+    users = _load_users()
+    user = users.get(uname)
+
+    record = user if user is not None else _UNKNOWN_LOCKOUTS.setdefault(uname or "_anon_", {"failed_attempts": 0, "locked_until": 0})
+    locked_until = float(record.get("locked_until", 0) or 0)
+
+    if locked_until > now:
+        rem = int(math.ceil(locked_until - now))
+        mins = max(1, int(math.ceil(rem / 60)))
+        msg = f"Account locked due to {MAX_FAILED_ATTEMPTS} failed login attempts. Try again in {mins} minute{'s' if mins != 1 else ''} ({rem}s)."
+        return None, msg, 429, {"locked": True, "retry_after": rem, "attempts_remaining": 0}
+
+    if locked_until > 0 and locked_until <= now:
+        record["locked_until"] = 0
+        record["failed_attempts"] = 0
+        if user is not None:
+            _save_users(users)
+
+    if user and bcrypt.checkpw((password or "").encode(), user["hash"].encode()):
+        if user.get("failed_attempts") or user.get("locked_until"):
+            user["failed_attempts"] = 0
+            user["locked_until"] = 0
+            _save_users(users)
         token = secrets.token_hex(32)
-        SESSIONS[token] = {"username": username, "role": user["role"], "expires": time.time() + SESSION_TTL}
-        return token
-    return None
+        SESSIONS[token] = {"username": uname, "role": user["role"], "expires": now + SESSION_TTL}
+        return token, None, 200, {"locked": False, "attempts_remaining": MAX_FAILED_ATTEMPTS}
+
+    fails = int(record.get("failed_attempts", 0) or 0) + 1
+    record["failed_attempts"] = fails
+
+    if fails >= MAX_FAILED_ATTEMPTS:
+        record["locked_until"] = now + LOCKOUT_SECONDS
+        if user is not None:
+            _save_users(users)
+        msg = f"Account locked for 15 minutes due to {MAX_FAILED_ATTEMPTS} incorrect login attempts."
+        return None, msg, 429, {"locked": True, "retry_after": LOCKOUT_SECONDS, "attempts_remaining": 0}
+
+    if user is not None:
+        _save_users(users)
+    rem_tries = MAX_FAILED_ATTEMPTS - fails
+    msg = f"Invalid credentials ({rem_tries} attempt{'s' if rem_tries != 1 else ''} remaining before 15m lockout)"
+    return None, msg, 401, {"locked": False, "attempts_remaining": rem_tries}
+
+def login(username, password):
+    token, _, _, _ = login_with_status(username, password)
+    return token
 
 def logout(token):
     SESSIONS.pop(token, None)
@@ -52,3 +103,4 @@ def require_auth(f):
             return jsonify({"error": "Unauthorised"}), 401
         return f(*args, **kwargs)
     return wrapper
+

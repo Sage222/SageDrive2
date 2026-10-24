@@ -29,9 +29,13 @@ const SMB_FS_FILE = path.join(DATA_DIR, 'smb_fs.json');
 const GDRIVE_FS_FILE = path.join(DATA_DIR, 'gdrive_fs.json');
 const GDRIVE_CONFIG_FILE = path.join(DATA_DIR, 'gdrive_client.json');
 const GDRIVE_CREDS_FILE = path.join(DATA_DIR, 'gdrive_token.json');
+const GDRIVE_ACCOUNTS_FILE = path.join(DATA_DIR, 'gdrive_accounts.json');
 const SMB_PROXY_FILE = path.join(DATA_DIR, 'smb_proxy_credentials.json');
 
 const SESSION_TTL = (parseInt(process.env.SESSION_TTL_HOURS || '24', 10) || 24) * 3600 * 1000;
+const MAX_FAILED_ATTEMPTS = 5;
+const LOCKOUT_SECONDS = 15 * 60; // 15 minutes
+const unknownLockouts = new Map();
 
 // Disk storage for uploads so large media files don't buffer in memory
 const upload = multer({
@@ -810,14 +814,42 @@ async function streamFileResponse(req, res, item) {
   return stream.pipe(res);
 }
 
-// ── Auth ──────────────────────────────────────────────────────────────────────
+// ── Auth (with 5-Strike / 15-Minute Anti-Hammering Lockout) ───────────────────
 app.post('/api/auth/login', (req, res) => {
   const body = req.body || {};
-  const u = body.username || '';
-  const pw = body.password || '';
+  const u = String(body.username || '').trim();
+  const pw = String(body.password || '');
+  const nowSec = Date.now() / 1000;
+
   const users = loadJson(USERS_FILE, {});
   const user = users[u];
+  const record = user || unknownLockouts.get(u || '_anon_') || { failed_attempts: 0, locked_until: 0 };
+  if (!user) unknownLockouts.set(u || '_anon_', record);
+
+  const lockedUntil = Number(record.locked_until || 0);
+  if (lockedUntil > nowSec) {
+    const rem = Math.ceil(lockedUntil - nowSec);
+    const mins = Math.max(1, Math.ceil(rem / 60));
+    return res.status(429).json({
+      error: `Account locked due to ${MAX_FAILED_ATTEMPTS} failed login attempts. Try again in ${mins} minute${mins !== 1 ? 's' : ''} (${rem}s).`,
+      locked: true,
+      retry_after: rem,
+      attempts_remaining: 0,
+    });
+  }
+
+  if (lockedUntil > 0 && lockedUntil <= nowSec) {
+    record.locked_until = 0;
+    record.failed_attempts = 0;
+    if (user) saveJson(USERS_FILE, users);
+  }
+
   if (user && bcrypt.compareSync(pw, user.hash)) {
+    if (user.failed_attempts || user.locked_until) {
+      user.failed_attempts = 0;
+      user.locked_until = 0;
+      saveJson(USERS_FILE, users);
+    }
     const token = crypto.randomBytes(32).toString('hex');
     sessionsMap.set(token, {
       username: u,
@@ -831,7 +863,28 @@ app.post('/api/auth/login', (req, res) => {
     );
     return res.json({ token });
   }
-  return res.status(401).json({ error: 'Invalid credentials' });
+
+  const fails = Number(record.failed_attempts || 0) + 1;
+  record.failed_attempts = fails;
+
+  if (fails >= MAX_FAILED_ATTEMPTS) {
+    record.locked_until = nowSec + LOCKOUT_SECONDS;
+    if (user) saveJson(USERS_FILE, users);
+    return res.status(429).json({
+      error: `Account locked for 15 minutes due to ${MAX_FAILED_ATTEMPTS} incorrect login attempts.`,
+      locked: true,
+      retry_after: LOCKOUT_SECONDS,
+      attempts_remaining: 0,
+    });
+  }
+
+  if (user) saveJson(USERS_FILE, users);
+  const remTries = MAX_FAILED_ATTEMPTS - fails;
+  return res.status(401).json({
+    error: `Invalid credentials (${remTries} attempt${remTries !== 1 ? 's' : ''} remaining before 15m lockout)`,
+    locked: false,
+    attempts_remaining: remTries,
+  });
 });
 
 app.post('/api/auth/logout', requireAuth, (req, res) => {
@@ -877,11 +930,21 @@ app.post('/api/smb/shares', requireAuth, (req, res) => {
   if (!b.name || !b.host || !b.share) {
     return res.status(400).json({ error: 'name, host, and share are required' });
   }
-  const sid = String(b.name).toLowerCase().replace(/\s+/g, '_');
-  const shares = listShares().filter((s) => s.id !== sid);
+  let shares = listShares();
+  const baseSid = String(b.name).trim().toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '') || 'smb_share';
+  let sid = baseSid;
+  const conflict = shares.find((s) => s.id === sid && (s.host !== b.host || s.share !== b.share));
+  if (conflict) {
+    sid = `${baseSid}_${crypto.randomBytes(2).toString('hex')}`;
+  }
+  shares = shares.filter((s) => s.id !== sid);
+  const customName = String(b.custom_name || '').trim();
+  const dispName = customName || String(b.name).trim();
   const entry = {
     id: sid,
-    name: b.name,
+    name: dispName,
+    custom_name: customName,
+    original_name: String(b.name).trim(),
     host: b.host,
     share: b.share,
     username: b.username || '',
@@ -893,6 +956,28 @@ app.post('/api/smb/shares', requireAuth, (req, res) => {
   ensureShareFS(sid);
   const { password, ...safeEntry } = entry;
   return res.status(201).json(safeEntry);
+});
+
+app.post('/api/smb/shares/:share_id/rename', requireAuth, (req, res) => {
+  const { share_id } = req.params;
+  const b = req.body || {};
+  const newName = String(b.name || b.custom_name || '').trim();
+  if (!newName) {
+    return res.status(400).json({ error: 'Custom name cannot be empty' });
+  }
+  const shares = listShares();
+  const target = shares.find((s) => s.id === share_id);
+  if (!target) {
+    return res.status(404).json({ error: `Share '${share_id}' not found` });
+  }
+  if (!target.original_name) {
+    target.original_name = target.name || target.share;
+  }
+  target.name = newName;
+  target.custom_name = newName;
+  saveJson(SHARES_FILE, shares);
+  const { password, ...safeEntry } = target;
+  return res.json(safeEntry);
 });
 
 app.delete('/api/smb/shares/:share_id', requireAuth, (req, res) => {
@@ -1096,7 +1181,7 @@ app.post('/api/smb/mkdir/:share_id', requireAuth, (req, res) => {
   return res.json({ ok: true });
 });
 
-// ── Google Drive Helpers & Routes ─────────────────────────────────────────────
+// ── Google Drive Helpers & Routes (Multi-Account) ─────────────────────────────
 function getGDriveConfig() {
   const defaults = {
     client_id: process.env.GOOGLE_CLIENT_ID || '',
@@ -1116,17 +1201,139 @@ function isGDriveConfigured() {
   return Boolean(cfg.client_id && cfg.client_secret && cfg.redirect_uri);
 }
 
-function isGDriveAuthenticated() {
-  const creds = loadJson(GDRIVE_CREDS_FILE, null);
-  return Boolean(creds && creds.token);
+function loadGDriveAccountsRaw() {
+  const list = loadJson(GDRIVE_ACCOUNTS_FILE, null);
+  if (Array.isArray(list)) return list;
+  const legacy = loadJson(GDRIVE_CREDS_FILE, null);
+  if (legacy && legacy.token) {
+    const migrated = [
+      {
+        id: 'default',
+        name: 'Google Drive',
+        custom_name: '',
+        original_name: 'Google Drive',
+        email: legacy.email || 'user@gmail.com',
+        creds: legacy,
+      },
+    ];
+    saveJson(GDRIVE_ACCOUNTS_FILE, migrated);
+    return migrated;
+  }
+  return [];
 }
 
-function ensureGDriveFolderPath(baseFolderId, parts) {
+function saveGDriveAccountsRaw(accounts) {
+  saveJson(GDRIVE_ACCOUNTS_FILE, accounts);
+  if (accounts.length > 0 && accounts[0].creds) {
+    saveJson(GDRIVE_CREDS_FILE, accounts[0].creds);
+  } else {
+    try {
+      if (fs.existsSync(GDRIVE_CREDS_FILE)) fs.unlinkSync(GDRIVE_CREDS_FILE);
+    } catch (_) {}
+  }
+}
+
+function listGDriveAccounts() {
+  return loadGDriveAccountsRaw().map((a) => ({
+    id: a.id,
+    name: a.custom_name || a.name || 'Google Drive',
+    custom_name: a.custom_name || '',
+    original_name: a.original_name || a.name || 'Google Drive',
+    email: a.email || '',
+  }));
+}
+
+function resolveGDriveAccountId(rawId) {
+  const accounts = loadGDriveAccountsRaw();
+  if (!accounts.length) return 'default';
+  if (!rawId || rawId === 'root' || rawId === 'default') {
+    const def = accounts.find((a) => a.id === 'default');
+    return def ? def.id : accounts[0].id;
+  }
+  const found = accounts.find((a) => a.id === rawId);
+  return found ? found.id : accounts[0].id;
+}
+
+function isGDriveAuthenticated() {
+  return loadGDriveAccountsRaw().length > 0;
+}
+
+function ensureGDriveAccountSeeded(accountId) {
+  const accId = resolveGDriveAccountId(accountId);
+  const hasAny = Object.values(gdriveFSData).some((f) => (f.accountId || 'default') === accId);
+  if (hasAny) return;
+  const now = new Date().toISOString();
+  const suffix = accId === 'default' ? '' : `_${accId}`;
+  gdriveFSData[`folder-docs${suffix}`] = {
+    id: `folder-docs${suffix}`,
+    accountId: accId,
+    name: 'Documents',
+    type: 'folder',
+    size: 0,
+    modified: now,
+    mimeType: 'application/vnd.google-apps.folder',
+    parent: 'root',
+  };
+  gdriveFSData[`folder-media${suffix}`] = {
+    id: `folder-media${suffix}`,
+    accountId: accId,
+    name: 'Media',
+    type: 'folder',
+    size: 0,
+    modified: now,
+    mimeType: 'application/vnd.google-apps.folder',
+    parent: 'root',
+  };
+  const readmePath = path.join(BLOBS_DIR, 'gdrive_welcome.txt');
+  if (fs.existsSync(readmePath)) {
+    gdriveFSData[`file-readme${suffix}`] = {
+      id: `file-readme${suffix}`,
+      accountId: accId,
+      name: 'Welcome.txt',
+      type: 'file',
+      size: fs.statSync(readmePath).size,
+      modified: now,
+      mimeType: 'text/plain',
+      parent: 'root',
+      blobPath: readmePath,
+    };
+  }
+  if (fs.existsSync(SAMPLE_WAV_PATH)) {
+    gdriveFSData[`file-sample-audio${suffix}`] = {
+      id: `file-sample-audio${suffix}`,
+      accountId: accId,
+      name: 'Sample_Audio.wav',
+      type: 'file',
+      size: fs.statSync(SAMPLE_WAV_PATH).size,
+      modified: now,
+      mimeType: 'audio/wav',
+      parent: 'root',
+      blobPath: SAMPLE_WAV_PATH,
+    };
+  }
+  if (fs.existsSync(SAMPLE_MP4_PATH) && fs.statSync(SAMPLE_MP4_PATH).size > 0) {
+    gdriveFSData[`file-sample-video${suffix}`] = {
+      id: `file-sample-video${suffix}`,
+      accountId: accId,
+      name: 'Sample_Video.mp4',
+      type: 'file',
+      size: fs.statSync(SAMPLE_MP4_PATH).size,
+      modified: now,
+      mimeType: 'video/mp4',
+      parent: 'root',
+      blobPath: SAMPLE_MP4_PATH,
+    };
+  }
+  saveGDriveFS();
+}
+
+function ensureGDriveFolderPath(baseFolderId, parts, accountId = 'default') {
+  const accId = resolveGDriveAccountId(accountId);
   let currId = baseFolderId || 'root';
   for (const part of parts) {
     if (!part) continue;
     const existing = Object.values(gdriveFSData).find(
-      (f) => f.parent === currId && f.type === 'folder' && f.name === part
+      (f) => (f.accountId || 'default') === accId && f.parent === currId && f.type === 'folder' && f.name === part
     );
     if (existing) {
       currId = existing.id;
@@ -1134,6 +1341,7 @@ function ensureGDriveFolderPath(baseFolderId, parts) {
       const newId = 'folder-' + crypto.randomBytes(6).toString('hex');
       gdriveFSData[newId] = {
         id: newId,
+        accountId: accId,
         name: part,
         type: 'folder',
         size: 0,
@@ -1151,7 +1359,45 @@ app.get('/api/gdrive/status', requireAuth, (req, res) => {
   return res.json({
     configured: isGDriveConfigured(),
     authenticated: isGDriveAuthenticated(),
+    accounts: listGDriveAccounts(),
   });
+});
+
+app.get('/api/gdrive/accounts', requireAuth, (req, res) => {
+  return res.json(listGDriveAccounts());
+});
+
+app.post('/api/gdrive/accounts/:account_id/rename', requireAuth, (req, res) => {
+  const { account_id } = req.params;
+  const b = req.body || {};
+  const newName = String(b.name || b.custom_name || '').trim();
+  if (!newName) {
+    return res.status(400).json({ error: 'Custom name cannot be empty' });
+  }
+  const accounts = loadGDriveAccountsRaw();
+  const target = accounts.find(
+    (a) => a.id === account_id || ((account_id === 'root' || account_id === 'default') && a === accounts[0])
+  );
+  if (!target) {
+    return res.status(404).json({ error: `Google Drive account '${account_id}' not found` });
+  }
+  if (!target.original_name) target.original_name = target.name || 'Google Drive';
+  target.name = newName;
+  target.custom_name = newName;
+  saveGDriveAccountsRaw(accounts);
+  return res.json({
+    id: target.id,
+    name: target.name,
+    custom_name: target.custom_name,
+    email: target.email || '',
+  });
+});
+
+app.delete('/api/gdrive/accounts/:account_id', requireAuth, (req, res) => {
+  const { account_id } = req.params;
+  const accounts = loadGDriveAccountsRaw().filter((a) => a.id !== account_id);
+  saveGDriveAccountsRaw(accounts);
+  return res.json({ ok: true });
 });
 
 app.get('/api/gdrive/config', requireAuth, (req, res) => {
@@ -1173,7 +1419,11 @@ app.get('/api/gdrive/auth', requireAuth, (req, res) => {
   if (!isGDriveConfigured()) {
     return res.status(400).json({ error: 'Google OAuth not configured' });
   }
-  return res.json({ url: '/api/gdrive/callback?code=preview_oauth_code' });
+  const name = encodeURIComponent(String(req.query.name || '').trim());
+  const accountId = encodeURIComponent(String(req.query.account_id || '').trim());
+  return res.json({
+    url: `/api/gdrive/callback?code=preview_oauth_code&name=${name}&account_id=${accountId}`,
+  });
 });
 
 app.get('/api/gdrive/callback', (req, res) => {
@@ -1182,31 +1432,67 @@ app.get('/api/gdrive/callback', (req, res) => {
     return res.status(400).send('Missing code');
   }
   const cfg = getGDriveConfig();
-  saveJson(GDRIVE_CREDS_FILE, {
+  const customName = String(req.query.name || '').trim();
+  const accountId = String(req.query.account_id || '').trim();
+  const accounts = loadGDriveAccountsRaw();
+  const creds = {
     token: 'gdrive_access_' + crypto.randomBytes(8).toString('hex'),
     refresh_token: 'gdrive_refresh_' + crypto.randomBytes(8).toString('hex'),
     client_id: cfg.client_id,
     client_secret: cfg.client_secret,
-  });
+  };
+
+  let target = accountId ? accounts.find((a) => a.id === accountId) : null;
+  if (target) {
+    target.creds = creds;
+    if (customName) {
+      target.name = customName;
+      target.custom_name = customName;
+    }
+  } else {
+    const newId = accounts.length === 0 ? 'default' : `gdrive_${crypto.randomBytes(3).toString('hex')}`;
+    const idx = accounts.length + 1;
+    const defaultLabel = idx === 1 ? 'Google Drive' : `Google Drive ${idx}`;
+    const dispName = customName || defaultLabel;
+    accounts.push({
+      id: newId,
+      name: dispName,
+      custom_name: customName,
+      original_name: defaultLabel,
+      email: idx === 1 ? 'primary@gmail.com' : `drive${idx}@gmail.com`,
+      creds,
+    });
+    ensureGDriveAccountSeeded(newId);
+  }
+  saveGDriveAccountsRaw(accounts);
   return res.redirect('/#gdrive-connected');
 });
 
 app.delete('/api/gdrive/revoke', requireAuth, (req, res) => {
-  try {
-    if (fs.existsSync(GDRIVE_CREDS_FILE)) fs.unlinkSync(GDRIVE_CREDS_FILE);
-  } catch (_) {}
+  const accountId = String(req.query.account_id || '').trim();
+  if (accountId) {
+    const accounts = loadGDriveAccountsRaw().filter((a) => a.id !== accountId);
+    saveGDriveAccountsRaw(accounts);
+  } else {
+    saveGDriveAccountsRaw([]);
+  }
   return res.json({ ok: true });
 });
 
 app.get('/api/gdrive/files', requireAuth, (req, res) => {
   const folderId = req.query.folder || 'root';
+  const accId = resolveGDriveAccountId(req.query.account_id);
+  ensureGDriveAccountSeeded(accId);
+
   if (
+    accId === 'default' &&
     !gdriveFSData['file-sample-video'] &&
     fs.existsSync(SAMPLE_MP4_PATH) &&
     fs.statSync(SAMPLE_MP4_PATH).size > 0
   ) {
     gdriveFSData['file-sample-video'] = {
       id: 'file-sample-video',
+      accountId: 'default',
       name: 'Sample_Video.mp4',
       type: 'file',
       size: fs.statSync(SAMPLE_MP4_PATH).size,
@@ -1220,7 +1506,8 @@ app.get('/api/gdrive/files', requireAuth, (req, res) => {
 
   const out = [];
   for (const f of Object.values(gdriveFSData)) {
-    if (f.parent === folderId) {
+    const fAcc = f.accountId || 'default';
+    if (fAcc === accId && f.parent === folderId) {
       out.push({
         id: f.id,
         name: f.name,
@@ -1248,6 +1535,7 @@ app.get('/api/gdrive/download/:file_id', requireAuth, (req, res) => {
 
 app.post('/api/gdrive/upload', requireAuth, upload.single('file'), (req, res) => {
   const folderId = req.query.folder || 'root';
+  const accId = resolveGDriveAccountId(req.query.account_id);
   const relPath = String(req.body?.relative_path || req.query?.relative_path || '').trim().replace(/^\/+/, '');
   const f = req.file;
   if (!f) {
@@ -1258,7 +1546,7 @@ app.post('/api/gdrive/upload', requireAuth, upload.single('file'), (req, res) =>
   if (relPath) {
     const parts = relPath.split('/').filter(Boolean);
     if (parts.length > 1) {
-      targetParent = ensureGDriveFolderPath(folderId, parts.slice(0, -1));
+      targetParent = ensureGDriveFolderPath(folderId, parts.slice(0, -1), accId);
       actualName = parts[parts.length - 1];
     } else if (parts.length === 1) {
       actualName = parts[0];
@@ -1267,6 +1555,7 @@ app.post('/api/gdrive/upload', requireAuth, upload.single('file'), (req, res) =>
   const id = 'file-' + crypto.randomBytes(6).toString('hex');
   gdriveFSData[id] = {
     id,
+    accountId: accId,
     name: actualName,
     type: 'file',
     size: f.size,
@@ -1359,11 +1648,13 @@ app.delete('/api/gdrive/delete/:file_id', requireAuth, (req, res) => {
 
 app.post('/api/gdrive/mkdir', requireAuth, (req, res) => {
   const b = req.body || {};
+  const accId = resolveGDriveAccountId(req.query.account_id || b.account_id);
   const parent = b.parent || 'root';
   const name = b.name || 'New Folder';
   const id = 'folder-' + crypto.randomBytes(6).toString('hex');
   gdriveFSData[id] = {
     id,
+    accountId: accId,
     name,
     type: 'folder',
     size: 0,
@@ -1375,7 +1666,7 @@ app.post('/api/gdrive/mkdir', requireAuth, (req, res) => {
   return res.json({ id });
 });
 
-// ── Cross-Drive Transfer (SMB <-> Google Drive & SMB <-> SMB) ─────────────────
+// ── Cross-Drive Transfer (SMB <-> Google Drive & SMB <-> SMB & GDrive <-> GDrive) ──
 function copyBlobFile(srcItem, nameHint) {
   const buf = getItemBuffer(srcItem);
   const ext = path.extname(nameHint || srcItem?.name || '') || '';
@@ -1384,22 +1675,24 @@ function copyBlobFile(srcItem, nameHint) {
   return { blobPath: newBlobPath, size: buf.length };
 }
 
-function copySmbItemToGDrive(srcShare, smbPath, destFolderId) {
+function copySmbItemToGDrive(srcShare, smbPath, destFolderId, destAccountId = 'default') {
+  const accId = resolveGDriveAccountId(destAccountId);
   const entries = ensureShareFS(srcShare);
   const norm = smbPath.replace(/\/+$/, '');
   const item = entries[norm];
   if (!item) return;
   if (item.type === 'folder') {
-    const newFolderId = ensureGDriveFolderPath(destFolderId, [item.name]);
+    const newFolderId = ensureGDriveFolderPath(destFolderId, [item.name], accId);
     const children = Object.values(entries).filter((c) => path.posix.dirname(c.path) === norm);
     for (const ch of children) {
-      copySmbItemToGDrive(srcShare, ch.path, newFolderId);
+      copySmbItemToGDrive(srcShare, ch.path, newFolderId, accId);
     }
   } else {
     const { blobPath, size } = copyBlobFile(item, item.name);
     const id = 'file-' + crypto.randomBytes(6).toString('hex');
     gdriveFSData[id] = {
       id,
+      accountId: accId,
       name: item.name,
       type: 'file',
       size,
@@ -1481,20 +1774,22 @@ function copySmbItemToSmb(srcShare, smbPath, destShare, destSmbDir) {
   }
 }
 
-function copyGDriveItemToGDrive(fileId, destFolderId) {
+function copyGDriveItemToGDrive(fileId, destFolderId, destAccountId = 'default') {
+  const accId = resolveGDriveAccountId(destAccountId);
   const item = gdriveFSData[fileId];
   if (!item) return;
   if (item.type === 'folder') {
-    const newFolderId = ensureGDriveFolderPath(destFolderId, [item.name]);
+    const newFolderId = ensureGDriveFolderPath(destFolderId, [item.name], accId);
     const children = Object.values(gdriveFSData).filter((c) => c.parent === fileId);
     for (const ch of children) {
-      copyGDriveItemToGDrive(ch.id, newFolderId);
+      copyGDriveItemToGDrive(ch.id, newFolderId, accId);
     }
   } else {
     const { blobPath, size } = copyBlobFile(item, item.name);
     const id = 'file-' + crypto.randomBytes(6).toString('hex');
     gdriveFSData[id] = {
       id,
+      accountId: accId,
       name: item.name,
       type: 'file',
       size,
@@ -1523,13 +1818,13 @@ app.post('/api/transfer', requireAuth, (req, res) => {
     let copied = 0;
     for (const it of items) {
       if (srcType === 'smb' && destType === 'gdrive') {
-        copySmbItemToGDrive(srcDrive, it.path, destFolder);
+        copySmbItemToGDrive(srcDrive, it.path, destFolder, destDrive);
       } else if (srcType === 'gdrive' && destType === 'smb') {
         copyGDriveItemToSmb(it.id, destDrive, destFolder);
       } else if (srcType === 'smb' && destType === 'smb') {
         copySmbItemToSmb(srcDrive, it.path, destDrive, destFolder);
       } else if (srcType === 'gdrive' && destType === 'gdrive') {
-        copyGDriveItemToGDrive(it.id, destFolder);
+        copyGDriveItemToGDrive(it.id, destFolder, destDrive);
       } else {
         return res.status(400).json({ error: 'Invalid source or destination type' });
       }

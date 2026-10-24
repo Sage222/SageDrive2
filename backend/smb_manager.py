@@ -1,4 +1,4 @@
-import json, os, io, socket, tempfile, queue, threading, zipfile
+import json, os, io, re, socket, tempfile, queue, threading, zipfile, secrets
 from pathlib import Path
 from smb.SMBConnection import SMBConnection
 
@@ -9,14 +9,50 @@ def _load(): return json.loads(SHARES_FILE.read_text()) if SHARES_FILE.exists() 
 def _save(s): SHARES_FILE.write_text(json.dumps(s, indent=2))
 def list_shares(): return _load()
 
-def add_share(name, host, share, username, password, port=445):
-    sid = name.lower().replace(" ", "_")
-    shares = [s for s in _load() if s["id"] != sid]
-    entry = {"id": sid, "name": name, "host": host, "share": share,
-             "username": username, "password": password, "port": port}
+def add_share(name, host, share, username, password, port=445, custom_name=""):
+    shares = _load()
+    base_sid = re.sub(r"[^a-z0-9_]+", "_", name.strip().lower()).strip("_") or "smb_share"
+    sid = base_sid
+    existing_ids = {s["id"] for s in shares}
+    # If another share already uses this id with a different host/share, create a unique id
+    conflict = next((s for s in shares if s["id"] == sid and (s.get("host") != host or s.get("share") != share)), None)
+    if conflict:
+        sid = f"{base_sid}_{secrets.token_hex(2)}"
+    shares = [s for s in shares if s["id"] != sid]
+    disp_name = (custom_name or name).strip()
+    entry = {
+        "id": sid,
+        "name": disp_name,
+        "custom_name": custom_name.strip() if custom_name else "",
+        "original_name": name.strip(),
+        "host": host,
+        "share": share,
+        "username": username,
+        "password": password,
+        "port": port,
+    }
     shares.append(entry)
     _save(shares)
     return entry
+
+def rename_share(share_id, new_name):
+    new_name = (new_name or "").strip()
+    if not new_name:
+        raise ValueError("Custom name cannot be empty")
+    shares = _load()
+    target = None
+    for s in shares:
+        if s["id"] == share_id:
+            if not s.get("original_name"):
+                s["original_name"] = s.get("name", s["share"])
+            s["name"] = new_name
+            s["custom_name"] = new_name
+            target = s
+            break
+    if not target:
+        raise ValueError(f"Share {share_id!r} not found")
+    _save(shares)
+    return target
 
 def remove_share(share_id):
     _save([s for s in _load() if s["id"] != share_id])

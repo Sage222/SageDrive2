@@ -1,23 +1,128 @@
-import os, json, time, mimetypes, io, re, subprocess, threading, tempfile, zipfile, queue, requests
+import os, json, time, math, secrets, bcrypt, mimetypes, io, re, subprocess, threading, tempfile, zipfile, queue, requests
 from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import quote, urlparse, parse_qs, unquote
 from flask import Flask, request, jsonify, send_file, send_from_directory, redirect
 from flask_cors import CORS
+from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 import auth, smb_manager, gdrive_manager
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 CORS(app, supports_credentials=True, expose_headers=["Content-Length", "Content-Range", "Accept-Ranges", "Content-Disposition"])
 auth.bootstrap_admin()
 
-# ── Ensure gdrive_manager has token-expiry persistence, 401 retry & meta cache ─
+# ── Self-contained Auth 5-Strike / 15-Minute Anti-Hammering Lockout ───────────
+_AUTH_MAX_ATTEMPTS = 5
+_AUTH_LOCKOUT_SECONDS = 15 * 60  # 15 minutes
+_AUTH_UNKNOWN_LOCKOUTS = {}
+_auth_lock = threading.Lock()
+
+def _auth_login_with_status(username, password):
+    uname = (username or "").strip()
+    now = time.time()
+    with _auth_lock:
+        users = auth._load_users()
+        user = users.get(uname)
+        record = user if user is not None else _AUTH_UNKNOWN_LOCKOUTS.setdefault(uname or "_anon_", {"failed_attempts": 0, "locked_until": 0})
+        locked_until = float(record.get("locked_until", 0) or 0)
+
+        if locked_until > now:
+            rem = int(math.ceil(locked_until - now))
+            mins = max(1, int(math.ceil(rem / 60)))
+            msg = f"Account locked due to {_AUTH_MAX_ATTEMPTS} failed login attempts. Try again in {mins} minute{'s' if mins != 1 else ''} ({rem}s)."
+            return None, msg, 429, {"locked": True, "retry_after": rem, "attempts_remaining": 0}
+
+        if locked_until > 0 and locked_until <= now:
+            record["locked_until"] = 0
+            record["failed_attempts"] = 0
+            if user is not None:
+                auth._save_users(users)
+
+        if user and bcrypt.checkpw((password or "").encode(), user["hash"].encode()):
+            if user.get("failed_attempts") or user.get("locked_until"):
+                user["failed_attempts"] = 0
+                user["locked_until"] = 0
+                auth._save_users(users)
+            token = secrets.token_hex(32)
+            auth.SESSIONS[token] = {"username": uname, "role": user["role"], "expires": now + auth.SESSION_TTL}
+            return token, None, 200, {"locked": False, "attempts_remaining": _AUTH_MAX_ATTEMPTS}
+
+        fails = int(record.get("failed_attempts", 0) or 0) + 1
+        record["failed_attempts"] = fails
+
+        if fails >= _AUTH_MAX_ATTEMPTS:
+            record["locked_until"] = now + _AUTH_LOCKOUT_SECONDS
+            if user is not None:
+                auth._save_users(users)
+            msg = f"Account locked for 15 minutes due to {_AUTH_MAX_ATTEMPTS} incorrect login attempts."
+            return None, msg, 429, {"locked": True, "retry_after": _AUTH_LOCKOUT_SECONDS, "attempts_remaining": 0}
+
+        if user is not None:
+            auth._save_users(users)
+        rem_tries = _AUTH_MAX_ATTEMPTS - fails
+        msg = f"Invalid credentials ({rem_tries} attempt{'s' if rem_tries != 1 else ''} remaining before 15m lockout)"
+        return None, msg, 401, {"locked": False, "attempts_remaining": rem_tries}
+
+auth.login_with_status = _auth_login_with_status
+
+# ── Self-contained Multi-SMB Share & Custom Name Support ──────────────────────
+def _smb_add_share(name, host, share, username="", password="", port=445, custom_name=""):
+    shares = smb_manager._load()
+    base_sid = re.sub(r"[^a-z0-9_]+", "_", name.strip().lower()).strip("_") or "smb_share"
+    sid = base_sid
+    conflict = next((s for s in shares if s["id"] == sid and (s.get("host") != host or s.get("share") != share)), None)
+    if conflict:
+        sid = f"{base_sid}_{secrets.token_hex(2)}"
+    shares = [s for s in shares if s["id"] != sid]
+    disp_name = (custom_name or name).strip()
+    entry = {
+        "id": sid,
+        "name": disp_name,
+        "custom_name": custom_name.strip() if custom_name else "",
+        "original_name": name.strip(),
+        "host": host,
+        "share": share,
+        "username": username,
+        "password": password,
+        "port": int(port or 445),
+    }
+    shares.append(entry)
+    smb_manager._save(shares)
+    return entry
+
+def _smb_rename_share(share_id, new_name):
+    new_name = (new_name or "").strip()
+    if not new_name:
+        raise ValueError("Custom name cannot be empty")
+    shares = smb_manager._load()
+    target = None
+    for s in shares:
+        if s["id"] == share_id:
+            if not s.get("original_name"):
+                s["original_name"] = s.get("name", s["share"])
+            s["name"] = new_name
+            s["custom_name"] = new_name
+            target = s
+            break
+    if not target:
+        raise ValueError(f"Share {share_id!r} not found")
+    smb_manager._save(shares)
+    return target
+
+smb_manager.add_share = _smb_add_share
+smb_manager.rename_share = _smb_rename_share
+
+# ── Multi-Account Google Drive Manager with Token Persistence & 401 Retry ─────
 _gd_creds_lock = threading.Lock()
 _gd_meta_cache = getattr(gdrive_manager, "_meta_cache", {})
 _GD_META_TTL = 120.0
+_GD_ACCOUNTS_FILE = gdrive_manager.DATA_DIR / "gdrive_accounts.json"
+_GD_PENDING_OAUTH = {}
 _SMB_SIZE_CACHE = {}
 _SMB_SIZE_TTL = 60.0
 _PROBE_CACHE = {}
@@ -34,11 +139,11 @@ def _gd_parse_expiry(raw_expiry):
     except Exception:
         return None
 
-def _gd_save_creds(c):
+def _gd_creds_to_dict(c):
     expiry_str = None
     if getattr(c, "expiry", None) is not None:
         expiry_str = c.expiry.isoformat()
-    gdrive_manager.CREDS_FILE.write_text(json.dumps({
+    return {
         "token": c.token,
         "refresh_token": c.refresh_token,
         "token_uri": c.token_uri,
@@ -46,13 +151,103 @@ def _gd_save_creds(c):
         "client_secret": c.client_secret,
         "scopes": list(c.scopes or gdrive_manager.SCOPES),
         "expiry": expiry_str,
-    }, indent=2))
+    }
 
-def _gd_load_creds(force_refresh=False):
+def _gd_load_accounts_raw():
+    if _GD_ACCOUNTS_FILE.exists():
+        try:
+            data = json.loads(_GD_ACCOUNTS_FILE.read_text())
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+    if gdrive_manager.CREDS_FILE.exists():
+        try:
+            legacy = json.loads(gdrive_manager.CREDS_FILE.read_text())
+            if legacy and (legacy.get("token") or legacy.get("refresh_token")):
+                migrated = [{
+                    "id": "default",
+                    "name": "Google Drive",
+                    "custom_name": "",
+                    "original_name": "Google Drive",
+                    "email": legacy.get("email", ""),
+                    "creds": legacy,
+                }]
+                _GD_ACCOUNTS_FILE.write_text(json.dumps(migrated, indent=2))
+                return migrated
+        except Exception:
+            pass
+    return []
+
+def _gd_save_accounts_raw(accounts):
+    _GD_ACCOUNTS_FILE.write_text(json.dumps(accounts, indent=2))
+    if accounts and accounts[0].get("creds"):
+        gdrive_manager.CREDS_FILE.write_text(json.dumps(accounts[0]["creds"], indent=2))
+    elif not accounts and gdrive_manager.CREDS_FILE.exists():
+        gdrive_manager.CREDS_FILE.unlink(missing_ok=True)
+
+def _gd_list_accounts():
+    accounts = _gd_load_accounts_raw()
+    return [{
+        "id": a["id"],
+        "name": a.get("custom_name") or a.get("name") or "Google Drive",
+        "custom_name": a.get("custom_name", ""),
+        "original_name": a.get("original_name") or a.get("name") or "Google Drive",
+        "email": a.get("email", ""),
+    } for a in accounts]
+
+def _gd_resolve_account_entry(account_id=None):
+    accounts = _gd_load_accounts_raw()
+    if not accounts:
+        return None, accounts
+    if not account_id or account_id in ("root", "default"):
+        for a in accounts:
+            if a["id"] == "default":
+                return a, accounts
+        return accounts[0], accounts
+    for a in accounts:
+        if a["id"] == account_id:
+            return a, accounts
+    return accounts[0], accounts
+
+def _gd_save_creds(c, account_id=None, custom_name=None, email=None):
     with _gd_creds_lock:
-        if not gdrive_manager.CREDS_FILE.exists():
+        accounts = _gd_load_accounts_raw()
+        c_dict = _gd_creds_to_dict(c)
+        target = None
+        if account_id:
+            target = next((a for a in accounts if a["id"] == account_id), None)
+        if not target and email:
+            target = next((a for a in accounts if a.get("email") and a.get("email") == email), None)
+        if target:
+            target["creds"] = c_dict
+            if email:
+                target["email"] = email
+            if custom_name:
+                target["custom_name"] = custom_name.strip()
+                target["name"] = custom_name.strip()
+        else:
+            new_id = "default" if not accounts else f"gdrive_{secrets.token_hex(3)}"
+            default_label = "Google Drive" if not accounts else f"Google Drive {len(accounts) + 1}"
+            if email and not custom_name:
+                default_label = f"Google Drive ({email.split('@')[0]})"
+            disp_name = (custom_name or "").strip() or default_label
+            accounts.append({
+                "id": new_id,
+                "name": disp_name,
+                "custom_name": (custom_name or "").strip(),
+                "original_name": default_label,
+                "email": email or "",
+                "creds": c_dict,
+            })
+        _gd_save_accounts_raw(accounts)
+
+def _gd_load_creds(force_refresh=False, account_id=None):
+    with _gd_creds_lock:
+        acc, accounts = _gd_resolve_account_entry(account_id)
+        if not acc:
             return None
-        d = json.loads(gdrive_manager.CREDS_FILE.read_text())
+        d = acc.get("creds") or {}
         cfg = gdrive_manager.get_config()
         expiry_dt = _gd_parse_expiry(d.get("expiry"))
         c = Credentials(
@@ -74,21 +269,133 @@ def _gd_load_creds(force_refresh=False):
         )
         if needs_refresh and c.refresh_token:
             c.refresh(Request())
-            _gd_save_creds(c)
+            acc["creds"] = _gd_creds_to_dict(c)
+            _gd_save_accounts_raw(accounts)
         return c if (c.token or c.valid) else None
 
-def _gd_svc():
-    c = _gd_load_creds()
+def _gd_is_authenticated(account_id=None):
+    accounts = _gd_load_accounts_raw()
+    if not accounts:
+        return False
+    try:
+        c = _gd_load_creds(account_id=account_id)
+        return c is not None and (c.valid or bool(c.refresh_token) or bool(c.token))
+    except Exception:
+        return False
+
+def _gd_rename_account(account_id, new_name):
+    new_name = (new_name or "").strip()
+    if not new_name:
+        raise ValueError("Custom name cannot be empty")
+    with _gd_creds_lock:
+        accounts = _gd_load_accounts_raw()
+        target = None
+        for a in accounts:
+            if a["id"] == account_id or (account_id in ("root", "default") and a == accounts[0]):
+                if not a.get("original_name"):
+                    a["original_name"] = a.get("name", "Google Drive")
+                a["name"] = new_name
+                a["custom_name"] = new_name
+                target = a
+                break
+        if not target:
+            raise ValueError(f"Google Drive account {account_id!r} not found")
+        _gd_save_accounts_raw(accounts)
+        return {
+            "id": target["id"],
+            "name": target["name"],
+            "custom_name": target.get("custom_name", ""),
+            "email": target.get("email", ""),
+        }
+
+def _gd_remove_account(account_id=None):
+    _gd_meta_cache.clear()
+    with _gd_creds_lock:
+        accounts = _gd_load_accounts_raw()
+        if not account_id:
+            _gd_save_accounts_raw([])
+            return
+        accounts = [a for a in accounts if a["id"] != account_id]
+        _gd_save_accounts_raw(accounts)
+
+def _gd_get_auth_url(custom_name=None, account_id=None):
+    cfg = gdrive_manager.get_config()
+    flow = Flow.from_client_config(gdrive_manager._client_config(), scopes=gdrive_manager.SCOPES, redirect_uri=cfg["redirect_uri"])
+    url, state = flow.authorization_url(access_type="offline", prompt="select_account consent")
+    if state:
+        _GD_PENDING_OAUTH[state] = {
+            "custom_name": (custom_name or "").strip(),
+            "account_id": (account_id or "").strip(),
+            "ts": time.time(),
+        }
+    return url
+
+def _gd_handle_callback(code, state):
+    cfg = gdrive_manager.get_config()
+    flow = Flow.from_client_config(gdrive_manager._client_config(), scopes=gdrive_manager.SCOPES, redirect_uri=cfg["redirect_uri"])
+    flow.fetch_token(code=code)
+    c = flow.credentials
+    pending = _GD_PENDING_OAUTH.pop(state, {}) if state else {}
+    email = ""
+    try:
+        svc = build("drive", "v3", credentials=c, cache_discovery=False)
+        about = svc.about().get(fields="user(displayName,emailAddress)").execute()
+        email = (about.get("user") or {}).get("emailAddress", "")
+    except Exception:
+        pass
+    _gd_save_creds(
+        c,
+        account_id=pending.get("account_id") or None,
+        custom_name=pending.get("custom_name") or None,
+        email=email,
+    )
+
+def _gd_svc(account_id=None):
+    c = _gd_load_creds(account_id=account_id)
     if not c:
         raise RuntimeError("Not authenticated with Google Drive")
     return build("drive", "v3", credentials=c, cache_discovery=False)
 
-def _gd_get_file_meta(file_id):
+def _gd_cache_key(account_id, file_id):
+    return f"{account_id or 'default'}:{file_id}"
+
+def _gd_list_files(folder_id="root", account_id=None):
+    res = _gd_svc(account_id=account_id).files().list(
+        q=f"'{folder_id}' in parents and trashed=false",
+        fields="files(id,name,mimeType,size,modifiedTime,parents)",
+        pageSize=200,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
+    out = []
     now = time.time()
-    cached = _gd_meta_cache.get(file_id)
+    for f in res.get("files", []):
+        is_folder = f["mimeType"] == "application/vnd.google-apps.folder"
+        size_val = int(f.get("size", 0) or 0)
+        info = {
+            "name": f["name"],
+            "mimeType": f["mimeType"],
+            "size": size_val,
+        }
+        _gd_meta_cache[_gd_cache_key(account_id, f["id"])] = (now, info)
+        _gd_meta_cache[f["id"]] = (now, info)
+        out.append({
+            "id": f["id"],
+            "name": f["name"],
+            "type": "folder" if is_folder else "file",
+            "size": size_val,
+            "modified": f.get("modifiedTime", ""),
+            "mimeType": f["mimeType"],
+        })
+    return out
+
+def _gd_get_file_meta(file_id, account_id=None):
+    now = time.time()
+    ck = _gd_cache_key(account_id, file_id)
+    cached = _gd_meta_cache.get(ck) or _gd_meta_cache.get(file_id)
     if cached and (now - cached[0]) < _GD_META_TTL:
         return cached[1]
-    svc = _gd_svc()
+    svc = _gd_svc(account_id=account_id)
     meta = svc.files().get(
         fileId=file_id,
         fields="name,mimeType,size",
@@ -99,16 +406,17 @@ def _gd_get_file_meta(file_id):
         "mimeType": meta.get("mimeType", "application/octet-stream"),
         "size": int(meta.get("size", 0) or 0),
     }
+    _gd_meta_cache[ck] = (now, info)
     _gd_meta_cache[file_id] = (now, info)
     return info
 
-def _gd_open_media_response(file_id, start=None, end=None):
+def _gd_open_media_response(file_id, start=None, end=None, account_id=None):
     url = (
         f"https://www.googleapis.com/drive/v3/files/{file_id}"
         f"?alt=media&supportsAllDrives=true&acknowledgeAbuse=true"
     )
     for attempt in range(2):
-        c = _gd_load_creds(force_refresh=(attempt > 0))
+        c = _gd_load_creds(force_refresh=(attempt > 0), account_id=account_id)
         if not c:
             raise RuntimeError("Not authenticated with Google Drive")
         headers = {"Authorization": f"Bearer {c.token}"}
@@ -131,8 +439,8 @@ def _gd_open_media_response(file_id, start=None, end=None):
         return r
     raise RuntimeError("Google Drive authentication failed after token refresh")
 
-def _gd_stream_file_range(file_id, start=0, end=None, chunk_size=262144):
-    r = _gd_open_media_response(file_id, start=start, end=end)
+def _gd_stream_file_range(file_id, start=0, end=None, chunk_size=262144, account_id=None):
+    r = _gd_open_media_response(file_id, start=start, end=end, account_id=account_id)
     def _gen():
         try:
             for chunk in r.iter_content(chunk_size=chunk_size):
@@ -145,11 +453,164 @@ def _gd_stream_file_range(file_id, start=0, end=None, chunk_size=262144):
                 pass
     return _gen()
 
+def _gd_download_file(file_id, account_id=None):
+    svc = _gd_svc(account_id=account_id)
+    meta = svc.files().get(
+        fileId=file_id,
+        fields="name,mimeType",
+        supportsAllDrives=True,
+    ).execute()
+    name, mime = meta["name"], meta["mimeType"]
+    export_map = {
+        "application/vnd.google-apps.document":
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.google-apps.spreadsheet":
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.google-apps.presentation":
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    }
+    buf = io.BytesIO()
+    req = svc.files().export_media(fileId=file_id, mimeType=export_map[mime]) \
+        if mime in export_map else svc.files().get_media(fileId=file_id, supportsAllDrives=True)
+    dl = MediaIoBaseDownload(buf, req)
+    done = False
+    while not done:
+        _, done = dl.next_chunk()
+    return buf.getvalue(), name, mime
+
+def _gd_ensure_folder_path(base_folder_id, parts, account_id=None):
+    svc = _gd_svc(account_id=account_id)
+    curr_id = base_folder_id or "root"
+    for part in parts:
+        if not part:
+            continue
+        safe_part = part.replace("'", "\\'")
+        q = (
+            f"'{curr_id}' in parents and name = '{safe_part}' "
+            f"and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        )
+        res = svc.files().list(
+            q=q,
+            fields="files(id)",
+            pageSize=1,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        files = res.get("files", [])
+        if files:
+            curr_id = files[0]["id"]
+        else:
+            created = svc.files().create(
+                body={
+                    "name": part,
+                    "parents": [curr_id],
+                    "mimeType": "application/vnd.google-apps.folder",
+                },
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
+            curr_id = created["id"]
+    return curr_id
+
+def _gd_upload_file(parent_id, filename, data, mime_type="application/octet-stream", relative_path=None, account_id=None):
+    svc = _gd_svc(account_id=account_id)
+    target_parent = parent_id or "root"
+    actual_name = filename
+    if relative_path:
+        norm_rel = relative_path.replace("\\", "/").lstrip("/")
+        segments = [s for s in norm_rel.split("/") if s]
+        if len(segments) > 1:
+            target_parent = _gd_ensure_folder_path(target_parent, segments[:-1], account_id=account_id)
+            actual_name = segments[-1]
+        elif segments:
+            actual_name = segments[0]
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime_type, resumable=True)
+    svc.files().create(
+        body={"name": actual_name, "parents": [target_parent]},
+        media_body=media,
+        fields="id",
+        supportsAllDrives=True,
+    ).execute()
+
+def _gd_rename_file(file_id, new_name, account_id=None):
+    _gd_meta_cache.pop(_gd_cache_key(account_id, file_id), None)
+    _gd_meta_cache.pop(file_id, None)
+    return _gd_svc(account_id=account_id).files().update(
+        fileId=file_id,
+        body={"name": new_name},
+        fields="id,name",
+        supportsAllDrives=True,
+    ).execute()
+
+def _gd_delete_file(file_id, account_id=None):
+    _gd_meta_cache.pop(_gd_cache_key(account_id, file_id), None)
+    _gd_meta_cache.pop(file_id, None)
+    _gd_svc(account_id=account_id).files().delete(fileId=file_id, supportsAllDrives=True).execute()
+
+def _gd_create_folder(parent_id, name, account_id=None):
+    f = _gd_svc(account_id=account_id).files().create(
+        body={
+            "name": name,
+            "parents": [parent_id],
+            "mimeType": "application/vnd.google-apps.folder",
+        },
+        fields="id",
+        supportsAllDrives=True,
+    ).execute()
+    return f["id"]
+
+def _gd_create_zip_tmpfile(file_ids, account_id=None):
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    tmp.close()
+
+    def _add_item(zf, fid, arc_prefix):
+        meta = _gd_get_file_meta(fid, account_id=account_id)
+        name = meta["name"]
+        mime = meta["mimeType"]
+        arc_path = f"{arc_prefix}/{name}" if arc_prefix else name
+        if mime == "application/vnd.google-apps.folder":
+            children = _gd_list_files(fid, account_id=account_id)
+            if not children:
+                zf.writestr(arc_path.rstrip("/") + "/", b"")
+            for ch in children:
+                _add_item(zf, ch["id"], arc_path)
+        else:
+            data, _, _ = _gd_download_file(fid, account_id=account_id)
+            zf.writestr(arc_path, data)
+
+    try:
+        with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zf:
+            for fid in file_ids:
+                _add_item(zf, fid, "")
+        size = os.path.getsize(tmp.name)
+        return tmp.name, size
+    except Exception:
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
+        raise
+
 gdrive_manager._save_creds = _gd_save_creds
 gdrive_manager._load_creds = _gd_load_creds
+gdrive_manager.is_authenticated = _gd_is_authenticated
+gdrive_manager.list_accounts = _gd_list_accounts
+gdrive_manager.rename_account = _gd_rename_account
+gdrive_manager.remove_account = _gd_remove_account
+gdrive_manager.get_auth_url = _gd_get_auth_url
+gdrive_manager.handle_callback = _gd_handle_callback
+gdrive_manager.revoke = _gd_remove_account
 gdrive_manager._svc = _gd_svc
+gdrive_manager.list_files = _gd_list_files
 gdrive_manager.get_file_meta = _gd_get_file_meta
 gdrive_manager.stream_file_range = _gd_stream_file_range
+gdrive_manager.download_file = _gd_download_file
+gdrive_manager.ensure_folder_path = _gd_ensure_folder_path
+gdrive_manager.upload_file = _gd_upload_file
+gdrive_manager.rename_file = _gd_rename_file
+gdrive_manager.delete_file = _gd_delete_file
+gdrive_manager.create_folder = _gd_create_folder
+gdrive_manager.create_zip_tmpfile = _gd_create_zip_tmpfile
 
 # ── Ensure smb_manager has fast size cache & clean early-abort stream_file_range ─
 def _get_smb_file_size(share_id, path):
@@ -278,7 +739,8 @@ class _InternalMediaRangeHandler(BaseHTTPRequestHandler):
                 kind = "smb"
             elif parsed.path.startswith("/gdrive/"):
                 file_id = unquote(parsed.path[len("/gdrive/"):])
-                meta = gdrive_manager.get_file_meta(file_id)
+                account_id = qs.get("account_id", [None])[0]
+                meta = gdrive_manager.get_file_meta(file_id, account_id=account_id)
                 file_size = meta["size"]
                 kind = "gdrive"
             else:
@@ -330,7 +792,7 @@ class _InternalMediaRangeHandler(BaseHTTPRequestHandler):
                 gen = smb_manager.stream_file_range(share_id, smb_path, start=start, length=fetch_len)
             else:
                 end_byte = (start + fetch_len - 1) if fetch_len > 0 else None
-                gen = gdrive_manager.stream_file_range(file_id, start=start, end=end_byte)
+                gen = gdrive_manager.stream_file_range(file_id, start=start, end=end_byte, account_id=account_id)
 
             try:
                 for chunk in gen:
@@ -358,8 +820,11 @@ threading.Thread(target=_internal_media_server.serve_forever, daemon=True).start
 def _internal_smb_url(share_id, path):
     return f"http://127.0.0.1:{_INTERNAL_MEDIA_PORT}/smb/{quote(str(share_id))}?path={quote(str(path))}"
 
-def _internal_gdrive_url(file_id):
-    return f"http://127.0.0.1:{_INTERNAL_MEDIA_PORT}/gdrive/{quote(str(file_id))}"
+def _internal_gdrive_url(file_id, account_id=None):
+    base = f"http://127.0.0.1:{_INTERNAL_MEDIA_PORT}/gdrive/{quote(str(file_id))}"
+    if account_id:
+        return f"{base}?account_id={quote(str(account_id))}"
+    return base
 
 MEDIA_MIMES = {
     "mp4": "video/mp4",
@@ -855,12 +1320,17 @@ def api_login():
     u = body.get("username","")
     pw = body.get("password","")
     print(f"LOGIN DEBUG username={u!r} pass_len={len(pw)} keys={list(body.keys())}", flush=True)
-    token = auth.login(u, pw)
+    token, err_msg, status_code, meta = auth.login_with_status(u, pw)
     if token:
         resp = jsonify({"token": token})
         resp.set_cookie("sd_token", token, max_age=auth.SESSION_TTL, path="/", samesite="Lax")
         return resp
-    return jsonify({"error": "Invalid credentials"}), 401
+    return jsonify({
+        "error": err_msg or "Invalid credentials",
+        "locked": meta.get("locked", False),
+        "retry_after": meta.get("retry_after", 0),
+        "attempts_remaining": meta.get("attempts_remaining", 0),
+    }), status_code
 
 @app.post("/api/auth/logout")
 @auth.require_auth
@@ -895,9 +1365,21 @@ def smb_add_share():
         entry = smb_manager.add_share(
             name=b["name"], host=b["host"], share=b["share"],
             username=b.get("username",""), password=b.get("password",""),
-            port=int(b.get("port", 445)))
+            port=int(b.get("port", 445)),
+            custom_name=b.get("custom_name", ""))
         return jsonify({k:v for k,v in entry.items() if k != "password"}), 201
     except (KeyError, ValueError) as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.post("/api/smb/shares/<share_id>/rename")
+@auth.require_auth
+def smb_rename_share(share_id):
+    b = request.get_json(force=True) or {}
+    new_name = (b.get("name") or b.get("custom_name") or "").strip()
+    try:
+        updated = smb_manager.rename_share(share_id, new_name)
+        return jsonify({k:v for k,v in updated.items() if k != "password"})
+    except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
 @app.delete("/api/smb/shares/<share_id>")
@@ -1119,8 +1601,34 @@ def smb_mkdir(share_id):
 @app.get("/api/gdrive/status")
 @auth.require_auth
 def gdrive_status():
-    return jsonify({"configured": gdrive_manager.is_configured(),
-                    "authenticated": gdrive_manager.is_authenticated()})
+    accounts = gdrive_manager.list_accounts()
+    return jsonify({
+        "configured": gdrive_manager.is_configured(),
+        "authenticated": gdrive_manager.is_authenticated(),
+        "accounts": accounts,
+    })
+
+@app.get("/api/gdrive/accounts")
+@auth.require_auth
+def gdrive_list_accounts():
+    return jsonify(gdrive_manager.list_accounts())
+
+@app.post("/api/gdrive/accounts/<account_id>/rename")
+@auth.require_auth
+def gdrive_rename_account(account_id):
+    b = request.get_json(force=True) or {}
+    new_name = (b.get("name") or b.get("custom_name") or "").strip()
+    try:
+        acc = gdrive_manager.rename_account(account_id, new_name)
+        return jsonify(acc)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.delete("/api/gdrive/accounts/<account_id>")
+@auth.require_auth
+def gdrive_delete_account(account_id):
+    gdrive_manager.remove_account(account_id)
+    return jsonify({"ok": True})
 
 @app.get("/api/gdrive/config")
 @auth.require_auth
@@ -1143,7 +1651,9 @@ def gdrive_save_config():
 def gdrive_auth():
     if not gdrive_manager.is_configured():
         return jsonify({"error": "Google OAuth not configured"}), 400
-    return jsonify({"url": gdrive_manager.get_auth_url()})
+    custom_name = request.args.get("name", "").strip()
+    account_id = request.args.get("account_id", "").strip()
+    return jsonify({"url": gdrive_manager.get_auth_url(custom_name=custom_name, account_id=account_id)})
 
 @app.get("/api/gdrive/callback")
 def gdrive_callback():
@@ -1160,32 +1670,35 @@ def gdrive_callback():
 @app.delete("/api/gdrive/revoke")
 @auth.require_auth
 def gdrive_revoke():
-    gdrive_manager.revoke()
+    account_id = request.args.get("account_id", "").strip() or None
+    gdrive_manager.revoke(account_id=account_id)
     return jsonify({"ok": True})
 
 @app.get("/api/gdrive/files")
 @auth.require_auth
 def gdrive_files():
     folder_id = request.args.get("folder", "root")
+    account_id = request.args.get("account_id", "").strip() or None
     try:
-        return jsonify(gdrive_manager.list_files(folder_id))
+        return jsonify(gdrive_manager.list_files(folder_id, account_id=account_id))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.get("/api/gdrive/probe/<file_id>")
 @auth.require_auth
 def gdrive_probe(file_id):
+    account_id = request.args.get("account_id", "").strip() or None
     try:
-        meta = gdrive_manager.get_file_meta(file_id)
+        meta = gdrive_manager.get_file_meta(file_id, account_id=account_id)
         filename = meta["name"]
         file_size = meta["size"]
-        internal_url = _internal_gdrive_url(file_id)
+        internal_url = _internal_gdrive_url(file_id, account_id=account_id)
         end_byte = min(file_size - 1, 4 * 1024 * 1024 - 1) if file_size > 0 else 4 * 1024 * 1024 - 1
         info = probe_media_info(
-            cache_key=f"gdrive:{file_id}",
+            cache_key=f"gdrive:{account_id or 'default'}:{file_id}",
             internal_url=internal_url,
             filename=filename,
-            fallback_gen_fn=lambda: gdrive_manager.stream_file_range(file_id, start=0, end=end_byte),
+            fallback_gen_fn=lambda: gdrive_manager.stream_file_range(file_id, start=0, end=end_byte, account_id=account_id),
         )
         return jsonify(info)
     except Exception as e:
@@ -1194,15 +1707,16 @@ def gdrive_probe(file_id):
 @app.get("/api/gdrive/download/<file_id>")
 @auth.require_auth
 def gdrive_download(file_id):
+    account_id = request.args.get("account_id", "").strip() or None
     try:
-        meta = gdrive_manager.get_file_meta(file_id)
+        meta = gdrive_manager.get_file_meta(file_id, account_id=account_id)
         filename = meta["name"]
         raw_mime = meta["mimeType"]
         file_size = meta["size"]
 
         # Google Workspace native docs must be exported
         if raw_mime.startswith("application/vnd.google-apps."):
-            data, filename, mime = gdrive_manager.download_file(file_id)
+            data, filename, mime = gdrive_manager.download_file(file_id, account_id=account_id)
             return send_file(
                 io.BytesIO(data),
                 download_name=filename,
@@ -1211,7 +1725,7 @@ def gdrive_download(file_id):
             )
 
         disposition = make_content_disposition(filename, bool(request.args.get("dl")))
-        internal_url = _internal_gdrive_url(file_id)
+        internal_url = _internal_gdrive_url(file_id, account_id=account_id)
 
         if request.args.get("transcode") == "1":
             mode = request.args.get("mode", "auto")
@@ -1221,15 +1735,15 @@ def gdrive_download(file_id):
             if mode == "auto":
                 end_byte = min(file_size - 1, 4 * 1024 * 1024 - 1) if file_size > 0 else 4 * 1024 * 1024 - 1
                 probe_info = probe_media_info(
-                    cache_key=f"gdrive:{file_id}",
+                    cache_key=f"gdrive:{account_id or 'default'}:{file_id}",
                     internal_url=internal_url,
                     filename=filename,
-                    fallback_gen_fn=lambda: gdrive_manager.stream_file_range(file_id, start=0, end=end_byte),
+                    fallback_gen_fn=lambda: gdrive_manager.stream_file_range(file_id, start=0, end=end_byte, account_id=account_id),
                 )
             resp = app.response_class(
                 transcode_media_stream(
                     internal_url=internal_url,
-                    chunk_iterable_fn=lambda: gdrive_manager.stream_file_range(file_id, start=0, end=None),
+                    chunk_iterable_fn=lambda: gdrive_manager.stream_file_range(file_id, start=0, end=None, account_id=account_id),
                     filename=filename,
                     mode=mode,
                     audio_track=audio_track,
@@ -1247,7 +1761,7 @@ def gdrive_download(file_id):
         if request.args.get("transcode") == "audio":
             resp = app.response_class(
                 transcode_audio_stream(
-                    lambda: gdrive_manager.stream_file_range(file_id, start=0, end=None),
+                    lambda: gdrive_manager.stream_file_range(file_id, start=0, end=None, account_id=account_id),
                     internal_url=internal_url,
                 ),
                 status=200,
@@ -1285,7 +1799,7 @@ def gdrive_download(file_id):
             length = end - start + 1
 
             resp = app.response_class(
-                gdrive_manager.stream_file_range(file_id, start=start, end=end),
+                gdrive_manager.stream_file_range(file_id, start=start, end=end, account_id=account_id),
                 status=206,
                 mimetype=mime,
                 direct_passthrough=True,
@@ -1298,7 +1812,7 @@ def gdrive_download(file_id):
             return resp
         else:
             resp = app.response_class(
-                gdrive_manager.stream_file_range(file_id, start=0, end=None),
+                gdrive_manager.stream_file_range(file_id, start=0, end=None, account_id=account_id),
                 status=200,
                 mimetype=mime,
                 direct_passthrough=True,
@@ -1317,6 +1831,7 @@ def gdrive_download(file_id):
 @auth.require_auth
 def gdrive_upload():
     folder_id = request.args.get("folder","root")
+    account_id = request.args.get("account_id", "").strip() or None
     rel_path = (request.form.get("relative_path") or request.args.get("relative_path") or "").strip()
     f = request.files.get("file")
     if not f:
@@ -1328,6 +1843,7 @@ def gdrive_upload():
             f.read(),
             f.content_type or "application/octet-stream",
             relative_path=rel_path or None,
+            account_id=account_id,
         )
         return jsonify({"ok": True})
     except Exception as e:
@@ -1337,12 +1853,12 @@ def gdrive_upload():
 @auth.require_auth
 def gdrive_rename(file_id):
     b = request.get_json(force=True) or {}
+    account_id = (request.args.get("account_id") or b.get("account_id") or "").strip() or None
     new_name = (b.get("name") or b.get("new_name") or "").strip()
     if not new_name:
         return jsonify({"error": "New name is required"}), 400
     try:
-        _gd_meta_cache.pop(file_id, None)
-        gdrive_manager.rename_file(file_id, new_name)
+        gdrive_manager.rename_file(file_id, new_name, account_id=account_id)
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1351,11 +1867,12 @@ def gdrive_rename(file_id):
 @auth.require_auth
 def gdrive_zip():
     b = request.get_json(force=True) or {}
+    account_id = (request.args.get("account_id") or b.get("account_id") or "").strip() or None
     ids = b.get("ids") or []
     if not ids:
         return jsonify({"error": "No file IDs provided"}), 400
     try:
-        tmp_path, zip_size = gdrive_manager.create_zip_tmpfile(ids)
+        tmp_path, zip_size = gdrive_manager.create_zip_tmpfile(ids, account_id=account_id)
         archive_name = b.get("name") or "GoogleDrive_Download.zip"
         resp = app.response_class(
             _stream_and_unlink_tmpfile(tmp_path),
@@ -1373,9 +1890,9 @@ def gdrive_zip():
 @app.delete("/api/gdrive/delete/<file_id>")
 @auth.require_auth
 def gdrive_delete(file_id):
+    account_id = request.args.get("account_id", "").strip() or None
     try:
-        _gd_meta_cache.pop(file_id, None)
-        gdrive_manager.delete_file(file_id)
+        gdrive_manager.delete_file(file_id, account_id=account_id)
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1384,44 +1901,47 @@ def gdrive_delete(file_id):
 @auth.require_auth
 def gdrive_mkdir():
     b = request.get_json(force=True) or {}
+    account_id = (request.args.get("account_id") or b.get("account_id") or "").strip() or None
     try:
-        fid = gdrive_manager.create_folder(b.get("parent","root"), b.get("name","New Folder"))
+        fid = gdrive_manager.create_folder(b.get("parent","root"), b.get("name","New Folder"), account_id=account_id)
         return jsonify({"id": fid})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ── Cross-Drive Transfer (SMB <-> Google Drive & SMB <-> SMB) ─────────────────
-def _copy_smb_item_to_gdrive(src_share, smb_path, is_folder, dest_folder_id):
+# ── Cross-Drive Transfer (SMB <-> Google Drive & SMB <-> SMB & GDrive <-> GDrive) ──
+def _copy_smb_item_to_gdrive(src_share, smb_path, is_folder, dest_folder_id, dest_account_id=None):
     name = smb_path.rstrip("/").split("/")[-1]
     if is_folder:
-        new_folder_id = gdrive_manager.ensure_folder_path(dest_folder_id, [name])
+        new_folder_id = gdrive_manager.ensure_folder_path(dest_folder_id, [name], account_id=dest_account_id)
         for child in smb_manager.browse(src_share, smb_path):
             _copy_smb_item_to_gdrive(
                 src_share,
                 child["path"],
                 child["type"] == "folder",
                 new_folder_id,
+                dest_account_id=dest_account_id,
             )
     else:
         data = smb_manager.read_file_bytes(src_share, smb_path)
         mime = guess_media_mime(name)
-        gdrive_manager.upload_file(dest_folder_id, name, data, mime)
+        gdrive_manager.upload_file(dest_folder_id, name, data, mime, account_id=dest_account_id)
 
-def _copy_gdrive_item_to_smb(file_id, is_folder, dest_share, dest_smb_dir):
-    meta = gdrive_manager.get_file_meta(file_id)
+def _copy_gdrive_item_to_smb(file_id, is_folder, dest_share, dest_smb_dir, src_account_id=None):
+    meta = gdrive_manager.get_file_meta(file_id, account_id=src_account_id)
     name = meta["name"]
     target_path = dest_smb_dir.rstrip("/") + "/" + name
     if is_folder or meta["mimeType"] == "application/vnd.google-apps.folder":
         smb_manager.create_directory(dest_share, target_path)
-        for child in gdrive_manager.list_files(file_id):
+        for child in gdrive_manager.list_files(file_id, account_id=src_account_id):
             _copy_gdrive_item_to_smb(
                 child["id"],
                 child["type"] == "folder",
                 dest_share,
                 target_path,
+                src_account_id=src_account_id,
             )
     else:
-        data, _, _ = gdrive_manager.download_file(file_id)
+        data, _, _ = gdrive_manager.download_file(file_id, account_id=src_account_id)
         smb_manager.upload_file(dest_share, target_path, data)
 
 def _copy_smb_item_to_smb(src_share, smb_path, is_folder, dest_share, dest_smb_dir):
@@ -1441,20 +1961,22 @@ def _copy_smb_item_to_smb(src_share, smb_path, is_folder, dest_share, dest_smb_d
         data = smb_manager.read_file_bytes(src_share, smb_path)
         smb_manager.upload_file(dest_share, target_path, data)
 
-def _copy_gdrive_item_to_gdrive(file_id, is_folder, dest_folder_id):
-    meta = gdrive_manager.get_file_meta(file_id)
+def _copy_gdrive_item_to_gdrive(file_id, is_folder, dest_folder_id, src_account_id=None, dest_account_id=None):
+    meta = gdrive_manager.get_file_meta(file_id, account_id=src_account_id)
     name = meta["name"]
     if is_folder or meta["mimeType"] == "application/vnd.google-apps.folder":
-        new_folder_id = gdrive_manager.ensure_folder_path(dest_folder_id, [name])
-        for child in gdrive_manager.list_files(file_id):
+        new_folder_id = gdrive_manager.ensure_folder_path(dest_folder_id, [name], account_id=dest_account_id)
+        for child in gdrive_manager.list_files(file_id, account_id=src_account_id):
             _copy_gdrive_item_to_gdrive(
                 child["id"],
                 child["type"] == "folder",
                 new_folder_id,
+                src_account_id=src_account_id,
+                dest_account_id=dest_account_id,
             )
     else:
-        data, _, mime = gdrive_manager.download_file(file_id)
-        gdrive_manager.upload_file(dest_folder_id, name, data, mime)
+        data, _, mime = gdrive_manager.download_file(file_id, account_id=src_account_id)
+        gdrive_manager.upload_file(dest_folder_id, name, data, mime, account_id=dest_account_id)
 
 @app.post("/api/transfer")
 @auth.require_auth
@@ -1475,13 +1997,13 @@ def transfer_items():
         for item in items:
             is_folder = item.get("type") == "folder"
             if src_type == "smb" and dest_type == "gdrive":
-                _copy_smb_item_to_gdrive(src_drive, item["path"], is_folder, dest_folder)
+                _copy_smb_item_to_gdrive(src_drive, item["path"], is_folder, dest_folder, dest_account_id=dest_drive)
             elif src_type == "gdrive" and dest_type == "smb":
-                _copy_gdrive_item_to_smb(item["id"], is_folder, dest_drive, dest_folder)
+                _copy_gdrive_item_to_smb(item["id"], is_folder, dest_drive, dest_folder, src_account_id=src_drive)
             elif src_type == "smb" and dest_type == "smb":
                 _copy_smb_item_to_smb(src_drive, item["path"], is_folder, dest_drive, dest_folder)
             elif src_type == "gdrive" and dest_type == "gdrive":
-                _copy_gdrive_item_to_gdrive(item["id"], is_folder, dest_folder)
+                _copy_gdrive_item_to_gdrive(item["id"], is_folder, dest_folder, src_account_id=src_drive, dest_account_id=dest_drive)
             else:
                 return jsonify({"error": "Invalid source or destination type"}), 400
             copied += 1

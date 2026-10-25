@@ -18,7 +18,7 @@ Repository: [https://github.com/Sage222/SageDrive2](https://github.com/Sage222/S
 ### File Browsing & Responsive UI
 - **Unified Sidebar:** Browse all connected SMB shares and Google Drives from a collapsible sidebar (`[` shortcut or toggle button).
 - **Tablet & Mobile Ready:** Slide-over navigation drawer, touch-friendly controls, and adaptive layouts for phones, tablets, and desktops.
-- **List & Grid Views:** Switch between detailed list view and visual grid view with live search/filtering and sorting (name, size, date, folders first).
+- **List & Grid Views with Sorting:** Switch between detailed list view and visual grid view, and sort files and folders by **Name**, **Date**, or **Size** (ascending or descending) using either the topbar sort controls or clickable column headers (`Name`, `Size`, `Modified`) in list view (folders always stay grouped at the top).
 - **Breadcrumb Navigation:** Clickable path breadcrumbs for instant directory jumping.
 
 ### Advanced File Management
@@ -45,9 +45,9 @@ Repository: [https://github.com/Sage222/SageDrive2](https://github.com/Sage222/S
 - **Hardened Session Management:** Username/password authentication with `bcrypt` hashed passwords, `HttpOnly` + `SameSite=Lax` session cookies, Bearer token sessions, full session revocation on logout, and configurable session TTL.
 
 ### Tidied Settings Page & Multi-Drive SMB Proxy
-- **Category Filter Tabs:** Organized into **All**, **Storage**, **Google OAuth**, **SMB Proxy**, and **Security & About** tabs.
-- **2-Column Storage Cards:** Manage all connected Google Drives and SMB shares side-by-side with inline custom name editing, status badges, and quick **+ Add** buttons.
-- **Collapsible OAuth Credentials:** Google OAuth Client ID/Secret configuration collapses neatly once configured.
+- **Dedicated Category Tabs:** Organized into **Google Drives**, **SMB**, **Google OAuth**, **SMB Proxy**, and **Security & About** tabs for clean, focused configuration.
+- **Dedicated Google Drives & SMB Tabs:** Manage connected Google Drive accounts and SMB/NAS shares in their own dedicated tabs with inline custom name editing, status badges, and quick **+ Add** buttons.
+- **Google OAuth Credentials:** Configure and copy your Google OAuth Client ID, Client Secret, and Authorized Redirect URI in the **Google OAuth** tab.
 - **Multi-Drive Google Drive SMB Proxy:**
   - **Separate Network Share per Google Drive:** Expose each connected Google Drive account as its own independent Samba network share (`\\<host>\<ShareName>`) on port `445` via `rclone` FUSE mounts (`/mnt/gdrive_mounts/<account_id>`).
   - **Per-Drive Enable/Disable Toggle:** Turn the SMB Proxy share on or off individually for each connected Google Drive in **Settings → SMB Proxy**.
@@ -107,7 +107,7 @@ Use the `ADMIN_USER` and `ADMIN_PASS` values from your `.env` file.
 
 ## Adding & Naming SMB Shares
 
-1. Go to **Settings → Storage** (or click **+ Add** next to SMB Shares)
+1. Go to **Settings → SMB**
 2. Click **+ Add Share**
 3. Fill in the details:
    - **Display Name** — a friendly label shown in the sidebar (e.g. `Media NAS`)

@@ -133,6 +133,7 @@ for idx, acc in enumerate(accounts):
     mpath = f"/mnt/gdrive_mounts/{rc_id}"
     subprocess.run([
         "rclone", "mount", f"gdrive_{rc_id}:", mpath,
+        "--config", "/root/.config/rclone/rclone.conf",
         "--allow-other",
         "--vfs-cache-mode", "writes",
         "--vfs-cache-max-size", "512M",

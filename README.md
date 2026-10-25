@@ -48,7 +48,7 @@ Repository: [https://github.com/Sage222/SageDrive2](https://github.com/Sage222/S
   - **Separate Network Share per Google Drive:** Expose each connected Google Drive account as its own independent Samba network share (`\\<host>\<ShareName>`) on port `445` via `rclone` FUSE mounts (`/mnt/gdrive_mounts/<account_id>`).
   - **Per-Drive Enable/Disable Toggle:** Turn the SMB Proxy share on or off individually for each connected Google Drive in **Settings → SMB Proxy**.
   - **Custom SMB Share Names:** Assign a custom network share name (e.g. `GoogleDrive`, `PersonalDrive`, `WorkDrive`) per Google Drive in **Settings → SMB Proxy**, complete with per-drive one-click UNC path and PowerShell `net use` command copy buttons.
-  - **Live Mount & Samba Reload:** Adding, toggling, or renaming a Google Drive's SMB share dynamically reconciles `rclone` mounts and reloads Samba (`smbd`) on the fly without requiring a Docker container restart.
+  - **Live Mount & Samba Reload:** Adding, toggling, or renaming a Google Drive's SMB share dynamically reconciles `rclone` mounts (`/mnt/gdrive_mounts/<account_id>`), unmounts any legacy single-drive `/mnt/gdrive` mount at startup, rewrites `/etc/samba/smb.conf`, and reloads Samba (`smbd`) on the fly without requiring a Docker image rebuild or container restart.
 
 ### Tech Stack
 - **Backend:** Python, Flask, `pysmb`, Google Drive API v3, `ffmpeg` (live audio remuxing), `rclone` + Samba

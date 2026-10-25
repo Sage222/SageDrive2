@@ -1,4 +1,4 @@
-import os, json, time, math, secrets, bcrypt, mimetypes, io, re, subprocess, threading, tempfile, zipfile, queue, requests
+import os, json, time, math, secrets, bcrypt, mimetypes, io, re, shutil, subprocess, threading, tempfile, zipfile, queue, requests
 from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -2219,6 +2219,7 @@ def _reconcile_smb_proxy():
                         subprocess.run(
                             [
                                 "rclone", "mount", remote_name, mpath,
+                                "--config", "/root/.config/rclone/rclone.conf",
                                 "--allow-other",
                                 "--vfs-cache-mode", "writes",
                                 "--vfs-cache-max-size", "512M",

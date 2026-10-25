@@ -459,17 +459,40 @@ def _open_media_response(file_id, start=None, end=None, account_id=None):
     raise RuntimeError("Google Drive authentication failed after token refresh")
 
 def stream_file_range(file_id, start=0, end=None, chunk_size=262144, account_id=None):
-    r = _open_media_response(file_id, start=start, end=end, account_id=account_id)
     def _gen():
-        try:
-            for chunk in r.iter_content(chunk_size=chunk_size):
-                if chunk:
-                    yield chunk
-        finally:
+        curr_start = int(start or 0)
+        retries = 0
+        while True:
+            if end is not None and curr_start > end:
+                break
+            r = None
+            prev_start = curr_start
             try:
-                r.close()
+                r = _open_media_response(file_id, start=curr_start, end=end, account_id=account_id)
+                for chunk in r.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        curr_start += len(chunk)
+                        yield chunk
+                        if end is not None and curr_start > end:
+                            break
+                break
+            except GeneratorExit:
+                break
             except Exception:
-                pass
+                if end is not None and curr_start > end:
+                    break
+                if curr_start > prev_start:
+                    retries = 0
+                else:
+                    retries += 1
+                if retries > 4:
+                    raise
+            finally:
+                if r is not None:
+                    try:
+                        r.close()
+                    except Exception:
+                        pass
     return _gen()
 
 def download_file(file_id, account_id=None):

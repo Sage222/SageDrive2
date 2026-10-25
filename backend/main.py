@@ -1,4 +1,4 @@
-import os, json, time, math, secrets, bcrypt, mimetypes, io, re, shutil, subprocess, threading, tempfile, zipfile, queue, requests
+import os, json, time, math, secrets, bcrypt, mimetypes, io, re, shutil, struct, subprocess, threading, tempfile, zipfile, queue, requests
 from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -522,17 +522,40 @@ def _gd_open_media_response(file_id, start=None, end=None, account_id=None):
     raise RuntimeError("Google Drive authentication failed after token refresh")
 
 def _gd_stream_file_range(file_id, start=0, end=None, chunk_size=262144, account_id=None):
-    r = _gd_open_media_response(file_id, start=start, end=end, account_id=account_id)
     def _gen():
-        try:
-            for chunk in r.iter_content(chunk_size=chunk_size):
-                if chunk:
-                    yield chunk
-        finally:
+        curr_start = int(start or 0)
+        retries = 0
+        while True:
+            if end is not None and curr_start > end:
+                break
+            r = None
+            prev_start = curr_start
             try:
-                r.close()
+                r = _gd_open_media_response(file_id, start=curr_start, end=end, account_id=account_id)
+                for chunk in r.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        curr_start += len(chunk)
+                        yield chunk
+                        if end is not None and curr_start > end:
+                            break
+                break
+            except GeneratorExit:
+                break
             except Exception:
-                pass
+                if end is not None and curr_start > end:
+                    break
+                if curr_start > prev_start:
+                    retries = 0
+                else:
+                    retries += 1
+                if retries > 4:
+                    raise
+            finally:
+                if r is not None:
+                    try:
+                        r.close()
+                    except Exception:
+                        pass
     return _gen()
 
 def _gd_download_file(file_id, account_id=None):
@@ -810,6 +833,7 @@ def _smb_stream_file_range(share_id, path, start=0, length=None, chunk_size=2621
     q = queue.Queue(maxsize=32)
     sentinel = object()
     aborted = threading.Event()
+    smb_op_timeout = 14400
 
     class _AbortStream(Exception):
         pass
@@ -817,6 +841,7 @@ def _smb_stream_file_range(share_id, path, start=0, length=None, chunk_size=2621
     class _QueueWriter:
         def __init__(self, max_bytes):
             self.remaining = max_bytes
+            self.written = 0
             self.buf = bytearray()
 
         def write(self, data):
@@ -830,6 +855,7 @@ def _smb_stream_file_range(share_id, path, start=0, length=None, chunk_size=2621
                 if len(data) > self.remaining:
                     data = data[:self.remaining]
                 self.remaining -= len(data)
+            self.written += len(data)
             self.buf.extend(data)
             while len(self.buf) >= chunk_size:
                 if aborted.is_set():
@@ -852,27 +878,65 @@ def _smb_stream_file_range(share_id, path, start=0, length=None, chunk_size=2621
                         break
 
     def _producer():
-        c = None
+        cfg = None
+        writer = _QueueWriter(length)
+        retries = 0
         try:
             cfg = smb_manager._cfg(share_id)
-            c = smb_manager._conn(cfg)
-            writer = _QueueWriter(length)
-            if start == 0 and length is None:
-                c.retrieveFile(cfg["share"], path, writer)
-            else:
-                max_len = length if (length is not None and length > 0) else -1
-                c.retrieveFileFromOffset(cfg["share"], path, writer, offset=start, max_length=max_len)
-            writer.flush()
-        except _AbortStream:
-            pass
-        except Exception as e:
+            while not aborted.is_set():
+                if writer.remaining is not None and writer.remaining <= 0:
+                    break
+                c = None
+                prev_written = writer.written
+                try:
+                    c = smb_manager._conn(cfg)
+                    curr_offset = start + writer.written
+                    if curr_offset == 0 and writer.remaining is None:
+                        c.retrieveFile(cfg["share"], path, writer, timeout=smb_op_timeout)
+                    else:
+                        max_len = writer.remaining if (writer.remaining is not None and writer.remaining > 0) else -1
+                        c.retrieveFileFromOffset(
+                            cfg["share"],
+                            path,
+                            writer,
+                            offset=curr_offset,
+                            max_length=max_len,
+                            timeout=smb_op_timeout,
+                        )
+                    writer.flush()
+                    break
+                except _AbortStream:
+                    break
+                except Exception as e:
+                    if aborted.is_set():
+                        break
+                    if writer.remaining is not None and writer.remaining <= 0:
+                        writer.flush()
+                        break
+                    if writer.written > prev_written:
+                        retries = 0
+                    else:
+                        retries += 1
+                    if retries > 4:
+                        try:
+                            writer.flush()
+                        except Exception:
+                            pass
+                        try:
+                            q.put(e, timeout=1.0)
+                        except Exception:
+                            pass
+                        break
+                finally:
+                    if c is not None:
+                        try:
+                            c.close()
+                        except Exception:
+                            pass
+        except Exception as outer_e:
             if not aborted.is_set():
                 try:
-                    writer.flush()
-                except Exception:
-                    pass
-                try:
-                    q.put(e, timeout=1.0)
+                    q.put(outer_e, timeout=1.0)
                 except Exception:
                     pass
         finally:
@@ -880,11 +944,6 @@ def _smb_stream_file_range(share_id, path, start=0, length=None, chunk_size=2621
                 q.put(sentinel, timeout=1.0)
             except Exception:
                 pass
-            if c is not None:
-                try:
-                    c.close()
-                except Exception:
-                    pass
 
     threading.Thread(target=_producer, daemon=True).start()
 
@@ -910,10 +969,9 @@ class _InternalMediaRangeHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-    def do_GET(self):
+    def _handle_request(self, send_body=True):
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
-        is_probe = qs.get("probe", [""])[0] == "1"
         try:
             if parsed.path.startswith("/smb/"):
                 share_id = unquote(parsed.path[len("/smb/"):])
@@ -970,7 +1028,10 @@ class _InternalMediaRangeHandler(BaseHTTPRequestHandler):
                     self.send_header("Content-Length", str(file_size))
                 self.end_headers()
 
-            fetch_len = min(length, 8 * 1024 * 1024) if (is_probe and length > 0) else length
+            if not send_body:
+                return
+
+            fetch_len = length
             if kind == "smb":
                 gen = smb_manager.stream_file_range(share_id, smb_path, start=start, length=fetch_len)
             else:
@@ -989,12 +1050,18 @@ class _InternalMediaRangeHandler(BaseHTTPRequestHandler):
                     gen.close()
                 except Exception:
                     pass
-        except Exception as e:
+        except Exception:
             try:
                 self.send_response(500)
                 self.end_headers()
             except Exception:
                 pass
+
+    def do_HEAD(self):
+        self._handle_request(send_body=False)
+
+    def do_GET(self):
+        self._handle_request(send_body=True)
 
 _internal_media_server = ThreadingHTTPServer(("127.0.0.1", 0), _InternalMediaRangeHandler)
 _INTERNAL_MEDIA_PORT = _internal_media_server.server_port
@@ -1106,6 +1173,48 @@ def _stream_and_unlink_tmpfile(tmp_path, chunk_size=262144):
             pass
 
 # ── Media Codec Probe & Smart Remux / Transcode ───────────────────────────────
+def _parse_duration_val(val):
+    if val is None:
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val) if val > 0 else 0.0
+    s = str(val).strip()
+    if not s or s.upper() == "N/A":
+        return 0.0
+    try:
+        v = float(s)
+        if v > 0 and math.isfinite(v):
+            return v
+    except Exception:
+        pass
+    m = re.match(r"^(\d+):(\d{1,2}):(\d{1,2}(?:\.\d+)?)", s)
+    if m:
+        try:
+            hrs = int(m.group(1))
+            mins = int(m.group(2))
+            secs = float(m.group(3))
+            return hrs * 3600.0 + mins * 60.0 + secs
+        except Exception:
+            pass
+    return 0.0
+
+def _extract_probe_duration(fmt, streams):
+    candidates = [
+        _parse_duration_val((fmt or {}).get("duration")),
+    ]
+    fmt_tags = (fmt or {}).get("tags") or {}
+    for k, v in fmt_tags.items():
+        if str(k).lower().startswith("duration"):
+            candidates.append(_parse_duration_val(v))
+    for st in (streams or []):
+        candidates.append(_parse_duration_val(st.get("duration")))
+        st_tags = st.get("tags") or {}
+        for k, v in st_tags.items():
+            if str(k).lower().startswith("duration"):
+                candidates.append(_parse_duration_val(v))
+    valid = [c for c in candidates if c and c > 0 and math.isfinite(c)]
+    return max(valid) if valid else 0.0
+
 def _analyze_probe_data(data, filename=""):
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     streams = data.get("streams") or []
@@ -1175,10 +1284,7 @@ def _analyze_probe_data(data, filename=""):
             "title": tags.get("title") or tags.get("TITLE") or "",
         })
 
-    try:
-        duration = float(fmt.get("duration") or 0)
-    except Exception:
-        duration = 0.0
+    duration = _extract_probe_duration(fmt, streams)
 
     return {
         "has_video": has_video,
@@ -1201,19 +1307,19 @@ def probe_media_info(cache_key, internal_url, filename="", fallback_gen_fn=None)
     if cached and (now - cached[0]) < _PROBE_TTL:
         return cached[1]
 
-    probe_url = internal_url + ("&" if "?" in internal_url else "?") + "probe=1"
+    show_entries = "stream=index,codec_type,codec_name,profile,pix_fmt,channels,sample_rate,duration:stream_tags:format=format_name,duration:format_tags"
     cmd = [
         "ffprobe",
         "-v", "error",
-        "-probesize", "4000000",
-        "-analyzeduration", "4000000",
-        "-show_entries", "stream=index,codec_type,codec_name,profile,pix_fmt,channels,sample_rate:stream_tags=language,title:format=format_name,duration",
+        "-probesize", "10000000",
+        "-analyzeduration", "10000000",
+        "-show_entries", show_entries,
         "-of", "json",
-        probe_url,
+        internal_url,
     ]
     data = None
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         if res.returncode == 0 and res.stdout.strip():
             parsed = json.loads(res.stdout)
             if parsed.get("streams"):
@@ -1227,9 +1333,9 @@ def probe_media_info(cache_key, internal_url, filename="", fallback_gen_fn=None)
                 [
                     "ffprobe",
                     "-v", "error",
-                    "-probesize", "4000000",
-                    "-analyzeduration", "4000000",
-                    "-show_entries", "stream=index,codec_type,codec_name,profile,pix_fmt,channels,sample_rate:stream_tags=language,title:format=format_name,duration",
+                    "-probesize", "8000000",
+                    "-analyzeduration", "8000000",
+                    "-show_entries", show_entries,
                     "-of", "json",
                     "pipe:0",
                 ],
@@ -1241,7 +1347,7 @@ def probe_media_info(cache_key, internal_url, filename="", fallback_gen_fn=None)
             sent = 0
             try:
                 for chunk in gen:
-                    if proc.poll() is not None or sent >= 4 * 1024 * 1024:
+                    if proc.poll() is not None or sent >= 8 * 1024 * 1024:
                         break
                     proc.stdin.write(chunk)
                     sent += len(chunk)
@@ -1256,7 +1362,7 @@ def probe_media_info(cache_key, internal_url, filename="", fallback_gen_fn=None)
                     gen.close()
                 except Exception:
                     pass
-            out, _ = proc.communicate(timeout=5)
+            out, _ = proc.communicate(timeout=8)
             if out:
                 parsed = json.loads(out.decode("utf-8", errors="ignore"))
                 if parsed.get("streams"):
@@ -1268,6 +1374,84 @@ def probe_media_info(cache_key, internal_url, filename="", fallback_gen_fn=None)
     if data and data.get("streams"):
         _PROBE_CACHE[cache_key] = (now, info)
     return info
+
+def _patch_mp4_moov_duration(chunk, duration_sec):
+    """
+    Patches the ISO BMFF moov header (mvhd, tkhd, mdhd, and mvex/mehd) emitted
+    by FFmpeg's -movflags empty_moov so browsers and players know the full
+    duration of a live-remuxed or transcoded video immediately from the first chunk.
+    """
+    if not chunk or not duration_sec or duration_sec <= 0 or not math.isfinite(duration_sec):
+        return chunk
+    try:
+        buf = bytearray(chunk)
+        mvhd_ts = [1000]
+
+        def _walk(b, start, end):
+            pos = start
+            while pos + 8 <= end:
+                sz, btype = struct.unpack(">I4s", b[pos:pos+8])
+                if sz < 8 or pos + sz > end:
+                    break
+                if btype == b"mvhd":
+                    ver = b[pos+8]
+                    if ver == 0 and sz >= 28:
+                        ts = struct.unpack(">I", b[pos+20:pos+24])[0] or 1000
+                        mvhd_ts[0] = ts
+                        struct.pack_into(">I", b, pos+24, min(0xFFFFFFFF, int(round(duration_sec * ts))))
+                    elif ver == 1 and sz >= 40:
+                        ts = struct.unpack(">I", b[pos+28:pos+32])[0] or 1000
+                        mvhd_ts[0] = ts
+                        struct.pack_into(">Q", b, pos+32, int(round(duration_sec * ts)))
+                elif btype == b"tkhd":
+                    ver = b[pos+8]
+                    ts = mvhd_ts[0]
+                    if ver == 0 and sz >= 32:
+                        struct.pack_into(">I", b, pos+28, min(0xFFFFFFFF, int(round(duration_sec * ts))))
+                    elif ver == 1 and sz >= 44:
+                        struct.pack_into(">Q", b, pos+36, int(round(duration_sec * ts)))
+                elif btype == b"mdhd":
+                    ver = b[pos+8]
+                    if ver == 0 and sz >= 28:
+                        ts = struct.unpack(">I", b[pos+20:pos+24])[0] or 1000
+                        struct.pack_into(">I", b, pos+24, min(0xFFFFFFFF, int(round(duration_sec * ts))))
+                    elif ver == 1 and sz >= 40:
+                        ts = struct.unpack(">I", b[pos+28:pos+32])[0] or 1000
+                        struct.pack_into(">Q", b, pos+32, int(round(duration_sec * ts)))
+                elif btype in (b"moov", b"trak", b"mdia"):
+                    _walk(b, pos+8, pos+sz)
+                elif btype == b"moof":
+                    break
+                pos += sz
+
+        _walk(buf, 0, len(buf))
+        pos = 0
+        while pos + 8 <= len(buf):
+            sz, btype = struct.unpack(">I4s", buf[pos:pos+8])
+            if sz < 8 or pos + sz > len(buf):
+                break
+            if btype == b"moov":
+                cpos = pos + 8
+                cend = pos + sz
+                while cpos + 8 <= cend:
+                    csz, ctype = struct.unpack(">I4s", buf[cpos:cpos+8])
+                    if csz < 8 or cpos + csz > cend:
+                        break
+                    if ctype == b"mvex":
+                        has_mehd = b"mehd" in buf[cpos+8:cpos+csz]
+                        if not has_mehd:
+                            mehd_dur = min(0xFFFFFFFF, int(round(duration_sec * mvhd_ts[0])))
+                            mehd_box = struct.pack(">I4sB3sI", 16, b"mehd", 0, b"\x00\x00\x00", mehd_dur)
+                            struct.pack_into(">I", buf, cpos, csz + 16)
+                            struct.pack_into(">I", buf, pos, sz + 16)
+                            buf[cpos+8:cpos+8] = mehd_box
+                        break
+                    cpos += csz
+                break
+            pos += sz
+        return bytes(buf)
+    except Exception:
+        return chunk
 
 def _build_ffmpeg_video_cmd(input_spec, mode="full", video_codec="h264", audio_track=0, start_time=0.0):
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
@@ -1293,16 +1477,16 @@ def _build_ffmpeg_video_cmd(input_spec, mode="full", video_codec="h264", audio_t
     ]
     return cmd
 
-def transcode_media_stream(internal_url=None, chunk_iterable_fn=None, filename="", mode="auto", audio_track=0, start_time=0.0, probe_info=None):
+def transcode_media_stream(internal_url=None, chunk_iterable_fn=None, filename="", mode="auto", audio_track=0, start_time=0.0, probe_info=None, duration_hint=0.0):
     """
-    Streams fragmented MP4 with universal 2-channel stereo AAC audio.
-    When mode='remux' (or mode='auto' with H.264/HEVC video), copies the video
-    stream untouched (-c:v copy) while transcoding EAC3/AC3/DTS/etc. audio to
-    stereo AAC at 100x realtime speed. Automatically falls back to full libx264
-    encoding if stream copy produces no output.
+    Streams fragmented MP4 with universal 2-channel stereo AAC audio and patches
+    the initial moov header with the true full media duration.
     """
     vcodec = (probe_info or {}).get("video_codec") or "h264"
     can_remux = (probe_info or {}).get("can_remux_video", False)
+    total_dur = float((probe_info or {}).get("duration") or duration_hint or 0.0)
+    effective_dur = max(0.0, total_dur - float(start_time or 0.0)) if total_dur > 0 else 0.0
+
     if mode == "auto":
         effective_mode = "remux" if can_remux else "full"
     elif mode in ("remux", "full"):
@@ -1362,14 +1546,23 @@ def transcode_media_stream(internal_url=None, chunk_iterable_fn=None, filename="
 
                 threading.Thread(target=_feed_stdin, daemon=True).start()
 
-            first_chunk = proc.stdout.read(65536)
-            if not first_chunk:
+            init_buf = bytearray()
+            while len(init_buf) < 16384:
+                piece = proc.stdout.read(65536 - len(init_buf))
+                if not piece:
+                    break
+                init_buf.extend(piece)
+                if b"moof" in init_buf:
+                    break
+
+            if not init_buf:
                 try:
                     proc.kill()
                 except Exception:
                     pass
                 continue
 
+            first_chunk = _patch_mp4_moov_duration(bytes(init_buf), effective_dur)
             yield first_chunk
             while True:
                 out = proc.stdout.read(65536)
@@ -1396,7 +1589,7 @@ def transcode_stream(chunk_iterable):
         mode="full",
     )
 
-def transcode_audio_stream(chunk_iterable, internal_url=None):
+def transcode_audio_stream(chunk_iterable, internal_url=None, start_time=0.0):
     """
     Transcodes any audio stream (including 5.1/7.1 EAC3, AC3, DTS, FLAC, WMA, ALAC)
     into universal 2-channel stereo MP3.
@@ -1405,17 +1598,19 @@ def transcode_audio_stream(chunk_iterable, internal_url=None):
     gen = None
     try:
         if internal_url:
+            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+            if start_time and start_time > 0:
+                cmd += ["-ss", f"{start_time:.3f}"]
+            cmd += [
+                "-i", internal_url,
+                "-vn",
+                "-af", "aresample=async=1:first_pts=0",
+                "-c:a", "libmp3lame", "-ac", "2", "-ar", "48000", "-b:a", "192k",
+                "-f", "mp3",
+                "pipe:1",
+            ]
             proc = subprocess.Popen(
-                [
-                    "ffmpeg",
-                    "-hide_banner", "-loglevel", "error",
-                    "-i", internal_url,
-                    "-vn",
-                    "-af", "aresample=async=1:first_pts=0",
-                    "-c:a", "libmp3lame", "-ac", "2", "-ar", "48000", "-b:a", "192k",
-                    "-f", "mp3",
-                    "pipe:1",
-                ],
+                cmd,
                 stdout=subprocess.PIPE,
                 bufsize=65536,
             )
@@ -1616,14 +1811,13 @@ def smb_download(share_id):
             mode = request.args.get("mode", "auto")
             audio_track = int(request.args.get("audio_track", "0") or 0)
             start_time = float(request.args.get("ss", "0") or 0.0)
-            probe_info = None
-            if mode == "auto":
-                probe_info = probe_media_info(
-                    cache_key=f"smb:{share_id}:{path}",
-                    internal_url=internal_url,
-                    filename=filename,
-                    fallback_gen_fn=lambda: smb_manager.stream_file_range(share_id, path, start=0, length=min(file_size, 4 * 1024 * 1024)),
-                )
+            duration_hint = float(request.args.get("duration", "0") or 0.0)
+            probe_info = probe_media_info(
+                cache_key=f"smb:{share_id}:{path}",
+                internal_url=internal_url,
+                filename=filename,
+                fallback_gen_fn=lambda: smb_manager.stream_file_range(share_id, path, start=0, length=min(file_size, 8 * 1024 * 1024)),
+            )
             resp = app.response_class(
                 transcode_media_stream(
                     internal_url=internal_url,
@@ -1633,6 +1827,7 @@ def smb_download(share_id):
                     audio_track=audio_track,
                     start_time=start_time,
                     probe_info=probe_info,
+                    duration_hint=duration_hint,
                 ),
                 status=200,
                 mimetype="video/mp4",
@@ -1643,10 +1838,12 @@ def smb_download(share_id):
             return resp
 
         if request.args.get("transcode") == "audio":
+            start_time = float(request.args.get("ss", "0") or 0.0)
             resp = app.response_class(
                 transcode_audio_stream(
                     lambda: smb_manager.stream_file_range(share_id, path, start=0, length=file_size),
                     internal_url=internal_url,
+                    start_time=start_time,
                 ),
                 status=200,
                 mimetype="audio/mpeg",
@@ -1966,15 +2163,14 @@ def gdrive_download(file_id):
             mode = request.args.get("mode", "auto")
             audio_track = int(request.args.get("audio_track", "0") or 0)
             start_time = float(request.args.get("ss", "0") or 0.0)
-            probe_info = None
-            if mode == "auto":
-                end_byte = min(file_size - 1, 4 * 1024 * 1024 - 1) if file_size > 0 else 4 * 1024 * 1024 - 1
-                probe_info = probe_media_info(
-                    cache_key=f"gdrive:{account_id or 'default'}:{file_id}",
-                    internal_url=internal_url,
-                    filename=filename,
-                    fallback_gen_fn=lambda: gdrive_manager.stream_file_range(file_id, start=0, end=end_byte, account_id=account_id),
-                )
+            duration_hint = float(request.args.get("duration", "0") or 0.0)
+            end_byte = min(file_size - 1, 8 * 1024 * 1024 - 1) if file_size > 0 else 8 * 1024 * 1024 - 1
+            probe_info = probe_media_info(
+                cache_key=f"gdrive:{account_id or 'default'}:{file_id}",
+                internal_url=internal_url,
+                filename=filename,
+                fallback_gen_fn=lambda: gdrive_manager.stream_file_range(file_id, start=0, end=end_byte, account_id=account_id),
+            )
             resp = app.response_class(
                 transcode_media_stream(
                     internal_url=internal_url,
@@ -1984,6 +2180,7 @@ def gdrive_download(file_id):
                     audio_track=audio_track,
                     start_time=start_time,
                     probe_info=probe_info,
+                    duration_hint=duration_hint,
                 ),
                 status=200,
                 mimetype="video/mp4",
@@ -1994,10 +2191,12 @@ def gdrive_download(file_id):
             return resp
 
         if request.args.get("transcode") == "audio":
+            start_time = float(request.args.get("ss", "0") or 0.0)
             resp = app.response_class(
                 transcode_audio_stream(
                     lambda: gdrive_manager.stream_file_range(file_id, start=0, end=None, account_id=account_id),
                     internal_url=internal_url,
+                    start_time=start_time,
                 ),
                 status=200,
                 mimetype="audio/mpeg",

@@ -118,16 +118,17 @@ def get_file_size(share_id, path):
 
 def stream_file_range(share_id, path, start=0, length=None, chunk_size=262144):
     """
-    Streams a byte range [start, start + length) from SMB using a single
-    retrieveFileFromOffset (or retrieveFile) call in a background thread.
-    Flushes the final chunk and signals completion before closing the SMB socket
-    so HTTP downloads never hang at 100%, and aborts immediately if the caller
-    closes the generator early (e.g. during Range seeking or ffprobe).
+    Streams a byte range [start, start + length) from SMB using
+    retrieveFileFromOffset (or retrieveFile) in a background thread with a 4-hour
+    transfer timeout and automatic byte-accurate reconnect/resume if the SMB
+    connection drops mid-stream. Aborts immediately if the caller closes the
+    generator early (e.g. during Range seeking or ffprobe).
     """
     norm_path = sanitize_smb_path(path, allow_root=False)
     q = queue.Queue(maxsize=32)
     sentinel = object()
     aborted = threading.Event()
+    smb_op_timeout = 14400
 
     class _AbortStream(Exception):
         pass
@@ -135,6 +136,7 @@ def stream_file_range(share_id, path, start=0, length=None, chunk_size=262144):
     class _QueueWriter:
         def __init__(self, max_bytes):
             self.remaining = max_bytes
+            self.written = 0
             self.buf = bytearray()
 
         def write(self, data):
@@ -148,6 +150,7 @@ def stream_file_range(share_id, path, start=0, length=None, chunk_size=262144):
                 if len(data) > self.remaining:
                     data = data[:self.remaining]
                 self.remaining -= len(data)
+            self.written += len(data)
             self.buf.extend(data)
             while len(self.buf) >= chunk_size:
                 if aborted.is_set():
@@ -170,27 +173,65 @@ def stream_file_range(share_id, path, start=0, length=None, chunk_size=262144):
                         break
 
     def _producer():
-        c = None
+        cfg = None
+        writer = _QueueWriter(length)
+        retries = 0
         try:
             cfg = _cfg(share_id)
-            c = _conn(cfg)
-            writer = _QueueWriter(length)
-            if start == 0 and length is None:
-                c.retrieveFile(cfg["share"], norm_path, writer)
-            else:
-                max_len = length if (length is not None and length > 0) else -1
-                c.retrieveFileFromOffset(cfg["share"], norm_path, writer, offset=start, max_length=max_len)
-            writer.flush()
-        except _AbortStream:
-            pass
-        except Exception as e:
+            while not aborted.is_set():
+                if writer.remaining is not None and writer.remaining <= 0:
+                    break
+                c = None
+                prev_written = writer.written
+                try:
+                    c = _conn(cfg)
+                    curr_offset = start + writer.written
+                    if curr_offset == 0 and writer.remaining is None:
+                        c.retrieveFile(cfg["share"], norm_path, writer, timeout=smb_op_timeout)
+                    else:
+                        max_len = writer.remaining if (writer.remaining is not None and writer.remaining > 0) else -1
+                        c.retrieveFileFromOffset(
+                            cfg["share"],
+                            norm_path,
+                            writer,
+                            offset=curr_offset,
+                            max_length=max_len,
+                            timeout=smb_op_timeout,
+                        )
+                    writer.flush()
+                    break
+                except _AbortStream:
+                    break
+                except Exception as e:
+                    if aborted.is_set():
+                        break
+                    if writer.remaining is not None and writer.remaining <= 0:
+                        writer.flush()
+                        break
+                    if writer.written > prev_written:
+                        retries = 0
+                    else:
+                        retries += 1
+                    if retries > 4:
+                        try:
+                            writer.flush()
+                        except Exception:
+                            pass
+                        try:
+                            q.put(e, timeout=1.0)
+                        except Exception:
+                            pass
+                        break
+                finally:
+                    if c is not None:
+                        try:
+                            c.close()
+                        except Exception:
+                            pass
+        except Exception as outer_e:
             if not aborted.is_set():
                 try:
-                    writer.flush()
-                except Exception:
-                    pass
-                try:
-                    q.put(e, timeout=1.0)
+                    q.put(outer_e, timeout=1.0)
                 except Exception:
                     pass
         finally:
@@ -198,11 +239,6 @@ def stream_file_range(share_id, path, start=0, length=None, chunk_size=262144):
                 q.put(sentinel, timeout=1.0)
             except Exception:
                 pass
-            if c is not None:
-                try:
-                    c.close()
-                except Exception:
-                    pass
 
     threading.Thread(target=_producer, daemon=True).start()
 

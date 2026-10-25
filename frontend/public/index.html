@@ -1301,25 +1301,57 @@ function nextMediaTrack(type) {
   playMediaAtIndex(nextIdx, type);
 }
 
+function fmtMediaTime(sec) {
+  if (!Number.isFinite(sec) || sec < 0) sec = 0;
+  const total = Math.floor(sec);
+  const hrs = Math.floor(total / 3600);
+  const mins = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  if (hrs > 0) {
+    return `${hrs}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  }
+  return `${mins}:${String(secs).padStart(2, '0')}`;
+}
+
+function onMediaTimelineScrubInput(val) {
+  if (!_activeMediaState) return;
+  _activeMediaState.isScrubbing = true;
+  const curEl = document.getElementById('media-time-current');
+  if (curEl) curEl.textContent = fmtMediaTime(parseFloat(val) || 0);
+}
+
+function onMediaTimelineScrubChange(val) {
+  if (!_activeMediaState) return;
+  const targetSec = Math.max(0, parseFloat(val) || 0);
+  _activeMediaState.isScrubbing = false;
+  if (_activeMediaState.seekTo) {
+    _activeMediaState.seekTo(targetSec);
+  }
+}
+
 function changeMediaAudioTrack(trackIdxStr) {
   if (!_activeMediaState) return;
   const idx = parseInt(trackIdxStr, 10) || 0;
   _activeMediaState.audioTrack = idx;
+  const player = document.getElementById('active-media-player');
+  const curPos = (_activeMediaState.seekOffset || 0) + (player && Number.isFinite(player.currentTime) ? player.currentTime : 0);
   const targetMode = (_activeMediaState.mode === 'direct')
     ? (_activeMediaState.canRemux ? 'remux' : 'full')
     : _activeMediaState.mode;
-  _activeMediaState.switchMode(targetMode, true);
+  _activeMediaState.switchMode(targetMode, true, curPos);
 }
 
 function forceMediaCompatMode() {
   if (!_activeMediaState) return;
+  const player = document.getElementById('active-media-player');
+  const curPos = (_activeMediaState.seekOffset || 0) + (player && Number.isFinite(player.currentTime) ? player.currentTime : 0);
   if (_activeMediaState.isVid) {
     const nextMode = _activeMediaState.mode === 'direct'
       ? (_activeMediaState.canRemux ? 'remux' : 'full')
       : (_activeMediaState.mode === 'remux' ? 'full' : 'remux');
-    _activeMediaState.switchMode(nextMode, true);
+    _activeMediaState.switchMode(nextMode, true, curPos);
   } else {
-    _activeMediaState.switchMode('audio', true);
+    _activeMediaState.switchMode('audio', true, curPos);
   }
 }
 
@@ -1377,6 +1409,13 @@ function openMedia(fJson, type) {
     +   '<div class="progress-track"><div id="media-stream-fill" class="progress-fill indeterminate"></div></div>'
     + '</div>'
     + mediaEl
+    + '<div id="media-timeline-bar" style="display:none;align-items:center;gap:var(--space-2);padding:6px 10px;background:var(--color-surface-offset);border:1px solid var(--color-border);border-radius:var(--radius-md)">'
+    +   '<span id="media-time-current" style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--color-text);min-width:46px">0:00</span>'
+    +   '<input id="media-timeline-slider" type="range" min="0" max="100" step="0.1" value="0" '
+    +     'style="flex:1;accent-color:var(--color-primary);cursor:pointer;height:6px" '
+    +     'oninput="onMediaTimelineScrubInput(this.value)" onchange="onMediaTimelineScrubChange(this.value)" title="Seek anywhere in full timeline"/>'
+    +   '<span id="media-time-total" style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--color-text-muted);min-width:46px;text-align:right">0:00</span>'
+    + '</div>'
     + '<div class="media-controls-bar">'
     +   '<div class="media-nav-group">'
     +     '<button class="btn btn-secondary btn-sm" onclick="prevMediaTrack(\'' + type + '\')" ' + (_mediaPlaylist.length <= 1 ? 'disabled style="opacity:.45;cursor:not-allowed"' : '') + ' title="Previous track">'
@@ -1425,6 +1464,10 @@ function openMedia(fJson, type) {
   const compatBtn = document.getElementById('media-compat-btn');
   const compatLabel = document.getElementById('media-compat-label');
   const trackSelect = document.getElementById('media-audio-track-select');
+  const timelineBar = document.getElementById('media-timeline-bar');
+  const timelineSlider = document.getElementById('media-timeline-slider');
+  const timeCurrentEl = document.getElementById('media-time-current');
+  const timeTotalEl = document.getElementById('media-time-total');
 
   if (!player) return;
 
@@ -1437,11 +1480,38 @@ function openMedia(fJson, type) {
     audioTrack: 0,
     canRemux: true,
     probeInfo: null,
+    totalDuration: 0,
+    seekOffset: 0,
+    isScrubbing: false,
+    ignoreNextSeeking: false,
     triedFallback: false,
     silentCheckDone: false,
     switchMode: null,
+    seekTo: null,
   };
   _activeMediaState = state;
+
+  function syncTimelineUi() {
+    const pDur = (player && Number.isFinite(player.duration) && player.duration > 0 && player.duration < 86400 * 7)
+      ? (state.seekOffset + player.duration)
+      : 0;
+    const probeDur = (state.probeInfo && state.probeInfo.duration > 0) ? state.probeInfo.duration : 0;
+    const effTotal = Math.max(state.totalDuration || 0, probeDur, pDur);
+    if (effTotal > 0) {
+      state.totalDuration = effTotal;
+      if (timelineBar) timelineBar.style.display = 'flex';
+      if (timelineSlider) timelineSlider.max = String(Math.ceil(effTotal * 10) / 10);
+      if (timeTotalEl) timeTotalEl.textContent = fmtMediaTime(effTotal);
+    }
+    if (!state.isScrubbing) {
+      const curPos = Math.min(
+        effTotal || Infinity,
+        Math.max(0, state.seekOffset + (Number.isFinite(player.currentTime) ? player.currentTime : 0))
+      );
+      if (timelineSlider) timelineSlider.value = String(Math.round(curPos * 10) / 10);
+      if (timeCurrentEl) timeCurrentEl.textContent = fmtMediaTime(curPos);
+    }
+  }
 
   function updateCodecUi() {
     if (!codecBadge) return;
@@ -1449,72 +1519,136 @@ function openMedia(fJson, type) {
     const ac = p && p.audio_codec ? p.audio_codec.toUpperCase() : '';
     const vc = p && p.video_codec ? p.video_codec.toUpperCase() : extBadge;
     const ch = p && p.audio_channels > 2 ? ` ${p.audio_channels}ch` : '';
+    const durBadge = state.totalDuration > 0 ? ` • ${fmtMediaTime(state.totalDuration)}` : '';
     if (state.mode === 'remux') {
-      codecBadge.textContent = `${vc} • ${ac || 'Audio'}${ch} → AAC Stereo`;
+      codecBadge.textContent = `${vc} • ${ac || 'Audio'}${ch} → AAC Stereo${durBadge}`;
       if (compatBtn) compatBtn.classList.add('btn-primary');
       if (compatBtn) compatBtn.classList.remove('btn-secondary');
       if (compatLabel) compatLabel.textContent = 'AAC Stereo Active';
     } else if (state.mode === 'full') {
-      codecBadge.textContent = `${vc}${ac ? ' + ' + ac : ''} → H264 + AAC`;
+      codecBadge.textContent = `${vc}${ac ? ' + ' + ac : ''} → H264 + AAC${durBadge}`;
       if (compatBtn) compatBtn.classList.add('btn-primary');
       if (compatBtn) compatBtn.classList.remove('btn-secondary');
       if (compatLabel) compatLabel.textContent = 'Full Transcode Active';
     } else if (state.mode === 'audio') {
-      codecBadge.textContent = `${ac || extBadge}${ch} → MP3 Stereo`;
+      codecBadge.textContent = `${ac || extBadge}${ch} → MP3 Stereo${durBadge}`;
       if (compatBtn) compatBtn.classList.add('btn-primary');
       if (compatBtn) compatBtn.classList.remove('btn-secondary');
       if (compatLabel) compatLabel.textContent = 'Compat Audio Active';
     } else {
-      codecBadge.textContent = ac ? `${vc} • ${ac}${ch}` : vc;
+      codecBadge.textContent = (ac ? `${vc} • ${ac}${ch}` : vc) + durBadge;
       if (compatBtn) compatBtn.classList.remove('btn-primary');
       if (compatBtn) compatBtn.classList.add('btn-secondary');
       if (compatLabel) compatLabel.textContent = 'AAC Audio Fix';
     }
   }
 
-  function switchMode(newMode, isManual) {
+  function switchMode(newMode, isManual, seekSeconds) {
     if (_activeMediaState !== state) return;
     state.mode = newMode;
+    const startSec = (typeof seekSeconds === 'number' && Number.isFinite(seekSeconds) && seekSeconds >= 0)
+      ? seekSeconds
+      : 0;
+    state.seekOffset = (newMode === 'direct') ? 0 : startSec;
     updateCodecUi();
+    syncTimelineUi();
+
     if (statusWrap) {
       statusWrap.style.display = 'flex';
       statusFill.classList.add('indeterminate');
+      const seekLabel = state.seekOffset > 0 ? ` at ${fmtMediaTime(state.seekOffset)}` : '';
       if (newMode === 'remux') {
         const acName = (state.probeInfo && state.probeInfo.audio_codec) ? state.probeInfo.audio_codec.toUpperCase() : 'surround/unsupported';
-        statusText.textContent = `Converting ${acName} audio to stereo AAC…`;
+        statusText.textContent = `Converting ${acName} audio to stereo AAC${seekLabel}…`;
       } else if (newMode === 'full') {
-        statusText.textContent = 'Transcoding video & audio for browser playback…';
+        statusText.textContent = `Transcoding video & audio for browser playback${seekLabel}…`;
       } else if (newMode === 'audio') {
-        statusText.textContent = 'Transcoding audio stream to stereo MP3…';
+        statusText.textContent = `Transcoding audio stream to stereo MP3${seekLabel}…`;
       } else {
         statusText.textContent = 'Connecting to media stream…';
       }
     }
 
     let targetUrl = src;
+    const durParam = state.totalDuration > 0 ? `&duration=${encodeURIComponent(state.totalDuration.toFixed(2))}` : '';
+    const ssParam = state.seekOffset > 0 ? `&ss=${encodeURIComponent(state.seekOffset.toFixed(2))}` : '';
     if (newMode === 'remux') {
-      targetUrl = `${src}&transcode=1&mode=remux&audio_track=${state.audioTrack}`;
+      targetUrl = `${src}&transcode=1&mode=remux&audio_track=${state.audioTrack}${durParam}${ssParam}`;
     } else if (newMode === 'full') {
-      targetUrl = `${src}&transcode=1&mode=full&audio_track=${state.audioTrack}`;
+      targetUrl = `${src}&transcode=1&mode=full&audio_track=${state.audioTrack}${durParam}${ssParam}`;
     } else if (newMode === 'audio') {
-      targetUrl = `${src}&transcode=audio`;
+      targetUrl = `${src}&transcode=audio${durParam}${ssParam}`;
     }
 
+    state.ignoreNextSeeking = true;
     player.src = targetUrl;
     player.load();
     player.playbackRate = _playbackRate;
+    if (newMode === 'direct' && startSec > 0) {
+      const setDirectTime = () => {
+        player.removeEventListener('loadedmetadata', setDirectTime);
+        try { player.currentTime = startSec; } catch (_) {}
+      };
+      player.addEventListener('loadedmetadata', setDirectTime);
+    }
     player.play().catch(() => {});
   }
   state.switchMode = switchMode;
 
+  function seekTo(targetSec) {
+    if (_activeMediaState !== state) return;
+    const clamped = state.totalDuration > 0
+      ? Math.max(0, Math.min(state.totalDuration - 0.5, targetSec))
+      : Math.max(0, targetSec);
+
+    if (state.mode === 'direct' || _activeMediaBlobUrl) {
+      state.seekOffset = 0;
+      state.ignoreNextSeeking = true;
+      try { player.currentTime = clamped; } catch (_) {}
+      syncTimelineUi();
+      return;
+    }
+
+    let bufEnd = 0;
+    try {
+      if (player.buffered && player.buffered.length > 0) {
+        bufEnd = player.buffered.end(player.buffered.length - 1);
+      }
+    } catch (_) {}
+
+    const relTarget = clamped - state.seekOffset;
+    if (relTarget >= 0 && bufEnd > 1 && relTarget <= bufEnd - 0.5) {
+      state.ignoreNextSeeking = true;
+      try { player.currentTime = relTarget; } catch (_) {}
+      syncTimelineUi();
+      return;
+    }
+
+    switchMode(state.mode, true, clamped);
+  }
+  state.seekTo = seekTo;
+
   player.playbackRate = _playbackRate;
+  player.onloadedmetadata = () => {
+    player.playbackRate = _playbackRate;
+    syncTimelineUi();
+    updateCodecUi();
+  };
+  player.ondurationchange = () => {
+    syncTimelineUi();
+    updateCodecUi();
+  };
   player.onloadeddata = () => {
     player.playbackRate = _playbackRate;
+    state.ignoreNextSeeking = false;
     if (statusWrap) statusWrap.style.display = 'none';
+    syncTimelineUi();
   };
   player.oncanplay = () => {
     player.playbackRate = _playbackRate;
+    state.ignoreNextSeeking = false;
     if (statusWrap) statusWrap.style.display = 'none';
+    syncTimelineUi();
   };
   player.onwaiting = () => {
     if (statusWrap && !_activeMediaBlobUrl) {
@@ -1524,19 +1658,55 @@ function openMedia(fJson, type) {
     }
   };
   player.onplaying = () => {
+    state.ignoreNextSeeking = false;
     if (statusWrap) statusWrap.style.display = 'none';
+    syncTimelineUi();
+  };
+  player.onseeking = () => {
+    if (_activeMediaState !== state) return;
+    if (state.ignoreNextSeeking) {
+      state.ignoreNextSeeking = false;
+      return;
+    }
+    if (state.mode !== 'direct' && !_activeMediaBlobUrl) {
+      let bufEnd = 0;
+      try {
+        if (player.buffered && player.buffered.length > 0) {
+          bufEnd = player.buffered.end(player.buffered.length - 1);
+        }
+      } catch (_) {}
+      const wantedRel = player.currentTime || 0;
+      if (wantedRel > bufEnd + 1.0 && state.totalDuration > 0) {
+        const absTarget = Math.min(state.totalDuration - 0.5, state.seekOffset + wantedRel);
+        switchMode(state.mode, true, absTarget);
+      }
+    }
   };
   player.onended = () => {
+    const absPos = state.seekOffset + (Number.isFinite(player.currentTime) ? player.currentTime : 0);
+    if (state.mode !== 'direct' && state.totalDuration > 0 && absPos < state.totalDuration - 5) {
+      // Stream stopped before reaching actual end of file: automatically resume at current position
+      switchMode(state.mode, false, absPos);
+      return;
+    }
     if (_autoPlayNext && _mediaPlaylist.length > 1) {
       nextMediaTrack(type);
     }
   };
 
-  // Detect if browser plays video track but silently drops unsupported audio (e.g. EAC3/AC3/DTS)
+  // Update timeline UI and detect if browser plays video track but silently drops unsupported audio
   player.ontimeupdate = () => {
-    if (_activeMediaState !== state || !isVid || state.mode !== 'direct' || state.silentCheckDone) return;
-    if (player.currentTime < 0.5) return;
+    if (_activeMediaState !== state) return;
+    syncTimelineUi();
+
+    if (!isVid || state.mode !== 'direct' || state.silentCheckDone) return;
+    if (player.currentTime < 1.5) return;
     state.silentCheckDone = true;
+
+    // If ffprobe already verified the audio codec is natively supported by browsers, do not override direct mode
+    if (state.probeInfo && state.probeInfo.has_audio && !state.probeInfo.needs_audio_transcode && state.probeInfo.audio_codec) {
+      return;
+    }
 
     const expectAudio = !state.probeInfo || state.probeInfo.has_audio !== false;
     if (!expectAudio) return;
@@ -1550,7 +1720,7 @@ function openMedia(fJson, type) {
     );
 
     if (noAudioTracks || mozNoAudio || webkitZeroAudio) {
-      switchMode(state.canRemux ? 'remux' : 'full', false);
+      switchMode(state.canRemux ? 'remux' : 'full', false, player.currentTime || 0);
     }
   };
 
@@ -1558,16 +1728,16 @@ function openMedia(fJson, type) {
     if (_activeMediaState !== state) return;
     if (isVid) {
       if (state.mode === 'direct') {
-        switchMode(state.canRemux ? 'remux' : 'full', false);
+        switchMode(state.canRemux ? 'remux' : 'full', false, state.seekOffset);
         return;
       }
       if (state.mode === 'remux') {
-        switchMode('full', false);
+        switchMode('full', false, state.seekOffset);
         return;
       }
     } else {
       if (state.mode === 'direct') {
-        switchMode('audio', false);
+        switchMode('audio', false, state.seekOffset);
         return;
       }
     }
@@ -1577,13 +1747,13 @@ function openMedia(fJson, type) {
     }
   };
 
-  // Probe stream codecs first so EAC3/AC3/DTS/surround audio plays with AAC from the very first frame
+  // Probe stream codecs & full duration first so EAC3/AC3/DTS/surround audio plays with AAC and full duration from frame 0
   (async () => {
     const ext = _fileExt(f);
     let probe = null;
     try {
       const probeCtrl = new AbortController();
-      const timer = setTimeout(() => probeCtrl.abort(), 5000);
+      const timer = setTimeout(() => probeCtrl.abort(), 12000);
       const r = await apiFetch(mediaProbeUrl(f, type), { signal: probeCtrl.signal });
       clearTimeout(timer);
       if (r.ok) {
@@ -1593,6 +1763,10 @@ function openMedia(fJson, type) {
 
     if (_activeMediaState !== state) return;
     state.probeInfo = probe;
+    if (probe && probe.duration > 0) {
+      state.totalDuration = probe.duration;
+      syncTimelineUi();
+    }
 
     if (probe && Array.isArray(probe.audio_streams) && probe.audio_streams.length > 1 && trackSelect) {
       trackSelect.innerHTML = probe.audio_streams.map((t, i) => {
@@ -1616,31 +1790,31 @@ function openMedia(fJson, type) {
         state.canRemux = Boolean(probe.can_remux_video && !isHevcUnsupported);
 
         if (probe.needs_video_transcode || isHevcUnsupported) {
-          switchMode('full', false);
+          switchMode('full', false, 0);
           return;
         }
         if (probe.needs_audio_transcode || probe.recommended_mode === 'remux') {
-          switchMode(state.canRemux ? 'remux' : 'full', false);
+          switchMode(state.canRemux ? 'remux' : 'full', false, 0);
           return;
         }
         if (probe.recommended_mode === 'full') {
-          switchMode('full', false);
+          switchMode('full', false, 0);
           return;
         }
       } else if (['avi', 'wmv', 'flv', 'ts', 'm2ts', 'mpg', 'mpeg', 'vob', 'divx'].includes(ext)) {
-        switchMode('full', false);
+        switchMode('full', false, 0);
         return;
       }
-      switchMode('direct', false);
+      switchMode('direct', false, 0);
     } else {
       if (
         (probe && (probe.needs_audio_transcode || probe.recommended_mode === 'audio')) ||
         ['eac3', 'ec3', 'ac3', 'dts', 'wma', 'aiff', 'aif', 'alac', 'mka', 'mp2'].includes(ext)
       ) {
-        switchMode('audio', false);
+        switchMode('audio', false, 0);
         return;
       }
-      switchMode('direct', false);
+      switchMode('direct', false, 0);
     }
   })();
 }

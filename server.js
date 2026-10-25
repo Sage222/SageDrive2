@@ -565,9 +565,9 @@ function probeMediaItem(item) {
 
     const ff = spawn('ffprobe', [
       '-v', 'error',
-      '-probesize', '4000000',
-      '-analyzeduration', '4000000',
-      '-show_entries', 'stream=index,codec_type,codec_name,profile,pix_fmt,channels,sample_rate:stream_tags=language,title:format=format_name,duration',
+      '-probesize', '10000000',
+      '-analyzeduration', '10000000',
+      '-show_entries', 'stream=index,codec_type,codec_name,profile,pix_fmt,channels,sample_rate,duration:stream_tags:format=format_name,duration:format_tags',
       '-of', 'json',
       blobPath,
     ]);
@@ -644,6 +644,23 @@ function probeMediaItem(item) {
         };
       });
 
+      const parseDur = (val) => {
+        if (!val) return 0;
+        const n = parseFloat(val);
+        if (Number.isFinite(n) && n > 0 && !String(val).includes(':')) return n;
+        const m = /^(\d+):(\d{1,2}):(\d{1,2}(?:\.\d+)?)/.exec(String(val).trim());
+        if (m) return parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60 + parseFloat(m[3]);
+        return Number.isFinite(n) && n > 0 ? n : 0;
+      };
+      let maxDur = parseDur(fmt.duration);
+      for (const s of streams) {
+        maxDur = Math.max(maxDur, parseDur(s.duration));
+        const stTags = s.tags || {};
+        for (const [k, v] of Object.entries(stTags)) {
+          if (String(k).toLowerCase().startsWith('duration')) maxDur = Math.max(maxDur, parseDur(v));
+        }
+      }
+
       resolve({
         has_video: hasVideo,
         video_codec: videoCodec,
@@ -652,7 +669,7 @@ function probeMediaItem(item) {
         audio_codec: audioCodec,
         audio_channels: audioChannels,
         audio_streams: audioTracksOut,
-        duration: parseFloat(fmt.duration || 0) || 0,
+        duration: maxDur,
         needs_audio_transcode: needsAudioTranscode,
         needs_video_transcode: needsVideoTranscode,
         can_remux_video: canRemuxVideo,
@@ -660,6 +677,49 @@ function probeMediaItem(item) {
       });
     });
   });
+}
+
+function patchMp4MoovDuration(chunk, durationSec) {
+  if (!chunk || !durationSec || durationSec <= 0 || !Number.isFinite(durationSec)) return chunk;
+  try {
+    let buf = Buffer.from(chunk);
+    let mvhdTs = 1000;
+    const walk = (b, start, end) => {
+      let pos = start;
+      while (pos + 8 <= end) {
+        const sz = b.readUInt32BE(pos);
+        const btype = b.subarray(pos + 4, pos + 8).toString('ascii');
+        if (sz < 8 || pos + sz > end) break;
+        if (btype === 'mvhd') {
+          const ver = b[pos + 8];
+          if (ver === 0 && sz >= 28) {
+            mvhdTs = b.readUInt32BE(pos + 20) || 1000;
+            b.writeUInt32BE(Math.min(0xFFFFFFFF, Math.round(durationSec * mvhdTs)), pos + 24);
+          }
+        } else if (btype === 'tkhd') {
+          const ver = b[pos + 8];
+          if (ver === 0 && sz >= 32) {
+            b.writeUInt32BE(Math.min(0xFFFFFFFF, Math.round(durationSec * mvhdTs)), pos + 28);
+          }
+        } else if (btype === 'mdhd') {
+          const ver = b[pos + 8];
+          if (ver === 0 && sz >= 28) {
+            const ts = b.readUInt32BE(pos + 20) || 1000;
+            b.writeUInt32BE(Math.min(0xFFFFFFFF, Math.round(durationSec * ts)), pos + 24);
+          }
+        } else if (btype === 'moov' || btype === 'trak' || btype === 'mdia') {
+          walk(b, pos + 8, pos + sz);
+        } else if (btype === 'moof') {
+          break;
+        }
+        pos += sz;
+      }
+    };
+    walk(buf, 0, buf.length);
+    return buf;
+  } catch (_) {
+    return chunk;
+  }
 }
 
 // Unified streaming & Range response handler for both SMB and Google Drive files
@@ -682,10 +742,13 @@ async function streamFileResponse(req, res, item) {
     let mode = String(req.query.mode || 'auto');
     const audioTrack = Math.max(0, parseInt(req.query.audio_track || '0', 10) || 0);
     const startTime = parseFloat(req.query.ss || '0') || 0;
+    const durationHint = parseFloat(req.query.duration || '0') || 0;
     const probeInfo = await probeMediaItem(item);
     if (mode === 'auto') {
       mode = probeInfo.can_remux_video ? 'remux' : 'full';
     }
+    const totalDur = probeInfo.duration || durationHint || 0;
+    const effectiveDur = totalDur > 0 ? Math.max(0, totalDur - startTime) : 0;
 
     res.writeHead(200, {
       'Content-Type': 'video/mp4',
@@ -715,7 +778,16 @@ async function streamFileResponse(req, res, item) {
     );
 
     const ff = spawn('ffmpeg', args);
-    ff.stdout.pipe(res);
+    let patchedFirst = false;
+    ff.stdout.on('data', (chunk) => {
+      if (!patchedFirst) {
+        patchedFirst = true;
+        res.write(patchMp4MoovDuration(chunk, effectiveDur));
+      } else {
+        res.write(chunk);
+      }
+    });
+    ff.stdout.on('end', () => res.end());
     req.on('close', () => {
       try { ff.kill('SIGKILL'); } catch (_) {}
     });
@@ -723,20 +795,23 @@ async function streamFileResponse(req, res, item) {
   }
 
   if (req.query.transcode === 'audio') {
+    const startTime = parseFloat(req.query.ss || '0') || 0;
     res.writeHead(200, {
       'Content-Type': 'audio/mpeg',
       'Content-Disposition': disposition,
       'Cache-Control': 'no-cache',
     });
-    const ff = spawn('ffmpeg', [
-      '-hide_banner', '-loglevel', 'error',
+    const args = ['-hide_banner', '-loglevel', 'error'];
+    if (startTime > 0) args.push('-ss', String(startTime));
+    args.push(
       '-i', blobPath,
       '-vn',
       '-af', 'aresample=async=1:first_pts=0',
       '-c:a', 'libmp3lame', '-ac', '2', '-ar', '48000', '-b:a', '192k',
       '-f', 'mp3',
-      'pipe:1',
-    ]);
+      'pipe:1'
+    );
+    const ff = spawn('ffmpeg', args);
     ff.stdout.pipe(res);
     req.on('close', () => {
       try { ff.kill('SIGKILL'); } catch (_) {}

@@ -594,23 +594,64 @@ def _gd_ensure_folder_path(base_folder_id, parts, account_id=None):
             curr_id = created["id"]
     return curr_id
 
-def _gd_upload_file(parent_id, filename, data, mime_type="application/octet-stream", relative_path=None, account_id=None):
+def _gd_upload_file(parent_id, filename, data_or_stream, mime_type="application/octet-stream", relative_path=None, account_id=None):
     svc = _gd_svc(account_id=account_id)
     target_parent = parent_id or "root"
     actual_name = filename
     if relative_path:
-        norm_rel = relative_path.replace("\\", "/").lstrip("/")
-        segments = [s for s in norm_rel.split("/") if s]
+        norm_rel = relative_path.replace("\x00", "").replace("\\", "/").lstrip("/")
+        segments = [s for s in norm_rel.split("/") if s and s != "."]
+        if any(s == ".." for s in segments):
+            raise ValueError("Invalid relative_path: path traversal ('..') is not allowed")
         if len(segments) > 1:
             target_parent = _gd_ensure_folder_path(target_parent, segments[:-1], account_id=account_id)
             actual_name = segments[-1]
         elif segments:
             actual_name = segments[0]
-    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime_type, resumable=True)
+    stream_obj = data_or_stream if hasattr(data_or_stream, "read") else io.BytesIO(
+        data_or_stream if isinstance(data_or_stream, (bytes, bytearray)) else str(data_or_stream).encode("utf-8")
+    )
+    media = MediaIoBaseUpload(stream_obj, mimetype=mime_type, chunksize=8 * 1024 * 1024, resumable=True)
     svc.files().create(
         body={"name": actual_name, "parents": [target_parent]},
         media_body=media,
         fields="id",
+        supportsAllDrives=True,
+    ).execute()
+
+def _gd_update_file_content(file_id, data_or_stream, mime_type="text/plain; charset=utf-8", account_id=None):
+    _gd_meta_cache.pop(_gd_cache_key(account_id, file_id), None)
+    _gd_meta_cache.pop(file_id, None)
+    svc = _gd_svc(account_id=account_id)
+    stream_obj = data_or_stream if hasattr(data_or_stream, "read") else io.BytesIO(
+        data_or_stream if isinstance(data_or_stream, (bytes, bytearray)) else str(data_or_stream).encode("utf-8")
+    )
+    media = MediaIoBaseUpload(stream_obj, mimetype=mime_type, chunksize=8 * 1024 * 1024, resumable=True)
+    return svc.files().update(
+        fileId=file_id,
+        media_body=media,
+        fields="id,name,size,modifiedTime",
+        supportsAllDrives=True,
+    ).execute()
+
+def _gd_move_file(file_id, dest_folder_id, account_id=None):
+    dest_id = dest_folder_id or "root"
+    if file_id == dest_id:
+        raise ValueError("Cannot move a folder into itself")
+    _gd_meta_cache.pop(_gd_cache_key(account_id, file_id), None)
+    _gd_meta_cache.pop(file_id, None)
+    svc = _gd_svc(account_id=account_id)
+    meta = svc.files().get(
+        fileId=file_id,
+        fields="id,name,parents",
+        supportsAllDrives=True,
+    ).execute()
+    prev_parents = ",".join(meta.get("parents") or [])
+    return svc.files().update(
+        fileId=file_id,
+        addParents=dest_id,
+        removeParents=prev_parents,
+        fields="id,name,parents",
         supportsAllDrives=True,
     ).execute()
 
@@ -691,23 +732,81 @@ gdrive_manager.stream_file_range = _gd_stream_file_range
 gdrive_manager.download_file = _gd_download_file
 gdrive_manager.ensure_folder_path = _gd_ensure_folder_path
 gdrive_manager.upload_file = _gd_upload_file
+gdrive_manager.update_file_content = _gd_update_file_content
+gdrive_manager.move_file = _gd_move_file
 gdrive_manager.rename_file = _gd_rename_file
 gdrive_manager.delete_file = _gd_delete_file
 gdrive_manager.create_folder = _gd_create_folder
 gdrive_manager.create_zip_tmpfile = _gd_create_zip_tmpfile
 
-# ── Ensure smb_manager has fast size cache & clean early-abort stream_file_range ─
+# ── Ensure smb_manager has path sanitization, streaming upload, move, & size cache ─
+def _sanitize_smb_path(path, allow_root=True):
+    raw = str(path or "").replace("\x00", "").replace("\\", "/").strip()
+    parts = []
+    for seg in raw.split("/"):
+        seg = seg.strip()
+        if not seg or seg == ".":
+            continue
+        if seg == "..":
+            raise ValueError("Invalid SMB path: path traversal ('..') is not allowed")
+        parts.append(seg)
+    if not parts:
+        if allow_root:
+            return "/"
+        raise ValueError("SMB path cannot be empty")
+    return "/" + "/".join(parts)
+
+def _smb_upload_file(share_id, dest_path, data_or_stream):
+    norm_path = _sanitize_smb_path(dest_path, allow_root=False)
+    cfg = smb_manager._cfg(share_id)
+    c = smb_manager._conn(cfg)
+    try:
+        parent = "/".join(norm_path.split("/")[:-1])
+        if parent and parent != "/":
+            smb_manager._ensure_dirs_on_conn(c, cfg["share"], parent)
+        file_obj = data_or_stream if hasattr(data_or_stream, "read") else io.BytesIO(
+            data_or_stream if isinstance(data_or_stream, (bytes, bytearray)) else str(data_or_stream).encode("utf-8")
+        )
+        c.storeFile(cfg["share"], norm_path, file_obj)
+    finally:
+        c.close()
+
+def _smb_move_path(share_id, old_path, dest_dir):
+    norm_old = _sanitize_smb_path(old_path, allow_root=False)
+    norm_dest_dir = _sanitize_smb_path(dest_dir, allow_root=True)
+    base_name = norm_old.rstrip("/").split("/")[-1]
+    new_path = (norm_dest_dir.rstrip("/") + "/" + base_name) if norm_dest_dir != "/" else ("/" + base_name)
+    if new_path == norm_old:
+        return new_path
+    if new_path.startswith(norm_old.rstrip("/") + "/"):
+        raise ValueError("Cannot move a folder into itself")
+    cfg = smb_manager._cfg(share_id)
+    c = smb_manager._conn(cfg)
+    try:
+        if norm_dest_dir != "/":
+            smb_manager._ensure_dirs_on_conn(c, cfg["share"], norm_dest_dir)
+        c.rename(cfg["share"], norm_old, new_path)
+        return new_path
+    finally:
+        c.close()
+
+smb_manager.sanitize_smb_path = _sanitize_smb_path
+smb_manager.upload_file = _smb_upload_file
+smb_manager.move_path = _smb_move_path
+
 def _get_smb_file_size(share_id, path):
-    key = f"{share_id}:{path}"
+    norm_path = _sanitize_smb_path(path, allow_root=False)
+    key = f"{share_id}:{norm_path}"
     now = time.time()
     cached = _SMB_SIZE_CACHE.get(key)
     if cached and (now - cached[0]) < _SMB_SIZE_TTL:
         return cached[1]
-    sz = smb_manager.get_file_size(share_id, path)
+    sz = smb_manager.get_file_size(share_id, norm_path)
     _SMB_SIZE_CACHE[key] = (now, sz)
     return sz
 
 def _smb_stream_file_range(share_id, path, start=0, length=None, chunk_size=262144):
+    path = _sanitize_smb_path(path, allow_root=False)
     q = queue.Queue(maxsize=32)
     sentinel = object()
     aborted = threading.Event()
@@ -1403,11 +1502,10 @@ def api_login():
     body = request.get_json(force=True) or {}
     u = body.get("username","")
     pw = body.get("password","")
-    print(f"LOGIN DEBUG username={u!r} pass_len={len(pw)} keys={list(body.keys())}", flush=True)
     token, err_msg, status_code, meta = auth.login_with_status(u, pw)
     if token:
         resp = jsonify({"token": token})
-        resp.set_cookie("sd_token", token, max_age=auth.SESSION_TTL, path="/", samesite="Lax")
+        resp.set_cookie("sd_token", token, max_age=auth.SESSION_TTL, path="/", httponly=True, samesite="Lax")
         return resp
     return jsonify({
         "error": err_msg or "Invalid credentials",
@@ -1420,6 +1518,8 @@ def api_login():
 @auth.require_auth
 def api_logout():
     t = request.headers.get("Authorization","").removeprefix("Bearer ").strip()
+    if not t:
+        t = request.args.get("token", "").strip() or request.cookies.get("sd_token", "")
     auth.logout(t)
     resp = jsonify({"ok": True})
     resp.delete_cookie("sd_token", path="/")
@@ -1475,18 +1575,20 @@ def smb_delete_share(share_id):
 @app.get("/api/smb/browse/<share_id>")
 @auth.require_auth
 def smb_browse(share_id):
-    path = request.args.get("path", "/")
     try:
+        path = _sanitize_smb_path(request.args.get("path", "/"), allow_root=True)
         return jsonify(smb_manager.browse(share_id, path))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.get("/api/smb/probe/<share_id>")
 @auth.require_auth
 def smb_probe(share_id):
-    path = request.args.get("path", "")
-    filename = path.split("/")[-1] or "media"
     try:
+        path = _sanitize_smb_path(request.args.get("path", ""), allow_root=False)
+        filename = path.split("/")[-1] or "media"
         internal_url = _internal_smb_url(share_id, path)
         info = probe_media_info(
             cache_key=f"smb:{share_id}:{path}",
@@ -1495,15 +1597,17 @@ def smb_probe(share_id):
             fallback_gen_fn=lambda: smb_manager.stream_file_range(share_id, path, start=0, length=4 * 1024 * 1024),
         )
         return jsonify(info)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.get("/api/smb/download/<share_id>")
 @auth.require_auth
 def smb_download(share_id):
-    path = request.args.get("path", "")
-    filename = path.split("/")[-1] or "download"
     try:
+        path = _sanitize_smb_path(request.args.get("path", ""), allow_root=False)
+        filename = path.split("/")[-1] or "download"
         file_size = _get_smb_file_size(share_id, path)
         disposition = make_content_disposition(filename, bool(request.args.get("dl")))
         internal_url = _internal_smb_url(share_id, path)
@@ -1601,6 +1705,8 @@ def smb_download(share_id):
             resp.headers["Cache-Control"] = "no-cache"
             resp.headers["Content-Disposition"] = disposition
             return resp
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1613,11 +1719,33 @@ def smb_upload(share_id):
     if not f:
         return jsonify({"error": "No file provided"}), 400
     try:
-        sub_path = rel_path.lstrip("/") if rel_path else f.filename
-        target_path = dest.rstrip("/") + "/" + sub_path
-        smb_manager.upload_file(share_id, target_path, f.read())
+        norm_dest = _sanitize_smb_path(dest, allow_root=True)
+        sub_path = (rel_path or f.filename or "").lstrip("/")
+        target_path = _sanitize_smb_path(norm_dest.rstrip("/") + "/" + sub_path, allow_root=False)
+        smb_manager.upload_file(share_id, target_path, f.stream)
         _SMB_SIZE_CACHE.pop(f"{share_id}:{target_path}", None)
         return jsonify({"ok": True})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.put("/api/smb/content/<share_id>")
+@auth.require_auth
+def smb_save_content(share_id):
+    b = request.get_json(force=True) or {}
+    raw_path = (b.get("path") or request.args.get("path") or "").strip()
+    content = b.get("content")
+    if content is None:
+        return jsonify({"error": "content is required"}), 400
+    try:
+        target_path = _sanitize_smb_path(raw_path, allow_root=False)
+        encoded = str(content).encode("utf-8")
+        smb_manager.upload_file(share_id, target_path, io.BytesIO(encoded))
+        _SMB_SIZE_CACHE[f"{share_id}:{target_path}"] = (time.time(), len(encoded))
+        return jsonify({"ok": True, "path": target_path, "size": len(encoded)})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1630,9 +1758,12 @@ def smb_rename(share_id):
     if not old_path or not new_name:
         return jsonify({"error": "path and new_name are required"}), 400
     try:
-        new_path = smb_manager.rename_path(share_id, old_path, new_name)
-        _SMB_SIZE_CACHE.pop(f"{share_id}:{old_path}", None)
+        norm_old = _sanitize_smb_path(old_path, allow_root=False)
+        new_path = smb_manager.rename_path(share_id, norm_old, new_name)
+        _SMB_SIZE_CACHE.pop(f"{share_id}:{norm_old}", None)
         return jsonify({"ok": True, "path": new_path})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1644,7 +1775,8 @@ def smb_zip(share_id):
     if not paths:
         return jsonify({"error": "No paths provided"}), 400
     try:
-        tmp_path, zip_size = smb_manager.create_zip_tmpfile(share_id, paths)
+        clean_paths = [_sanitize_smb_path(p, allow_root=False) for p in paths]
+        tmp_path, zip_size = smb_manager.create_zip_tmpfile(share_id, clean_paths)
         archive_name = b.get("name") or "SageDrive_Download.zip"
         resp = app.response_class(
             _stream_and_unlink_tmpfile(tmp_path),
@@ -1656,6 +1788,8 @@ def smb_zip(share_id):
         resp.headers["Content-Disposition"] = make_content_disposition(archive_name, True)
         resp.headers["Cache-Control"] = "no-cache"
         return resp
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1664,10 +1798,12 @@ def smb_zip(share_id):
 def smb_delete_file(share_id):
     b = request.get_json(force=True) or {}
     try:
-        p = b.get("path","")
+        p = _sanitize_smb_path(b.get("path",""), allow_root=False)
         smb_manager.delete_path(share_id, p, b.get("is_dir", False))
         _SMB_SIZE_CACHE.pop(f"{share_id}:{p}", None)
         return jsonify({"ok": True})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1676,8 +1812,11 @@ def smb_delete_file(share_id):
 def smb_mkdir(share_id):
     b = request.get_json(force=True) or {}
     try:
-        smb_manager.create_directory(share_id, b.get("path",""))
+        p = _sanitize_smb_path(b.get("path",""), allow_root=False)
+        smb_manager.create_directory(share_id, p)
         return jsonify({"ok": True})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1936,12 +2075,38 @@ def gdrive_upload():
         gdrive_manager.upload_file(
             folder_id,
             f.filename,
-            f.read(),
+            f.stream,
             f.content_type or "application/octet-stream",
             relative_path=rel_path or None,
             account_id=account_id,
         )
         return jsonify({"ok": True})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.put("/api/gdrive/content/<file_id>")
+@auth.require_auth
+def gdrive_save_content(file_id):
+    b = request.get_json(force=True) or {}
+    account_id = (request.args.get("account_id") or b.get("account_id") or "").strip() or None
+    content = b.get("content")
+    if content is None:
+        return jsonify({"error": "content is required"}), 400
+    try:
+        meta = gdrive_manager.get_file_meta(file_id, account_id=account_id)
+        mime = guess_media_mime(meta.get("name", "file.txt"), meta.get("mimeType"))
+        if mime == "application/octet-stream":
+            mime = "text/plain; charset=utf-8"
+        encoded = str(content).encode("utf-8")
+        updated = gdrive_manager.update_file_content(
+            file_id,
+            io.BytesIO(encoded),
+            mime_type=mime,
+            account_id=account_id,
+        )
+        return jsonify({"ok": True, "size": len(encoded), "file": updated})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -2004,12 +2169,13 @@ def gdrive_mkdir():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ── Cross-Drive Transfer (SMB <-> Google Drive & SMB <-> SMB & GDrive <-> GDrive) ──
+# ── Cross-Drive Transfer & Move (SMB <-> Google Drive & SMB <-> SMB & GDrive <-> GDrive) ──
 def _copy_smb_item_to_gdrive(src_share, smb_path, is_folder, dest_folder_id, dest_account_id=None):
-    name = smb_path.rstrip("/").split("/")[-1]
+    norm_smb = _sanitize_smb_path(smb_path, allow_root=False)
+    name = norm_smb.rstrip("/").split("/")[-1]
     if is_folder:
         new_folder_id = gdrive_manager.ensure_folder_path(dest_folder_id, [name], account_id=dest_account_id)
-        for child in smb_manager.browse(src_share, smb_path):
+        for child in smb_manager.browse(src_share, norm_smb):
             _copy_smb_item_to_gdrive(
                 src_share,
                 child["path"],
@@ -2018,14 +2184,15 @@ def _copy_smb_item_to_gdrive(src_share, smb_path, is_folder, dest_folder_id, des
                 dest_account_id=dest_account_id,
             )
     else:
-        data = smb_manager.read_file_bytes(src_share, smb_path)
+        data = smb_manager.read_file_bytes(src_share, norm_smb)
         mime = guess_media_mime(name)
         gdrive_manager.upload_file(dest_folder_id, name, data, mime, account_id=dest_account_id)
 
 def _copy_gdrive_item_to_smb(file_id, is_folder, dest_share, dest_smb_dir, src_account_id=None):
     meta = gdrive_manager.get_file_meta(file_id, account_id=src_account_id)
     name = meta["name"]
-    target_path = dest_smb_dir.rstrip("/") + "/" + name
+    norm_dest = _sanitize_smb_path(dest_smb_dir, allow_root=True)
+    target_path = _sanitize_smb_path(norm_dest.rstrip("/") + "/" + name, allow_root=False)
     if is_folder or meta["mimeType"] == "application/vnd.google-apps.folder":
         smb_manager.create_directory(dest_share, target_path)
         for child in gdrive_manager.list_files(file_id, account_id=src_account_id):
@@ -2041,11 +2208,13 @@ def _copy_gdrive_item_to_smb(file_id, is_folder, dest_share, dest_smb_dir, src_a
         smb_manager.upload_file(dest_share, target_path, data)
 
 def _copy_smb_item_to_smb(src_share, smb_path, is_folder, dest_share, dest_smb_dir):
-    name = smb_path.rstrip("/").split("/")[-1]
-    target_path = dest_smb_dir.rstrip("/") + "/" + name
+    norm_smb = _sanitize_smb_path(smb_path, allow_root=False)
+    name = norm_smb.rstrip("/").split("/")[-1]
+    norm_dest = _sanitize_smb_path(dest_smb_dir, allow_root=True)
+    target_path = _sanitize_smb_path(norm_dest.rstrip("/") + "/" + name, allow_root=False)
     if is_folder:
         smb_manager.create_directory(dest_share, target_path)
-        for child in smb_manager.browse(src_share, smb_path):
+        for child in smb_manager.browse(src_share, norm_smb):
             _copy_smb_item_to_smb(
                 src_share,
                 child["path"],
@@ -2054,7 +2223,7 @@ def _copy_smb_item_to_smb(src_share, smb_path, is_folder, dest_share, dest_smb_d
                 target_path,
             )
     else:
-        data = smb_manager.read_file_bytes(src_share, smb_path)
+        data = smb_manager.read_file_bytes(src_share, norm_smb)
         smb_manager.upload_file(dest_share, target_path, data)
 
 def _copy_gdrive_item_to_gdrive(file_id, is_folder, dest_folder_id, src_account_id=None, dest_account_id=None):
@@ -2078,6 +2247,8 @@ def _copy_gdrive_item_to_gdrive(file_id, is_folder, dest_folder_id, src_account_
 @auth.require_auth
 def transfer_items():
     b = request.get_json(force=True) or {}
+    operation = (b.get("operation") or "copy").strip().lower()
+    is_move = (operation == "move")
     src_type = b.get("src_type")
     src_drive = b.get("src_drive")
     dest_type = b.get("dest_type")
@@ -2089,21 +2260,43 @@ def transfer_items():
         return jsonify({"error": "No items selected for transfer"}), 400
 
     try:
-        copied = 0
+        if dest_type == "smb":
+            dest_folder = _sanitize_smb_path(dest_folder, allow_root=True)
+        count = 0
         for item in items:
             is_folder = item.get("type") == "folder"
-            if src_type == "smb" and dest_type == "gdrive":
-                _copy_smb_item_to_gdrive(src_drive, item["path"], is_folder, dest_folder, dest_account_id=dest_drive)
+            if is_move and src_type == "smb" and dest_type == "smb" and src_drive == dest_drive:
+                src_path = _sanitize_smb_path(item["path"], allow_root=False)
+                smb_manager.move_path(src_drive, src_path, dest_folder)
+                _SMB_SIZE_CACHE.pop(f"{src_drive}:{src_path}", None)
+            elif is_move and src_type == "gdrive" and dest_type == "gdrive" and src_drive == dest_drive:
+                gdrive_manager.move_file(item["id"], dest_folder, account_id=src_drive)
+            elif src_type == "smb" and dest_type == "gdrive":
+                src_path = _sanitize_smb_path(item["path"], allow_root=False)
+                _copy_smb_item_to_gdrive(src_drive, src_path, is_folder, dest_folder, dest_account_id=dest_drive)
+                if is_move:
+                    smb_manager.delete_path(src_drive, src_path, is_folder)
+                    _SMB_SIZE_CACHE.pop(f"{src_drive}:{src_path}", None)
             elif src_type == "gdrive" and dest_type == "smb":
                 _copy_gdrive_item_to_smb(item["id"], is_folder, dest_drive, dest_folder, src_account_id=src_drive)
+                if is_move:
+                    gdrive_manager.delete_file(item["id"], account_id=src_drive)
             elif src_type == "smb" and dest_type == "smb":
-                _copy_smb_item_to_smb(src_drive, item["path"], is_folder, dest_drive, dest_folder)
+                src_path = _sanitize_smb_path(item["path"], allow_root=False)
+                _copy_smb_item_to_smb(src_drive, src_path, is_folder, dest_drive, dest_folder)
+                if is_move:
+                    smb_manager.delete_path(src_drive, src_path, is_folder)
+                    _SMB_SIZE_CACHE.pop(f"{src_drive}:{src_path}", None)
             elif src_type == "gdrive" and dest_type == "gdrive":
                 _copy_gdrive_item_to_gdrive(item["id"], is_folder, dest_folder, src_account_id=src_drive, dest_account_id=dest_drive)
+                if is_move:
+                    gdrive_manager.delete_file(item["id"], account_id=src_drive)
             else:
                 return jsonify({"error": "Invalid source or destination type"}), 400
-            copied += 1
-        return jsonify({"ok": True, "copied": copied})
+            count += 1
+        return jsonify({"ok": True, "copied": count, "moved": count if is_move else 0, "operation": "move" if is_move else "copy"})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -2221,6 +2414,8 @@ def _reconcile_smb_proxy():
                                 "rclone", "mount", remote_name, mpath,
                                 "--config", "/root/.config/rclone/rclone.conf",
                                 "--allow-other",
+                                "--buffer-size", "16M",
+                                "--vfs-read-chunk-size", "32M",
                                 "--vfs-cache-mode", "writes",
                                 "--vfs-cache-max-size", "512M",
                                 "--dir-cache-time", "5m",

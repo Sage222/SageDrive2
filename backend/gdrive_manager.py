@@ -535,23 +535,64 @@ def ensure_folder_path(base_folder_id, parts, account_id=None):
             curr_id = created["id"]
     return curr_id
 
-def upload_file(parent_id, filename, data, mime_type="application/octet-stream", relative_path=None, account_id=None):
+def upload_file(parent_id, filename, data_or_stream, mime_type="application/octet-stream", relative_path=None, account_id=None):
     svc = _svc(account_id=account_id)
     target_parent = parent_id or "root"
     actual_name = filename
     if relative_path:
-        norm_rel = relative_path.replace("\\", "/").lstrip("/")
-        segments = [s for s in norm_rel.split("/") if s]
+        norm_rel = relative_path.replace("\x00", "").replace("\\", "/").lstrip("/")
+        segments = [s for s in norm_rel.split("/") if s and s != "."]
+        if any(s == ".." for s in segments):
+            raise ValueError("Invalid relative_path: path traversal ('..') is not allowed")
         if len(segments) > 1:
             target_parent = ensure_folder_path(target_parent, segments[:-1], account_id=account_id)
             actual_name = segments[-1]
         elif segments:
             actual_name = segments[0]
-    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime_type, resumable=True)
+    stream_obj = data_or_stream if hasattr(data_or_stream, "read") else io.BytesIO(
+        data_or_stream if isinstance(data_or_stream, (bytes, bytearray)) else str(data_or_stream).encode("utf-8")
+    )
+    media = MediaIoBaseUpload(stream_obj, mimetype=mime_type, chunksize=8 * 1024 * 1024, resumable=True)
     svc.files().create(
         body={"name": actual_name, "parents": [target_parent]},
         media_body=media,
         fields="id",
+        supportsAllDrives=True,
+    ).execute()
+
+def update_file_content(file_id, data_or_stream, mime_type="text/plain; charset=utf-8", account_id=None):
+    _meta_cache.pop(_cache_key(account_id, file_id), None)
+    _meta_cache.pop(file_id, None)
+    svc = _svc(account_id=account_id)
+    stream_obj = data_or_stream if hasattr(data_or_stream, "read") else io.BytesIO(
+        data_or_stream if isinstance(data_or_stream, (bytes, bytearray)) else str(data_or_stream).encode("utf-8")
+    )
+    media = MediaIoBaseUpload(stream_obj, mimetype=mime_type, chunksize=8 * 1024 * 1024, resumable=True)
+    return svc.files().update(
+        fileId=file_id,
+        media_body=media,
+        fields="id,name,size,modifiedTime",
+        supportsAllDrives=True,
+    ).execute()
+
+def move_file(file_id, dest_folder_id, account_id=None):
+    dest_id = dest_folder_id or "root"
+    if file_id == dest_id:
+        raise ValueError("Cannot move a folder into itself")
+    _meta_cache.pop(_cache_key(account_id, file_id), None)
+    _meta_cache.pop(file_id, None)
+    svc = _svc(account_id=account_id)
+    meta = svc.files().get(
+        fileId=file_id,
+        fields="id,name,parents",
+        supportsAllDrives=True,
+    ).execute()
+    prev_parents = ",".join(meta.get("parents") or [])
+    return svc.files().update(
+        fileId=file_id,
+        addParents=dest_id,
+        removeParents=prev_parents,
+        fields="id,name,parents",
         supportsAllDrives=True,
     ).execute()
 

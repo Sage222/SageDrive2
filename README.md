@@ -22,11 +22,14 @@ Repository: [https://github.com/Sage222/SageDrive2](https://github.com/Sage222/S
 - **Breadcrumb Navigation:** Clickable path breadcrumbs for instant directory jumping.
 
 ### Advanced File Management
-- **Right-Click Context Menus:** Right-click any file or folder for quick actions (Open/Preview, Download, Rename, Copy to another drive, Delete).
+- **Right-Click Context Menus:** Right-click any file or folder for quick actions (Open/Preview, Edit Text/Config, Download, Rename, Copy to…, Move to…, Delete).
+- **In-Browser Text & Config File Editor:** View, edit, and save text, code, and configuration files (`.txt`, `.md`, `.json`, `.yaml`, `.yml`, `.xml`, `.csv`, `.ini`, `.conf`, `.toml`, `.py`, `.sh`, `.js`, `.ts`, `.css`, `.html`, `.env`, `.log`, etc.) directly in the browser on both SMB shares and Google Drive accounts, complete with `Ctrl+S` / `Cmd+S` save shortcut, `Tab` indentation, word-wrap toggle, and unsaved change indicators.
 - **In-Place Rename:** Rename files and folders directly on both SMB shares and Google Drive.
-- **Multi-Select & Batch Operations:** Select multiple items with checkboxes or `Select All` to perform **Batch Delete** or **Batch ZIP Download** (streams a dynamically created `.zip` archive of selected files and folders).
-- **Drag & Drop Folder Uploads:** Drag and drop individual files or entire nested folder structures directly into the browser; directory trees are automatically recreated on the destination SMB share or Google Drive.
-- **Cross-Drive Copy (SMB ↔ Google Drive):** Copy files or entire folders directly between any SMB share and any connected Google Drive account (or between two SMB shares / two Google Drives) right from the UI.
+- **Copy & Move Files/Folders (Same-Drive & Cross-Drive):**
+  - **Move Within the Same Drive:** Instant server-side move across folders on the same SMB share (`c.rename`) or the same Google Drive account (`addParents`/`removeParents`).
+  - **Cross-Drive Copy & Move (SMB ↔ Google Drive):** Copy or move files and entire nested folders between any SMB share and any connected Google Drive account (or between two SMB shares / two Google Drives) right from the UI.
+- **Multi-Select & Batch Operations:** Select multiple items with checkboxes or `Select All` to perform **Batch Copy**, **Batch Move**, **Batch Delete**, or **Batch ZIP Download** (streams a dynamically created `.zip` archive of selected files and folders).
+- **Zero-RAM Streaming Uploads & Drag-and-Drop Folders:** Drag and drop individual files or entire nested folder structures directly into the browser; uploads stream directly from the request stream to SMB (`storeFile`) or Google Drive resumable upload chunks (`8MB` chunks) without buffering the full file in container RAM.
 - **Progress Tracking:** Real-time upload and download progress bar with transfer speeds and automatic browser save prompts.
 
 ### Media Playback & Inline Preview
@@ -34,11 +37,12 @@ Repository: [https://github.com/Sage222/SageDrive2](https://github.com/Sage222/S
 - **Video & Audio Streaming:** Stream video (`mp4`, `webm`, `mkv`, `mov`, `m4v`, `avi`, `ts`, `ogg`) and audio (`mp3`, `wav`, `flac`, `m4a`, `aac`, `opus`, `ogg`) with HTTP Range request seeking on both SMB and Google Drive.
 - **Automatic Audio Transcoding (EAC3 / AC3 / DTS / TrueHD):** Built-in FFmpeg stream remuxing automatically detects browser-incompatible audio codecs (such as Dolby Digital Plus `eac3`, `ac3`, `dts`) and live-transcodes the audio track to stereo AAC on the fly while copying the H.264/HEVC video stream untouched (`-c:v copy -c:a aac`) for instant playback with working audio.
 - **Media Player Controls:** Next/Previous track navigation across the current folder playlist, playback speed controls (`0.5x` – `2x`), and direct download button.
-- **Image Gallery & Document Viewer:** Inline high-resolution image lightbox with next/prev navigation, plus inline preview for PDFs and text/code/markdown files.
+- **Image Gallery & Document Viewer:** Inline high-resolution image lightbox with next/prev navigation, plus inline preview/editor for PDFs and text/code/markdown/config files.
 
 ### Security & Authentication
 - **Anti-Hammering Login Lockout:** Protects against brute-force attacks by tracking failed login attempts. After **5 consecutive failed login attempts**, the account is automatically locked out for **15 minutes** with a live countdown timer on the sign-in screen.
-- **Session Management:** Username/password authentication with `bcrypt` hashed passwords, configurable session TTL, Bearer token sessions, and in-app password changing.
+- **Path Traversal Guard:** All SMB file and directory operations strictly normalize paths and reject `..` traversal segments and null bytes.
+- **Hardened Session Management:** Username/password authentication with `bcrypt` hashed passwords, `HttpOnly` + `SameSite=Lax` session cookies, Bearer token sessions, full session revocation on logout, and configurable session TTL.
 
 ### Tidied Settings Page & Multi-Drive SMB Proxy
 - **Category Filter Tabs:** Organized into **All**, **Storage**, **Google OAuth**, **SMB Proxy**, and **Security & About** tabs.
@@ -48,12 +52,12 @@ Repository: [https://github.com/Sage222/SageDrive2](https://github.com/Sage222/S
   - **Separate Network Share per Google Drive:** Expose each connected Google Drive account as its own independent Samba network share (`\\<host>\<ShareName>`) on port `445` via `rclone` FUSE mounts (`/mnt/gdrive_mounts/<account_id>`).
   - **Per-Drive Enable/Disable Toggle:** Turn the SMB Proxy share on or off individually for each connected Google Drive in **Settings → SMB Proxy**.
   - **Custom SMB Share Names:** Assign a custom network share name (e.g. `GoogleDrive`, `PersonalDrive`, `WorkDrive`) per Google Drive in **Settings → SMB Proxy**, complete with per-drive one-click UNC path and PowerShell `net use` command copy buttons.
-  - **Live Mount & Samba Reload:** Adding, toggling, or renaming a Google Drive's SMB share dynamically reconciles `rclone` mounts (`/mnt/gdrive_mounts/<account_id>`), unmounts any legacy single-drive `/mnt/gdrive` mount at startup, rewrites `/etc/samba/smb.conf`, and reloads Samba (`smbd`) on the fly without requiring a Docker image rebuild or container restart.
+  - **Live Mount, Memory Tuning & Samba Reload:** Adding, toggling, or renaming a Google Drive's SMB share dynamically reconciles `rclone` mounts (`/mnt/gdrive_mounts/<account_id>` with bounded `--buffer-size 16M` and `--vfs-read-chunk-size 32M`), unmounts any legacy single-drive `/mnt/gdrive` mount at startup, rewrites `/etc/samba/smb.conf`, and reloads Samba (`smbd`) on the fly without requiring a Docker image rebuild or container restart.
 
 ### Tech Stack
 - **Backend:** Python, Flask, `pysmb`, Google Drive API v3, `ffmpeg` (live audio remuxing), `rclone` + Samba
 - **Frontend:** Single-file vanilla JS SPA, Lucide icons, responsive CSS with light & dark themes
-- **Deployment:** Docker & Docker Compose
+- **Deployment:** Docker & Docker Compose (`1G` container memory limit tuned for multi-drive FUSE & FFmpeg remuxing)
 
 ---
 

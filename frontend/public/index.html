@@ -940,8 +940,11 @@ function updateBatchBar() {
         <button class="btn btn-secondary btn-sm" onclick="downloadSelectedZip('${type}')">
           <svg data-lucide="archive" width="14" height="14"></svg> Download ZIP
         </button>
-        <button class="btn btn-secondary btn-sm" onclick="showTransferModal('${type}')">
-          <svg data-lucide="folder-input" width="14" height="14"></svg> Copy to Drive…
+        <button class="btn btn-secondary btn-sm" onclick="showTransferModal('${type}', null, 'copy')">
+          <svg data-lucide="copy" width="14" height="14"></svg> Copy to…
+        </button>
+        <button class="btn btn-secondary btn-sm" onclick="showTransferModal('${type}', null, 'move')">
+          <svg data-lucide="folder-output" width="14" height="14"></svg> Move to…
         </button>
         <button class="btn btn-danger btn-sm" onclick="deleteSelectedItems('${type}')">
           <svg data-lucide="trash-2" width="14" height="14"></svg> Delete Selected
@@ -1080,8 +1083,10 @@ function fileCardList(f, type) {
         <svg data-lucide="download" width="14" height="14"></svg></button>
       <button class="btn btn-ghost btn-icon btn-sm" onclick="showRenameModal('${fj}','${type}')" title="Rename">
         <svg data-lucide="edit-3" width="14" height="14"></svg></button>
-      <button class="btn btn-ghost btn-icon btn-sm" onclick="showTransferModal('${type}','${fj}')" title="Copy to Drive…">
+      <button class="btn btn-ghost btn-icon btn-sm" onclick="showTransferModal('${type}','${fj}','copy')" title="Copy to…">
         <svg data-lucide="copy" width="14" height="14"></svg></button>
+      <button class="btn btn-ghost btn-icon btn-sm" onclick="showTransferModal('${type}','${fj}','move')" title="Move to…">
+        <svg data-lucide="folder-output" width="14" height="14"></svg></button>
       <button class="btn btn-danger btn-icon btn-sm" onclick="rmFile('${fj}','${type}')" title="Delete">
         <svg data-lucide="trash-2" width="14" height="14"></svg></button>
     </div>
@@ -1755,8 +1760,153 @@ function openImageViewer(fJson, type) {
   lucide.createIcons();
 }
 
-// ── In-Browser Document / Text / Generic Preview Modal ────────────────────────
-async function openBrowserPreview(fJson, type) {
+// ── In-Browser Document / Text & Config Editor / Generic Preview Modal ────────
+let _editorState = {
+  file: null,
+  type: '',
+  originalContent: '',
+  isEditing: false,
+  wordWrap: true,
+  dirty: false,
+};
+
+function updateEditorStats() {
+  const ta = document.getElementById('text-editor-area');
+  const pre = document.getElementById('text-preview-box');
+  const statsEl = document.getElementById('text-editor-stats');
+  const badgeEl = document.getElementById('text-editor-dirty-badge');
+  const saveBtn = document.getElementById('text-editor-save-btn');
+  const currentText = _editorState.isEditing && ta ? ta.value : (_editorState.originalContent || '');
+  const lines = currentText ? currentText.split('\n').length : 1;
+  const chars = currentText.length;
+  _editorState.dirty = _editorState.isEditing && ta ? (ta.value !== _editorState.originalContent) : false;
+
+  if (statsEl) {
+    statsEl.textContent = `${lines} line${lines === 1 ? '' : 's'} • ${chars.toLocaleString()} chars`;
+  }
+  if (badgeEl) {
+    if (_editorState.dirty) {
+      badgeEl.style.display = 'inline-flex';
+      badgeEl.className = 'badge badge-warning';
+      badgeEl.textContent = 'Unsaved changes';
+    } else if (_editorState.isEditing) {
+      badgeEl.style.display = 'inline-flex';
+      badgeEl.className = 'badge badge-success';
+      badgeEl.textContent = 'Editing';
+    } else {
+      badgeEl.style.display = 'none';
+    }
+  }
+  if (saveBtn) {
+    saveBtn.style.display = _editorState.isEditing ? 'inline-flex' : 'none';
+  }
+  if (pre && !_editorState.isEditing) {
+    pre.textContent = _editorState.originalContent;
+  }
+}
+
+function toggleTextEditorMode(forceEdit = null) {
+  const ta = document.getElementById('text-editor-area');
+  const pre = document.getElementById('text-preview-box');
+  const toggleBtn = document.getElementById('text-editor-mode-btn');
+  if (!ta || !pre) return;
+
+  const nextEdit = forceEdit !== null ? Boolean(forceEdit) : !_editorState.isEditing;
+  if (!nextEdit && _editorState.dirty) {
+    if (!confirm('Discard unsaved changes and switch to read-only preview?')) return;
+    ta.value = _editorState.originalContent;
+  }
+  _editorState.isEditing = nextEdit;
+  pre.style.display = nextEdit ? 'none' : 'block';
+  ta.style.display = nextEdit ? 'block' : 'none';
+  if (toggleBtn) {
+    toggleBtn.innerHTML = nextEdit
+      ? `<svg data-lucide="eye" width="14" height="14"></svg> Preview`
+      : `<svg data-lucide="edit-3" width="14" height="14"></svg> Edit File`;
+  }
+  updateEditorStats();
+  lucide.createIcons();
+  if (nextEdit) {
+    setTimeout(() => ta.focus(), 30);
+  }
+}
+
+function toggleEditorWordWrap() {
+  _editorState.wordWrap = !_editorState.wordWrap;
+  const ta = document.getElementById('text-editor-area');
+  const pre = document.getElementById('text-preview-box');
+  const btn = document.getElementById('text-editor-wrap-btn');
+  const ws = _editorState.wordWrap ? 'pre-wrap' : 'pre';
+  if (ta) ta.style.whiteSpace = ws;
+  if (pre) pre.style.whiteSpace = ws;
+  if (btn) btn.classList.toggle('active', _editorState.wordWrap);
+}
+
+function handleEditorKeydown(e, fJson, type) {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+    e.preventDefault();
+    saveEditedTextFile(fJson, type);
+    return;
+  }
+  if (e.key === 'Tab') {
+    e.preventDefault();
+    const ta = e.target;
+    const start = ta.selectionStart;
+    const end = ta.selectionEnd;
+    ta.value = ta.value.substring(0, start) + '  ' + ta.value.substring(end);
+    ta.selectionStart = ta.selectionEnd = start + 2;
+    updateEditorStats();
+  }
+}
+
+async function saveEditedTextFile(fJson, type) {
+  const f = parseFileArg(fJson);
+  const ta = document.getElementById('text-editor-area');
+  const saveBtn = document.getElementById('text-editor-save-btn');
+  if (!ta) return;
+  const newContent = ta.value;
+
+  if (saveBtn) {
+    saveBtn.disabled = true;
+    saveBtn.innerHTML = `<svg data-lucide="loader" width="14" height="14"></svg> Saving…`;
+    lucide.createIcons();
+  }
+  try {
+    let res;
+    if (type === 'smb') {
+      const targetPath = f.path || (_path.replace(/\/$/, '') + '/' + f.name);
+      res = await apiJSON(`/api/smb/content/${encodeURIComponent(_activeDrive.id)}`, {
+        method: 'PUT',
+        json: { path: targetPath, content: newContent }
+      });
+    } else {
+      const accId = _activeDrive?.id || 'default';
+      res = await apiJSON(`/api/gdrive/content/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}`, {
+        method: 'PUT',
+        json: { content: newContent, account_id: accId }
+      });
+    }
+    _editorState.originalContent = newContent;
+    const pre = document.getElementById('text-preview-box');
+    if (pre) pre.textContent = newContent;
+    updateEditorStats();
+    toast(`Saved "${f.name}" (${fmtSize(res.size ?? new Blob([newContent]).size)})`, 'success');
+    if (_view === 'files') {
+      if (type === 'smb') loadSMBFiles();
+      else loadGDriveFiles();
+    }
+  } catch (e) {
+    toast('Failed saving file: ' + e.message, 'error');
+  } finally {
+    if (saveBtn) {
+      saveBtn.disabled = false;
+      saveBtn.innerHTML = `<svg data-lucide="save" width="14" height="14"></svg> Save Changes`;
+      lucide.createIcons();
+    }
+  }
+}
+
+async function openBrowserPreview(fJson, type, startInEditMode = false) {
   cleanupActiveMedia();
   const f = parseFileArg(fJson);
   const src = mediaApiUrl(f, type);
@@ -1795,37 +1945,73 @@ async function openBrowserPreview(fJson, type) {
   }
 
   if (isTxt) {
+    _editorState = {
+      file: f,
+      type,
+      originalContent: '',
+      isEditing: Boolean(startInEditMode),
+      wordWrap: true,
+      dirty: false,
+    };
     showModal(`
       <div class="modal-header">
-        <div style="display:flex;align-items:center;gap:var(--space-2);overflow:hidden;max-width:calc(100% - 48px)">
+        <div style="display:flex;align-items:center;gap:var(--space-2);overflow:hidden;flex:1;min-width:0">
           <svg data-lucide="file-code" width="16" height="16" style="color:var(--color-primary);flex-shrink:0"></svg>
           <h3 style="font-size:var(--text-sm);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(f.name)}</h3>
+          <span id="text-editor-dirty-badge" style="display:none;flex-shrink:0"></span>
         </div>
-        <button class="btn btn-ghost btn-icon" onclick="closeModal()" title="Close">
-          <svg data-lucide="x" width="18" height="18"></svg>
-        </button>
+        <div style="display:flex;align-items:center;gap:var(--space-2);flex-shrink:0">
+          <button class="btn btn-secondary btn-sm active" id="text-editor-wrap-btn" onclick="toggleEditorWordWrap()" title="Toggle Word Wrap">
+            <svg data-lucide="wrap-text" width="14" height="14"></svg> Wrap
+          </button>
+          <button class="btn btn-secondary btn-sm" id="text-editor-mode-btn" onclick="toggleTextEditorMode()">
+            <svg data-lucide="${startInEditMode ? 'eye' : 'edit-3'}" width="14" height="14"></svg>
+            ${startInEditMode ? 'Preview' : 'Edit File'}
+          </button>
+          <button class="btn btn-ghost btn-icon" onclick="if(!_editorState.dirty || confirm('Discard unsaved changes?')) closeModal()" title="Close">
+            <svg data-lucide="x" width="18" height="18"></svg>
+          </button>
+        </div>
       </div>
       <div class="modal-body" style="padding-top:var(--space-3);gap:var(--space-3)">
-        <pre id="text-preview-box" style="width:100%;height:62vh;overflow:auto;padding:var(--space-4);background:var(--color-bg);border:1px solid var(--color-border);border-radius:var(--radius-md);font-family:var(--font-mono);font-size:var(--text-xs);line-height:1.55;white-space:pre-wrap;word-break:break-word;color:var(--color-text)">Loading file preview…</pre>
+        <pre id="text-preview-box" style="width:100%;height:62vh;overflow:auto;padding:var(--space-4);background:var(--color-bg);border:1px solid var(--color-border);border-radius:var(--radius-md);font-family:var(--font-mono);font-size:var(--text-xs);line-height:1.55;white-space:pre-wrap;word-break:break-word;color:var(--color-text);display:${startInEditMode ? 'none' : 'block'}">Loading file content…</pre>
+        <textarea id="text-editor-area" spellcheck="false"
+                  oninput="updateEditorStats()"
+                  onkeydown="handleEditorKeydown(event,'${fjEsc}','${type}')"
+                  style="width:100%;height:62vh;overflow:auto;padding:var(--space-4);background:var(--color-bg);border:1px solid var(--color-primary);border-radius:var(--radius-md);font-family:var(--font-mono);font-size:var(--text-xs);line-height:1.55;white-space:pre-wrap;color:var(--color-text);resize:vertical;outline:none;display:${startInEditMode ? 'block' : 'none'}"
+                  placeholder="Loading file content…"></textarea>
         <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:var(--space-2)">
-          <span style="font-size:var(--text-xs);color:var(--color-text-muted);font-family:var(--font-mono)">${fmtSize(f.size)}</span>
-          <div style="display:flex;gap:var(--space-2)">
+          <div style="display:flex;align-items:center;gap:var(--space-3);flex-wrap:wrap">
+            <span id="text-editor-stats" style="font-size:var(--text-xs);color:var(--color-text-muted);font-family:var(--font-mono)">${fmtSize(f.size)}</span>
+            <span style="font-size:11px;color:var(--color-text-faint)">Tip: Press <kbd style="font-family:var(--font-mono)">Ctrl+S</kbd> to save while editing</span>
+          </div>
+          <div style="display:flex;gap:var(--space-2);flex-wrap:wrap">
+            <button class="btn btn-primary btn-sm" id="text-editor-save-btn" onclick="saveEditedTextFile('${fjEsc}','${type}')" style="display:${startInEditMode ? 'inline-flex' : 'none'}">
+              <svg data-lucide="save" width="14" height="14"></svg> Save Changes
+            </button>
             <a class="btn btn-secondary btn-sm" href="${src}" target="_blank" rel="noopener noreferrer" style="text-decoration:none">
               <svg data-lucide="external-link" width="14" height="14"></svg> Open in New Tab
             </a>
-            <button class="btn btn-primary btn-sm" onclick="dlFile('${fjEsc}','${type}')">
+            <button class="btn btn-secondary btn-sm" onclick="dlFile('${fjEsc}','${type}')">
               <svg data-lucide="download" width="14" height="14"></svg> Download
             </button>
           </div>
         </div>
       </div>
-    `, 'max-width:860px');
+    `, 'max-width:920px');
     lucide.createIcons();
     try {
       const r = await apiFetch(src);
       const txt = await r.text();
+      _editorState.originalContent = txt;
       const pre = document.getElementById('text-preview-box');
+      const ta = document.getElementById('text-editor-area');
       if (pre) pre.textContent = txt;
+      if (ta) {
+        ta.value = txt;
+        if (startInEditMode) setTimeout(() => ta.focus(), 30);
+      }
+      updateEditorStats();
     } catch (e) {
       const pre = document.getElementById('text-preview-box');
       if (pre) pre.textContent = 'Unable to load text preview: ' + e.message;
@@ -2068,6 +2254,7 @@ function openContextMenu(e, fJson, type) {
   const isSel = _selectedItems.has(key);
   const isMedia = f.type !== 'folder' && (isVideoFile(f) || isAudioFile(f));
   const isImg = f.type !== 'folder' && isImageFile(f);
+  const isTxt = f.type !== 'folder' && isTextFile(f);
   const menu = document.getElementById('context-menu');
 
   let html = '';
@@ -2084,8 +2271,14 @@ function openContextMenu(e, fJson, type) {
       <svg data-lucide="image"></svg> View Image
     </button>`;
   } else {
-    html += `<button class="ctx-item" onclick="closeContextMenu();openBrowserPreview('${fJson}','${type}')">
+    html += `<button class="ctx-item" onclick="closeContextMenu();openBrowserPreview('${fJson}','${type}', false)">
       <svg data-lucide="eye"></svg> Open in Browser
+    </button>`;
+  }
+
+  if (isTxt) {
+    html += `<button class="ctx-item" onclick="closeContextMenu();openBrowserPreview('${fJson}','${type}', true)">
+      <svg data-lucide="file-code"></svg> Edit Text / Config…
     </button>`;
   }
 
@@ -2098,8 +2291,12 @@ function openContextMenu(e, fJson, type) {
     <svg data-lucide="edit-3"></svg> Rename
   </button>`;
 
-  html += `<button class="ctx-item" onclick="closeContextMenu();showTransferModal('${type}','${fJson}')">
-    <svg data-lucide="copy"></svg> Copy to Drive…
+  html += `<button class="ctx-item" onclick="closeContextMenu();showTransferModal('${type}','${fJson}','copy')">
+    <svg data-lucide="copy"></svg> Copy to…
+  </button>`;
+
+  html += `<button class="ctx-item" onclick="closeContextMenu();showTransferModal('${type}','${fJson}','move')">
+    <svg data-lucide="folder-output"></svg> Move to…
   </button>`;
 
   html += `<button class="ctx-item" onclick="closeContextMenu();toggleSelectItem('${fJson}','${type}')">
@@ -2377,15 +2574,39 @@ async function deleteSelectedItems(type) {
   if (type === 'smb') loadSMBFiles(); else loadGDriveFiles();
 }
 
-// ── Cross-Drive Transfer Modal ────────────────────────────────────────────────
+// ── Cross-Drive / Same-Drive Copy & Move Modal ────────────────────────────────
 let _transferItems = [];
 let _transferSrcType = '';
+let _transferMode = 'copy'; // 'copy' or 'move'
 let _transferDestDrive = null;
 let _transferDestFolder = '/';
 let _transferDestStack = [];
 
-async function showTransferModal(srcType, singleItemJson = null) {
+function setTransferMode(mode) {
+  _transferMode = mode === 'move' ? 'move' : 'copy';
+  const isMove = _transferMode === 'move';
+  const itemSummary = _transferItems.length === 1
+    ? `"${_transferItems[0].name}"`
+    : `${_transferItems.length} selected items`;
+
+  const titleEl = document.getElementById('transfer-modal-title');
+  if (titleEl) titleEl.textContent = `${isMove ? 'Move' : 'Copy'} ${itemSummary}`;
+
+  const copyTab = document.getElementById('transfer-mode-copy');
+  const moveTab = document.getElementById('transfer-mode-move');
+  if (copyTab) copyTab.classList.toggle('active', !isMove);
+  if (moveTab) moveTab.classList.toggle('active', isMove);
+
+  const submitBtn = document.getElementById('transfer-submit-btn');
+  if (submitBtn) {
+    submitBtn.innerHTML = `<svg data-lucide="${isMove ? 'folder-output' : 'copy'}" width="14" height="14"></svg> ${isMove ? 'Move Here' : 'Copy Here'}`;
+  }
+  lucide.createIcons();
+}
+
+async function showTransferModal(srcType, singleItemJson = null, mode = 'copy') {
   _transferSrcType = srcType;
+  _transferMode = mode === 'move' ? 'move' : 'copy';
   _transferItems = singleItemJson
     ? [parseFileArg(singleItemJson)]
     : Array.from(_selectedItems.values());
@@ -2411,8 +2632,14 @@ async function showTransferModal(srcType, singleItemJson = null) {
     return;
   }
 
-  // Pick a default target drive (prefer a different drive for quick cross-drive copy)
-  const preferred = destOptions.find(d => d.type !== srcType || d.id !== _activeDrive.id) || destOptions[0];
+  const isMove = _transferMode === 'move';
+  // For Move, default to the current drive so moving to another folder on the same drive is immediate; for Copy, prefer a different drive if available
+  const sameDriveOpt = destOptions.find(d => d.type === srcType && d.id === _activeDrive.id);
+  const diffDriveOpt = destOptions.find(d => d.type !== srcType || d.id !== _activeDrive.id);
+  const preferred = isMove
+    ? (sameDriveOpt || destOptions[0])
+    : (diffDriveOpt || sameDriveOpt || destOptions[0]);
+
   _transferDestDrive = preferred;
   _transferDestFolder = preferred.type === 'smb' ? '/' : 'root';
   _transferDestStack = [{ id: _transferDestFolder, name: preferred.name }];
@@ -2423,11 +2650,19 @@ async function showTransferModal(srcType, singleItemJson = null) {
 
   showModal(`
     <div class="modal-header">
-      <span class="modal-title">Copy ${escHtml(itemSummary)}</span>
+      <span class="modal-title" id="transfer-modal-title">${isMove ? 'Move' : 'Copy'} ${escHtml(itemSummary)}</span>
       <button class="btn btn-ghost btn-icon" onclick="closeModal()">
         <svg data-lucide="x" width="16" height="16"></svg></button>
     </div>
     <div class="modal-body">
+      <div class="settings-tabs" style="margin-bottom:var(--space-1)">
+        <button type="button" class="settings-tab ${!isMove ? 'active' : ''}" id="transfer-mode-copy" onclick="setTransferMode('copy')">
+          <svg data-lucide="copy" width="14" height="14"></svg> Copy
+        </button>
+        <button type="button" class="settings-tab ${isMove ? 'active' : ''}" id="transfer-mode-move" onclick="setTransferMode('move')">
+          <svg data-lucide="folder-output" width="14" height="14"></svg> Move
+        </button>
+      </div>
       <div class="form-group">
         <label class="form-label">Destination Drive</label>
         <select class="form-input" id="transfer-drive-select" onchange="onTransferDriveChange(this.value)">
@@ -2446,7 +2681,7 @@ async function showTransferModal(srcType, singleItemJson = null) {
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
       <button class="btn btn-primary" id="transfer-submit-btn" onclick="doTransfer()">
-        <svg data-lucide="copy" width="14" height="14"></svg> Copy Here
+        <svg data-lucide="${isMove ? 'folder-output' : 'copy'}" width="14" height="14"></svg> ${isMove ? 'Move Here' : 'Copy Here'}
       </button>
     </div>
   `);
@@ -2486,7 +2721,17 @@ async function loadTransferFolders() {
     } else {
       items = await apiJSON(`/api/gdrive/files?folder=${encodeURIComponent(_transferDestFolder)}&account_id=${encodeURIComponent(_transferDestDrive.id)}`);
     }
-    const folders = items.filter(it => it.type === 'folder');
+    const isSameDrive = _transferDestDrive.type === _transferSrcType && _transferDestDrive.id === _activeDrive?.id;
+    const movingFolderKeys = new Set(
+      isSameDrive
+        ? _transferItems.filter(it => it.type === 'folder').map(it => _transferDestDrive.type === 'smb' ? it.path : it.id)
+        : []
+    );
+    const folders = items.filter(it => {
+      if (it.type !== 'folder') return false;
+      const k = _transferDestDrive.type === 'smb' ? it.path : it.id;
+      return !movingFolderKeys.has(k);
+    });
     let html = '';
 
     if ((_transferDestDrive.type === 'smb' && _transferDestFolder !== '/') ||
@@ -2497,7 +2742,7 @@ async function loadTransferFolders() {
     }
 
     if (!folders.length && !html) {
-      html = `<div style="padding:var(--space-3);text-align:center;color:var(--color-text-faint);font-size:var(--text-xs)">No subfolders (will copy into current folder)</div>`;
+      html = `<div style="padding:var(--space-3);text-align:center;color:var(--color-text-faint);font-size:var(--text-xs)">No subfolders (will ${_transferMode === 'move' ? 'move' : 'copy'} into current folder)</div>`;
     } else {
       for (const fld of folders) {
         const targetId = _transferDestDrive.type === 'smb'
@@ -2536,14 +2781,16 @@ function transferGoUp() {
 
 async function doTransfer() {
   const btn = document.getElementById('transfer-submit-btn');
+  const isMove = _transferMode === 'move';
   if (btn) {
     btn.disabled = true;
-    btn.textContent = 'Copying…';
+    btn.textContent = isMove ? 'Moving…' : 'Copying…';
   }
   try {
     const res = await apiJSON('/api/transfer', {
       method: 'POST',
       json: {
+        operation: isMove ? 'move' : 'copy',
         src_type: _transferSrcType,
         src_drive: _activeDrive.id,
         dest_type: _transferDestDrive.type,
@@ -2554,15 +2801,17 @@ async function doTransfer() {
     });
     closeModal();
     clearSelection();
-    toast(`Copied ${res.copied} item${res.copied > 1 ? 's' : ''} to ${_transferDestDrive.name}`, 'success');
-    if (_transferDestDrive.type === _activeDrive.type && _transferDestDrive.id === _activeDrive.id) {
+    const count = res.moved || res.copied || _transferItems.length;
+    toast(`${isMove ? 'Moved' : 'Copied'} ${count} item${count > 1 ? 's' : ''} to ${_transferDestDrive.name}`, 'success');
+    if (isMove || (_transferDestDrive.type === _activeDrive.type && _transferDestDrive.id === _activeDrive.id)) {
       if (_activeDrive.type === 'smb') loadSMBFiles(); else loadGDriveFiles();
     }
   } catch (e) {
-    toast('Transfer failed: ' + e.message, 'error');
+    toast(`${isMove ? 'Move' : 'Copy'} failed: ` + e.message, 'error');
     if (btn) {
       btn.disabled = false;
-      btn.textContent = 'Copy Here';
+      btn.innerHTML = `<svg data-lucide="${isMove ? 'folder-output' : 'copy'}" width="14" height="14"></svg> ${isMove ? 'Move Here' : 'Copy Here'}`;
+      lucide.createIcons();
     }
   }
 }

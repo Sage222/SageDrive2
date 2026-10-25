@@ -135,6 +135,8 @@ for idx, acc in enumerate(accounts):
         "rclone", "mount", f"gdrive_{rc_id}:", mpath,
         "--config", "/root/.config/rclone/rclone.conf",
         "--allow-other",
+        "--buffer-size", "16M",
+        "--vfs-read-chunk-size", "32M",
         "--vfs-cache-mode", "writes",
         "--vfs-cache-max-size", "512M",
         "--dir-cache-time", "5m",

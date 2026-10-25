@@ -74,26 +74,44 @@ def _conn(cfg):
         raise ConnectionError(f"SMB connect failed for {host}:{port}")
     return c
 
+def sanitize_smb_path(path, allow_root=True):
+    raw = str(path or "").replace("\x00", "").replace("\\", "/").strip()
+    parts = []
+    for seg in raw.split("/"):
+        seg = seg.strip()
+        if not seg or seg == ".":
+            continue
+        if seg == "..":
+            raise ValueError("Invalid SMB path: path traversal ('..') is not allowed")
+        parts.append(seg)
+    if not parts:
+        if allow_root:
+            return "/"
+        raise ValueError("SMB path cannot be empty")
+    return "/" + "/".join(parts)
+
 def _cfg(share_id):
     s = {s["id"]: s for s in _load()}.get(share_id)
     if not s: raise ValueError(f"Share {share_id!r} not found")
     return s
 
 def browse(share_id, path="/"):
+    norm_path = sanitize_smb_path(path, allow_root=True)
     cfg = _cfg(share_id)
     c = _conn(cfg)
     try:
         return [{"name": e.filename, "type": "folder" if e.isDirectory else "file",
                  "size": e.file_size, "modified": e.last_write_time,
-                 "path": path.rstrip("/") + "/" + e.filename}
-                for e in c.listPath(cfg["share"], path) if e.filename not in (".", "..")]
+                 "path": norm_path.rstrip("/") + "/" + e.filename}
+                for e in c.listPath(cfg["share"], norm_path) if e.filename not in (".", "..")]
     finally: c.close()
 
 def get_file_size(share_id, path):
+    norm_path = sanitize_smb_path(path, allow_root=False)
     cfg = _cfg(share_id)
     c = _conn(cfg)
     try:
-        attrs = c.getAttributes(cfg["share"], path)
+        attrs = c.getAttributes(cfg["share"], norm_path)
         return attrs.file_size
     finally:
         c.close()
@@ -106,6 +124,7 @@ def stream_file_range(share_id, path, start=0, length=None, chunk_size=262144):
     so HTTP downloads never hang at 100%, and aborts immediately if the caller
     closes the generator early (e.g. during Range seeking or ffprobe).
     """
+    norm_path = sanitize_smb_path(path, allow_root=False)
     q = queue.Queue(maxsize=32)
     sentinel = object()
     aborted = threading.Event()
@@ -157,10 +176,10 @@ def stream_file_range(share_id, path, start=0, length=None, chunk_size=262144):
             c = _conn(cfg)
             writer = _QueueWriter(length)
             if start == 0 and length is None:
-                c.retrieveFile(cfg["share"], path, writer)
+                c.retrieveFile(cfg["share"], norm_path, writer)
             else:
                 max_len = length if (length is not None and length > 0) else -1
-                c.retrieveFileFromOffset(cfg["share"], path, writer, offset=start, max_length=max_len)
+                c.retrieveFileFromOffset(cfg["share"], norm_path, writer, offset=start, max_length=max_len)
             writer.flush()
         except _AbortStream:
             pass
@@ -208,12 +227,13 @@ def retrieve_to_tmpfile(share_id, path):
     Download the full file from SMB into a temp file on disk.
     Returns (tmp_path, filename, file_size). Caller must delete tmp_path.
     """
+    norm_path = sanitize_smb_path(path, allow_root=False)
     cfg = _cfg(share_id)
     c = _conn(cfg)
-    filename = path.split("/")[-1]
+    filename = norm_path.split("/")[-1]
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix="_" + filename)
     try:
-        c.retrieveFile(cfg["share"], path, tmp)
+        c.retrieveFile(cfg["share"], norm_path, tmp)
         tmp.flush()
         size = tmp.tell()
         tmp.close()
@@ -226,17 +246,19 @@ def retrieve_to_tmpfile(share_id, path):
         c.close()
 
 def read_file_bytes(share_id, path):
+    norm_path = sanitize_smb_path(path, allow_root=False)
     cfg = _cfg(share_id)
     c = _conn(cfg)
     buf = io.BytesIO()
     try:
-        c.retrieveFile(cfg["share"], path, buf)
+        c.retrieveFile(cfg["share"], norm_path, buf)
         return buf.getvalue()
     finally:
         c.close()
 
 def _ensure_dirs_on_conn(c, share_name, dir_path):
-    parts = [p for p in dir_path.replace("\\", "/").split("/") if p]
+    norm_dir = sanitize_smb_path(dir_path, allow_root=True)
+    parts = [p for p in norm_dir.split("/") if p]
     built = ""
     for part in parts:
         built += "/" + part
@@ -248,25 +270,50 @@ def _ensure_dirs_on_conn(c, share_name, dir_path):
             except Exception:
                 pass
 
-def upload_file(share_id, dest_path, data):
+def upload_file(share_id, dest_path, data_or_stream):
+    norm_path = sanitize_smb_path(dest_path, allow_root=False)
     cfg = _cfg(share_id)
     c = _conn(cfg)
     try:
-        norm_path = "/" + dest_path.replace("\\", "/").lstrip("/")
         parent = "/".join(norm_path.split("/")[:-1])
         if parent and parent != "/":
             _ensure_dirs_on_conn(c, cfg["share"], parent)
-        c.storeFile(cfg["share"], norm_path, io.BytesIO(data))
+        file_obj = data_or_stream if hasattr(data_or_stream, "read") else io.BytesIO(
+            data_or_stream if isinstance(data_or_stream, (bytes, bytearray)) else str(data_or_stream).encode("utf-8")
+        )
+        c.storeFile(cfg["share"], norm_path, file_obj)
     finally:
         c.close()
 
 def rename_path(share_id, old_path, new_name):
+    norm_old = sanitize_smb_path(old_path, allow_root=False)
+    clean_name = (new_name or "").replace("\x00", "").replace("/", "").replace("\\", "").strip()
+    if not clean_name or clean_name in (".", ".."):
+        raise ValueError("Invalid new name")
     cfg = _cfg(share_id)
     c = _conn(cfg)
     try:
-        norm_old = "/" + old_path.replace("\\", "/").lstrip("/")
         parent = "/".join(norm_old.rstrip("/").split("/")[:-1])
-        new_path = (parent + "/" + new_name) if parent else ("/" + new_name)
+        new_path = (parent + "/" + clean_name) if parent else ("/" + clean_name)
+        c.rename(cfg["share"], norm_old, new_path)
+        return new_path
+    finally:
+        c.close()
+
+def move_path(share_id, old_path, dest_dir):
+    norm_old = sanitize_smb_path(old_path, allow_root=False)
+    norm_dest_dir = sanitize_smb_path(dest_dir, allow_root=True)
+    base_name = norm_old.rstrip("/").split("/")[-1]
+    new_path = (norm_dest_dir.rstrip("/") + "/" + base_name) if norm_dest_dir != "/" else ("/" + base_name)
+    if new_path == norm_old:
+        return new_path
+    if new_path.startswith(norm_old.rstrip("/") + "/"):
+        raise ValueError("Cannot move a folder into itself")
+    cfg = _cfg(share_id)
+    c = _conn(cfg)
+    try:
+        if norm_dest_dir != "/":
+            _ensure_dirs_on_conn(c, cfg["share"], norm_dest_dir)
         c.rename(cfg["share"], norm_old, new_path)
         return new_path
     finally:
@@ -287,18 +334,20 @@ def _delete_recursive_on_conn(c, share_name, path, is_dir=False):
     c.deleteDirectory(share_name, path)
 
 def delete_path(share_id, path, is_dir=False):
+    norm_path = sanitize_smb_path(path, allow_root=False)
     cfg = _cfg(share_id)
     c = _conn(cfg)
     try:
-        _delete_recursive_on_conn(c, cfg["share"], path, is_dir)
+        _delete_recursive_on_conn(c, cfg["share"], norm_path, is_dir)
     finally:
         c.close()
 
 def create_directory(share_id, path):
+    norm_path = sanitize_smb_path(path, allow_root=False)
     cfg = _cfg(share_id)
     c = _conn(cfg)
     try:
-        _ensure_dirs_on_conn(c, cfg["share"], path)
+        _ensure_dirs_on_conn(c, cfg["share"], norm_path)
     finally:
         c.close()
 

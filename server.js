@@ -859,7 +859,7 @@ app.post('/api/auth/login', (req, res) => {
     persistSessions();
     res.setHeader(
       'Set-Cookie',
-      `sd_token=${encodeURIComponent(token)}; Path=/; Max-Age=${Math.floor(SESSION_TTL / 1000)}; SameSite=Lax`
+      `sd_token=${encodeURIComponent(token)}; Path=/; Max-Age=${Math.floor(SESSION_TTL / 1000)}; HttpOnly; SameSite=Lax`
     );
     return res.json({ token });
   }
@@ -901,6 +901,24 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
 // ── SMB Helpers & Routes ──────────────────────────────────────────────────────
 function listShares() {
   return loadJson(SHARES_FILE, []);
+}
+
+function sanitizeSmbPath(rawPath, allowRoot = true) {
+  const raw = String(rawPath || '').replace(/\0/g, '').replace(/\\/g, '/').trim();
+  const parts = [];
+  for (const seg of raw.split('/')) {
+    const s = seg.trim();
+    if (!s || s === '.') continue;
+    if (s === '..') {
+      throw new Error("Invalid SMB path: path traversal ('..') is not allowed");
+    }
+    parts.push(s);
+  }
+  if (!parts.length) {
+    if (allowRoot) return '/';
+    throw new Error('SMB path cannot be empty');
+  }
+  return '/' + parts.join('/');
 }
 
 function ensureSmbParentDirs(entries, fullFilePath) {
@@ -1033,28 +1051,67 @@ app.get('/api/smb/download/:share_id', requireAuth, (req, res) => {
 
 app.post('/api/smb/upload/:share_id', requireAuth, upload.single('file'), (req, res) => {
   const { share_id } = req.params;
-  const dest = (req.query.path || '/').replace(/\/+$/, '');
-  const relPath = String(req.body?.relative_path || req.query?.relative_path || '').trim().replace(/^\/+/, '');
   const f = req.file;
   if (!f) {
     return res.status(400).json({ error: 'No file provided' });
   }
-  const entries = ensureShareFS(share_id);
-  const subPath = relPath || f.originalname;
-  const fullPath = `${dest}/${subPath}`;
-  ensureSmbParentDirs(entries, fullPath);
-  const actualName = path.posix.basename(fullPath);
-  entries[fullPath] = {
-    name: actualName,
-    type: 'file',
-    size: f.size,
-    modified: Math.floor(Date.now() / 1000),
-    path: fullPath,
-    blobPath: f.path,
-    mimeType: getMimeType(actualName, f.mimetype),
-  };
-  saveSmbFS();
-  return res.json({ ok: true });
+  try {
+    const dest = sanitizeSmbPath(req.query.path || '/', true);
+    const relPath = String(req.body?.relative_path || req.query?.relative_path || '').trim().replace(/^\/+/, '');
+    const entries = ensureShareFS(share_id);
+    const subPath = relPath || f.originalname;
+    const fullPath = sanitizeSmbPath(`${dest.replace(/\/+$/, '')}/${subPath}`, false);
+    ensureSmbParentDirs(entries, fullPath);
+    const actualName = path.posix.basename(fullPath);
+    entries[fullPath] = {
+      name: actualName,
+      type: 'file',
+      size: f.size,
+      modified: Math.floor(Date.now() / 1000),
+      path: fullPath,
+      blobPath: f.path,
+      mimeType: getMimeType(actualName, f.mimetype),
+    };
+    saveSmbFS();
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+});
+
+app.put('/api/smb/content/:share_id', requireAuth, (req, res) => {
+  const { share_id } = req.params;
+  const b = req.body || {};
+  const rawPath = b.path || req.query.path || '';
+  if (b.content === undefined || b.content === null) {
+    return res.status(400).json({ error: 'content is required' });
+  }
+  try {
+    const fullPath = sanitizeSmbPath(rawPath, false);
+    const entries = ensureShareFS(share_id);
+    ensureSmbParentDirs(entries, fullPath);
+    const actualName = path.posix.basename(fullPath);
+    const buf = Buffer.from(String(b.content), 'utf-8');
+    const existing = entries[fullPath];
+    const blobPath =
+      existing?.blobPath && !existing.blobPath.includes('sample_')
+        ? existing.blobPath
+        : path.join(BLOBS_DIR, `edit_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.txt`);
+    fs.writeFileSync(blobPath, buf);
+    entries[fullPath] = {
+      name: actualName,
+      type: 'file',
+      size: buf.length,
+      modified: Math.floor(Date.now() / 1000),
+      path: fullPath,
+      blobPath,
+      mimeType: getMimeType(actualName, existing?.mimeType || 'text/plain'),
+    };
+    saveSmbFS();
+    return res.json({ ok: true, path: fullPath, size: buf.length });
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
 });
 
 app.post('/api/smb/rename/:share_id', requireAuth, (req, res) => {
@@ -1629,6 +1686,29 @@ app.post('/api/gdrive/upload', requireAuth, upload.single('file'), (req, res) =>
   return res.json({ ok: true });
 });
 
+app.put('/api/gdrive/content/:file_id', requireAuth, (req, res) => {
+  const { file_id } = req.params;
+  const b = req.body || {};
+  if (b.content === undefined || b.content === null) {
+    return res.status(400).json({ error: 'content is required' });
+  }
+  const item = gdriveFSData[file_id];
+  if (!item) {
+    return res.status(404).json({ error: 'File not found' });
+  }
+  const buf = Buffer.from(String(b.content), 'utf-8');
+  const blobPath =
+    item.blobPath && !item.blobPath.includes('sample_')
+      ? item.blobPath
+      : path.join(BLOBS_DIR, `gdrive_edit_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.txt`);
+  fs.writeFileSync(blobPath, buf);
+  item.blobPath = blobPath;
+  item.size = buf.length;
+  item.modified = new Date().toISOString();
+  saveGDriveFS();
+  return res.json({ ok: true, size: buf.length, file: item });
+});
+
 app.post('/api/gdrive/rename/:file_id', requireAuth, (req, res) => {
   const { file_id } = req.params;
   const b = req.body || {};
@@ -1862,8 +1942,67 @@ function copyGDriveItemToGDrive(fileId, destFolderId, destAccountId = 'default')
   }
 }
 
+function deleteSmbPathRecursive(shareId, targetPath) {
+  const entries = ensureShareFS(shareId);
+  const norm = sanitizeSmbPath(targetPath, false);
+  delete entries[norm];
+  const prefix = norm.replace(/\/+$/, '') + '/';
+  for (const k of Object.keys(entries)) {
+    if (k.startsWith(prefix)) delete entries[k];
+  }
+}
+
+function deleteGDriveRecursive(fid) {
+  const item = gdriveFSData[fid];
+  if (!item) return;
+  if (item.type === 'folder') {
+    for (const ch of Object.values(gdriveFSData)) {
+      if (ch.parent === fid) deleteGDriveRecursive(ch.id);
+    }
+  }
+  delete gdriveFSData[fid];
+}
+
+function moveSmbPathSameShare(shareId, oldPath, destDir) {
+  const entries = ensureShareFS(shareId);
+  const normOld = sanitizeSmbPath(oldPath, false);
+  const normDestDir = sanitizeSmbPath(destDir, true);
+  const item = entries[normOld];
+  if (!item) throw new Error('Source item not found');
+  const baseName = path.posix.basename(normOld);
+  const newPath = normDestDir === '/' ? `/${baseName}` : `${normDestDir.replace(/\/+$/, '')}/${baseName}`;
+  if (newPath === normOld) return newPath;
+  if (newPath.startsWith(normOld + '/')) {
+    throw new Error('Cannot move a folder into itself');
+  }
+  ensureSmbParentDirs(entries, newPath);
+  delete entries[normOld];
+  entries[newPath] = {
+    ...item,
+    path: newPath,
+    modified: Math.floor(Date.now() / 1000),
+  };
+  if (item.type === 'folder') {
+    const oldPrefix = normOld + '/';
+    const newPrefix = newPath + '/';
+    for (const [k, child] of Object.entries(entries)) {
+      if (k.startsWith(oldPrefix)) {
+        const updatedChildPath = newPrefix + k.slice(oldPrefix.length);
+        delete entries[k];
+        entries[updatedChildPath] = {
+          ...child,
+          path: updatedChildPath,
+        };
+      }
+    }
+  }
+  return newPath;
+}
+
 app.post('/api/transfer', requireAuth, (req, res) => {
   const b = req.body || {};
+  const operation = String(b.operation || 'copy').trim().toLowerCase();
+  const isMove = operation === 'move';
   const srcType = b.src_type;
   const srcDrive = b.src_drive;
   const destType = b.dest_type;
@@ -1876,26 +2015,43 @@ app.post('/api/transfer', requireAuth, (req, res) => {
   }
 
   try {
-    let copied = 0;
+    let count = 0;
     for (const it of items) {
-      if (srcType === 'smb' && destType === 'gdrive') {
+      if (isMove && srcType === 'smb' && destType === 'smb' && srcDrive === destDrive) {
+        moveSmbPathSameShare(srcDrive, it.path, destFolder);
+      } else if (isMove && srcType === 'gdrive' && destType === 'gdrive' && srcDrive === destDrive) {
+        const gdItem = gdriveFSData[it.id];
+        if (!gdItem) throw new Error('Source file not found');
+        if (it.id === destFolder) throw new Error('Cannot move a folder into itself');
+        gdItem.parent = destFolder || 'root';
+        gdItem.modified = new Date().toISOString();
+      } else if (srcType === 'smb' && destType === 'gdrive') {
         copySmbItemToGDrive(srcDrive, it.path, destFolder, destDrive);
+        if (isMove) deleteSmbPathRecursive(srcDrive, it.path);
       } else if (srcType === 'gdrive' && destType === 'smb') {
         copyGDriveItemToSmb(it.id, destDrive, destFolder);
+        if (isMove) deleteGDriveRecursive(it.id);
       } else if (srcType === 'smb' && destType === 'smb') {
         copySmbItemToSmb(srcDrive, it.path, destDrive, destFolder);
+        if (isMove) deleteSmbPathRecursive(srcDrive, it.path);
       } else if (srcType === 'gdrive' && destType === 'gdrive') {
         copyGDriveItemToGDrive(it.id, destFolder, destDrive);
+        if (isMove) deleteGDriveRecursive(it.id);
       } else {
         return res.status(400).json({ error: 'Invalid source or destination type' });
       }
-      copied++;
+      count++;
     }
     saveSmbFS();
     saveGDriveFS();
-    return res.json({ ok: true, copied });
+    return res.json({
+      ok: true,
+      copied: count,
+      moved: isMove ? count : 0,
+      operation: isMove ? 'move' : 'copy',
+    });
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    return res.status(400).json({ error: err.message });
   }
 });
 

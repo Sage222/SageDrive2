@@ -36,7 +36,11 @@ Repository: [https://github.com/Sage222/SageDrive2](https://github.com/Sage222/S
 - **Default Inline Open:** Clicking any supported video, audio, image, PDF, or text/code file opens it directly in the browser without forcing a download.
 - **Video & Audio Streaming:** Stream full-length video (`mp4`, `webm`, `mkv`, `mov`, `m4v`, `avi`, `ts`, `ogg`) and audio (`mp3`, `wav`, `flac`, `m4a`, `aac`, `opus`, `ogg`) with HTTP Range request seeking and automatic byte-accurate stream resume on both SMB (`timeout=14400` with reconnect-at-offset) and Google Drive.
 - **Automatic Audio Transcoding (EAC3 / AC3 / DTS / TrueHD) with Full Duration & Seeking:** Built-in FFmpeg stream remuxing automatically detects browser-incompatible audio codecs (such as Dolby Digital Plus `eac3`, `ac3`, `dts`) and live-transcodes the audio track to stereo AAC on the fly while copying the H.264/HEVC video stream untouched (`-c:v copy -c:a aac`). The fragmented MP4 `moov` header (`mvhd`, `tkhd`, `mdhd`, `mehd`) is dynamically patched with the probed container/stream duration so long videos display their full duration immediately and support instant seeking (`?ss=`) across the entire timeline.
-- **Media Player Controls:** Dedicated full-duration interactive timeline scrubber, audio track selector, Next/Previous track navigation across the current folder playlist, playback speed controls (`0.5x` – `2x`), and direct download button.
+- **Media Player Controls, Skip Forward/Backward, `1.1x` Speed & Fullscreen Zoom:**
+  - **Skip Forward & Backward:** Skip `-30s`, `-10s`, `+10s`, or `+30s` using dedicated buttons, keyboard shortcuts (`ArrowLeft` / `ArrowRight`, `Shift+ArrowLeft` / `Shift+ArrowRight`, `J` / `L`), or the interactive full-duration timeline scrubber (both in normal view and Fullscreen mode).
+  - **Playback Speeds (including `1.1x`):** Adjust playback speed across `0.5x`, `0.75x`, `1x`, `1.1x`, `1.25x`, `1.5x`, and `2x`.
+  - **Fullscreen Zoom (`100%`, `110%`, `120%`, `130%`):** Scale video playback to `100%`, `110%`, `120%`, or `130%` directly inside Fullscreen mode (with an auto-hiding Fullscreen HUD overlay) or from the modal control bar.
+  - **Playlist & Audio Tracks:** Switch between multi-language audio tracks and navigate Next/Previous tracks across the current folder playlist.
 - **Image Gallery & Document Viewer:** Inline high-resolution image lightbox with next/prev navigation, plus inline preview/editor for PDFs and text/code/markdown/config files.
 
 ### Security & Authentication

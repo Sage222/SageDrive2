@@ -1260,7 +1260,7 @@ def _analyze_probe_data(data, filename=""):
         if video_codec not in ("h264", "hevc", "vp8", "vp9", "av1") or is_10bit_h264:
             needs_video_transcode = True
 
-    non_native_container = ext in ("avi", "wmv", "flv", "ts", "m2ts", "mpg", "mpeg", "vob", "divx")
+    non_native_container = ext in ("mkv", "avi", "wmv", "flv", "ts", "m2ts", "mpg", "mpeg", "vob", "divx")
     can_remux_video = has_video and video_codec in ("h264", "hevc") and not is_10bit_h264
 
     if has_video:
@@ -1456,6 +1456,8 @@ def _patch_mp4_moov_duration(chunk, duration_sec):
 def _build_ffmpeg_video_cmd(input_spec, mode="full", video_codec="h264", audio_track=0, start_time=0.0):
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
     if start_time and start_time > 0:
+        if mode == "remux":
+            cmd += ["-noaccurate_seek"]
         cmd += ["-ss", f"{start_time:.3f}"]
     cmd += ["-i", input_spec]
     cmd += ["-map", "0:V:0", "-map", f"0:a:{max(0, int(audio_track))}?", "-sn", "-dn"]
@@ -1467,8 +1469,9 @@ def _build_ffmpeg_video_cmd(input_spec, mode="full", video_codec="h264", audio_t
             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
             "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
         ]
+    af_filter = "aresample=async=1" if (mode == "remux" and start_time and start_time > 0) else "aresample=async=1:first_pts=0"
     cmd += [
-        "-af", "aresample=async=1:first_pts=0",
+        "-af", af_filter,
         "-c:a", "aac", "-ac", "2", "-ar", "48000", "-b:a", "192k",
         "-avoid_negative_ts", "make_zero",
         "-movflags", "frag_keyframe+empty_moov+default_base_moof",

@@ -274,18 +274,52 @@
                         gap:var(--space-3);padding:var(--space-2) var(--space-3);
                         background:var(--color-surface-offset);border-radius:var(--radius-md);
                         flex-wrap:wrap}
-    .media-nav-group{display:flex;align-items:center;gap:var(--space-2)}
+    .media-nav-group{display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap}
     .media-track-badge{font-family:var(--font-mono);font-size:var(--text-xs);
                        color:var(--color-text-muted);font-variant-numeric:tabular-nums;
                        padding:0 var(--space-1)}
-    .speed-group{display:inline-flex;align-items:center;background:var(--color-surface);
-                 border:1px solid var(--color-border);border-radius:var(--radius-md);
-                 padding:2px;gap:2px}
-    .speed-btn{font-family:var(--font-mono);font-size:11px;padding:2px 6px;
-               border-radius:calc(var(--radius-sm) - 1px);color:var(--color-text-muted);
-               font-variant-numeric:tabular-nums}
-    .speed-btn:hover{color:var(--color-text)}
-    .speed-btn.active{background:var(--color-primary);color:#fff;font-weight:500}
+    .speed-group,.zoom-group{display:inline-flex;align-items:center;background:var(--color-surface);
+                             border:1px solid var(--color-border);border-radius:var(--radius-md);
+                             padding:2px;gap:2px}
+    .speed-btn,.zoom-btn{font-family:var(--font-mono);font-size:11px;padding:2px 6px;
+                         border-radius:calc(var(--radius-sm) - 1px);color:var(--color-text-muted);
+                         font-variant-numeric:tabular-nums;cursor:pointer}
+    .speed-btn:hover,.zoom-btn:hover{color:var(--color-text)}
+    .speed-btn.active,.zoom-btn.active{background:var(--color-primary);color:#fff;font-weight:500}
+    .video-stage{position:relative;width:100%;max-height:66vh;background:#000;
+                 border-radius:var(--radius-md);overflow:hidden;
+                 display:flex;align-items:center;justify-content:center;user-select:none}
+    .video-stage video{width:100%;max-height:66vh;display:block;background:#000;
+                       transform-origin:center center;transition:transform 160ms ease;cursor:pointer}
+    .video-stage:fullscreen,.video-stage:-webkit-full-screen{
+      max-height:100vh;width:100vw;height:100vh;border-radius:0;background:#000;
+    }
+    .video-stage:fullscreen video,.video-stage:-webkit-full-screen video{
+      max-height:100vh;width:100vw;height:100vh;object-fit:contain;
+    }
+    .video-stage.hud-hidden{cursor:none}
+    .video-stage.hud-hidden .video-stage-hud{opacity:0;pointer-events:none;transform:translateY(8px)}
+    .video-stage-hud{position:absolute;left:0;right:0;bottom:0;z-index:10;
+                     background:linear-gradient(to top, rgba(0,0,0,.88) 0%, rgba(0,0,0,.62) 68%, transparent 100%);
+                     padding:var(--space-5) var(--space-3) var(--space-2);
+                     display:flex;flex-direction:column;gap:6px;color:#fff;
+                     transition:opacity 180ms ease, transform 180ms ease}
+    .video-hud-row{display:flex;align-items:center;justify-content:space-between;gap:var(--space-2);flex-wrap:wrap}
+    .video-hud-left,.video-hud-right{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+    .hud-btn{display:inline-flex;align-items:center;gap:4px;padding:4px 8px;
+             border-radius:var(--radius-sm);background:rgba(255,255,255,.14);
+             color:#fff;font-size:11px;font-family:var(--font-mono);font-weight:500;
+             border:1px solid rgba(255,255,255,.16);cursor:pointer;
+             transition:background 120ms ease}
+    .hud-btn:hover{background:rgba(255,255,255,.26)}
+    .hud-btn.active{background:var(--color-primary);border-color:var(--color-primary);color:#fff}
+    .hud-pill-group{display:inline-flex;align-items:center;background:rgba(0,0,0,.55);
+                    border:1px solid rgba(255,255,255,.18);border-radius:var(--radius-md);
+                    padding:2px;gap:2px}
+    .hud-pill{font-family:var(--font-mono);font-size:11px;padding:2px 6px;
+              border-radius:calc(var(--radius-sm) - 1px);color:rgba(255,255,255,.78);cursor:pointer}
+    .hud-pill:hover{color:#fff}
+    .hud-pill.active{background:var(--color-primary);color:#fff;font-weight:600}
 
     .toolbar{display:flex;align-items:center;gap:var(--space-2);
              margin-bottom:var(--space-5);flex-wrap:wrap}
@@ -596,6 +630,7 @@ let _selectedItems = new Map();
 let _mediaPlaylist = [];
 let _mediaIndex = -1;
 let _playbackRate = 1;
+let _videoZoom = 1;
 let _autoPlayNext = true;
 
 async function apiFetch(path, opts={}) {
@@ -1278,8 +1313,16 @@ function mediaProbeUrl(f, type) {
 let _activeMediaAbort = null;
 let _activeMediaBlobUrl = null;
 let _activeMediaState = null;
+let _hudIdleTimer = null;
 
 function cleanupActiveMedia() {
+  if (_activeMediaState && _activeMediaState.skipDebounceTimer) {
+    clearTimeout(_activeMediaState.skipDebounceTimer);
+  }
+  if (_hudIdleTimer) {
+    clearTimeout(_hudIdleTimer);
+    _hudIdleTimer = null;
+  }
   _activeMediaState = null;
   if (_activeMediaAbort) {
     try { _activeMediaAbort.abort(); } catch(_) {}
@@ -1293,8 +1336,11 @@ function cleanupActiveMedia() {
       player.oncanplay = null;
       player.onwaiting = null;
       player.onplaying = null;
+      player.onpause = null;
+      player.onplay = null;
       player.onended = null;
       player.ontimeupdate = null;
+      player.onseeking = null;
       player.pause();
       player.removeAttribute('src');
       player.load();
@@ -1383,10 +1429,162 @@ function setPlaybackRate(rate) {
   _playbackRate = rate;
   const player = document.getElementById('active-media-player');
   if (player) player.playbackRate = rate;
-  document.querySelectorAll('.speed-btn').forEach(btn => {
-    btn.classList.toggle('active', parseFloat(btn.dataset.rate) === rate);
+  document.querySelectorAll('.speed-btn, .hud-speed-btn').forEach(btn => {
+    btn.classList.toggle('active', Math.abs(parseFloat(btn.dataset.rate) - rate) < 0.001);
   });
 }
+
+function setVideoZoom(zoom) {
+  _videoZoom = zoom;
+  const player = document.getElementById('active-media-player');
+  if (player && _activeMediaState && _activeMediaState.isVid) {
+    player.style.transform = zoom === 1 ? 'scale(1)' : `scale(${zoom})`;
+  }
+  document.querySelectorAll('.zoom-btn, .hud-zoom-btn').forEach(btn => {
+    btn.classList.toggle('active', Math.abs(parseFloat(btn.dataset.zoom) - zoom) < 0.001);
+  });
+}
+
+function toggleMediaPlayPause() {
+  const player = document.getElementById('active-media-player');
+  if (!player) return;
+  if (player.paused) {
+    player.play().catch(() => {});
+  } else {
+    player.pause();
+  }
+  updatePlayPauseIcons();
+}
+
+function updatePlayPauseIcons() {
+  const player = document.getElementById('active-media-player');
+  const isPaused = !player || player.paused;
+  const iconName = isPaused ? 'play' : 'pause';
+  document.querySelectorAll('.media-play-toggle-btn').forEach(btn => {
+    btn.innerHTML = `<svg data-lucide="${iconName}" width="14" height="14"></svg>`;
+    btn.title = isPaused ? 'Play (Space)' : 'Pause (Space)';
+  });
+  lucide.createIcons();
+}
+
+function toggleMediaMute() {
+  const player = document.getElementById('active-media-player');
+  if (!player) return;
+  player.muted = !player.muted;
+  const iconName = player.muted || player.volume === 0 ? 'volume-x' : 'volume-2';
+  const muteBtn = document.getElementById('stage-mute-btn');
+  if (muteBtn) {
+    muteBtn.innerHTML = `<svg data-lucide="${iconName}" width="14" height="14"></svg>`;
+    lucide.createIcons();
+  }
+}
+
+function toggleVideoFullscreen() {
+  const stage = document.getElementById('video-stage-container');
+  const player = document.getElementById('active-media-player');
+  const target = stage || player;
+  if (!target) return;
+
+  const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+  if (fsEl) {
+    if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
+    else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+  } else {
+    if (target.requestFullscreen) target.requestFullscreen().catch(() => {});
+    else if (target.webkitRequestFullscreen) target.webkitRequestFullscreen();
+    else if (player && player.webkitEnterFullscreen) player.webkitEnterFullscreen();
+  }
+}
+
+function getMediaCurrentTime() {
+  if (!_activeMediaState) return 0;
+  if (typeof _activeMediaState.pendingSeekTarget === 'number' && Number.isFinite(_activeMediaState.pendingSeekTarget)) {
+    return _activeMediaState.pendingSeekTarget;
+  }
+  const player = document.getElementById('active-media-player');
+  const pTime = (player && Number.isFinite(player.currentTime)) ? player.currentTime : 0;
+  return Math.max(0, (_activeMediaState.seekOffset || 0) + pTime);
+}
+
+function skipMediaBy(deltaSec) {
+  if (!_activeMediaState || !_activeMediaState.seekTo) return;
+  const state = _activeMediaState;
+  const cur = getMediaCurrentTime();
+  const maxDur = state.totalDuration > 0 ? Math.max(0, state.totalDuration - 0.5) : Infinity;
+  const target = Math.max(0, Math.min(maxDur, cur + (Number(deltaSec) || 0)));
+
+  // Update timeline UI immediately for instant feedback on rapid skips
+  state.pendingSeekTarget = target;
+  const rounded = String(Math.round(target * 10) / 10);
+  const fmt = fmtMediaTime(target);
+  const s1 = document.getElementById('media-timeline-slider');
+  const s2 = document.getElementById('stage-timeline-slider');
+  const t1 = document.getElementById('media-time-current');
+  const t2 = document.getElementById('stage-time-current');
+  if (s1) s1.value = rounded;
+  if (s2) s2.value = rounded;
+  if (t1) t1.textContent = fmt;
+  if (t2) t2.textContent = fmt;
+
+  if (state.skipDebounceTimer) {
+    clearTimeout(state.skipDebounceTimer);
+    state.skipDebounceTimer = null;
+  }
+
+  // In direct or blob mode, seek immediately; in remux/full mode, debounce 160ms so multiple clicks accumulate cleanly
+  if (state.mode === 'direct' || _activeMediaBlobUrl) {
+    state.pendingSeekTarget = null;
+    state.seekTo(target);
+  } else {
+    state.skipDebounceTimer = setTimeout(() => {
+      state.skipDebounceTimer = null;
+      const finalTarget = state.pendingSeekTarget;
+      state.pendingSeekTarget = null;
+      if (typeof finalTarget === 'number' && Number.isFinite(finalTarget)) {
+        state.seekTo(finalTarget);
+      }
+    }, 160);
+  }
+}
+
+document.addEventListener('fullscreenchange', () => {
+  const isFs = Boolean(document.fullscreenElement || document.webkitFullscreenElement);
+  document.querySelectorAll('.fs-toggle-btn').forEach(btn => {
+    btn.innerHTML = `<svg data-lucide="${isFs ? 'minimize' : 'maximize'}" width="14" height="14"></svg>`;
+    btn.title = isFs ? 'Exit Fullscreen (F)' : 'Fullscreen (F)';
+  });
+  lucide.createIcons();
+});
+
+document.addEventListener('keydown', (e) => {
+  if (!_activeMediaState) return;
+  const tag = (e.target && e.target.tagName) ? e.target.tagName.toLowerCase() : '';
+  if (tag === 'input' && e.target.type !== 'range') return;
+  if (tag === 'textarea' || tag === 'select' || e.target?.isContentEditable) return;
+
+  if (e.key === 'ArrowLeft') {
+    e.preventDefault();
+    skipMediaBy(e.shiftKey ? -30 : -10);
+  } else if (e.key === 'ArrowRight') {
+    e.preventDefault();
+    skipMediaBy(e.shiftKey ? 30 : 10);
+  } else if (e.key === 'j' || e.key === 'J') {
+    e.preventDefault();
+    skipMediaBy(-30);
+  } else if (e.key === 'l' || e.key === 'L') {
+    e.preventDefault();
+    skipMediaBy(30);
+  } else if ((e.key === ' ' || e.key === 'k' || e.key === 'K') && tag !== 'button') {
+    e.preventDefault();
+    toggleMediaPlayPause();
+  } else if ((e.key === 'f' || e.key === 'F') && _activeMediaState.isVid) {
+    e.preventDefault();
+    toggleVideoFullscreen();
+  } else if (e.key === 'm' || e.key === 'M') {
+    e.preventDefault();
+    toggleMediaMute();
+  }
+});
 
 function toggleAutoNext(cb) {
   _autoPlayNext = cb.checked;
@@ -1425,8 +1623,16 @@ function fmtMediaTime(sec) {
 function onMediaTimelineScrubInput(val) {
   if (!_activeMediaState) return;
   _activeMediaState.isScrubbing = true;
+  const num = parseFloat(val) || 0;
+  const fmt = fmtMediaTime(num);
   const curEl = document.getElementById('media-time-current');
-  if (curEl) curEl.textContent = fmtMediaTime(parseFloat(val) || 0);
+  const stageCurEl = document.getElementById('stage-time-current');
+  const s1 = document.getElementById('media-timeline-slider');
+  const s2 = document.getElementById('stage-timeline-slider');
+  if (curEl) curEl.textContent = fmt;
+  if (stageCurEl) stageCurEl.textContent = fmt;
+  if (s1 && s1.value !== String(val)) s1.value = String(val);
+  if (s2 && s2.value !== String(val)) s2.value = String(val);
 }
 
 function onMediaTimelineScrubChange(val) {
@@ -1442,8 +1648,7 @@ function changeMediaAudioTrack(trackIdxStr) {
   if (!_activeMediaState) return;
   const idx = parseInt(trackIdxStr, 10) || 0;
   _activeMediaState.audioTrack = idx;
-  const player = document.getElementById('active-media-player');
-  const curPos = (_activeMediaState.seekOffset || 0) + (player && Number.isFinite(player.currentTime) ? player.currentTime : 0);
+  const curPos = getMediaCurrentTime();
   const targetMode = (_activeMediaState.mode === 'direct')
     ? (_activeMediaState.canRemux ? 'remux' : 'full')
     : _activeMediaState.mode;
@@ -1452,8 +1657,7 @@ function changeMediaAudioTrack(trackIdxStr) {
 
 function forceMediaCompatMode() {
   if (!_activeMediaState) return;
-  const player = document.getElementById('active-media-player');
-  const curPos = (_activeMediaState.seekOffset || 0) + (player && Number.isFinite(player.currentTime) ? player.currentTime : 0);
+  const curPos = getMediaCurrentTime();
   if (_activeMediaState.isVid) {
     const nextMode = _activeMediaState.mode === 'direct'
       ? (_activeMediaState.canRemux ? 'remux' : 'full')
@@ -1477,11 +1681,73 @@ function openMedia(fJson, type) {
   var src = mediaApiUrl(f, type);
   var isVid = isVideoFile(f);
   var extBadge = (_fileExt(f) || (isVid ? 'video' : 'audio')).toUpperCase();
+  var rates = [0.5, 0.75, 1, 1.1, 1.25, 1.5, 2];
+  var zooms = [
+    { val: 1, label: '100%' },
+    { val: 1.1, label: '110%' },
+    { val: 1.2, label: '120%' },
+    { val: 1.3, label: '130%' },
+  ];
+  var speedBtns = rates.map(r =>
+    `<button class="speed-btn ${Math.abs(_playbackRate - r) < 0.001 ? 'active' : ''}" data-rate="${r}" onclick="setPlaybackRate(${r})">${r}x</button>`
+  ).join('');
+  var hudSpeedBtns = rates.map(r =>
+    `<button class="hud-pill hud-speed-btn ${Math.abs(_playbackRate - r) < 0.001 ? 'active' : ''}" data-rate="${r}" onclick="event.stopPropagation();setPlaybackRate(${r})">${r}x</button>`
+  ).join('');
+  var zoomBtns = zooms.map(z =>
+    `<button class="zoom-btn ${Math.abs(_videoZoom - z.val) < 0.001 ? 'active' : ''}" data-zoom="${z.val}" onclick="setVideoZoom(${z.val})" title="Zoom ${z.label}">${z.label}</button>`
+  ).join('');
+  var hudZoomBtns = zooms.map(z =>
+    `<button class="hud-pill hud-zoom-btn ${Math.abs(_videoZoom - z.val) < 0.001 ? 'active' : ''}" data-zoom="${z.val}" onclick="event.stopPropagation();setVideoZoom(${z.val})" title="Fullscreen Zoom ${z.label}">${z.label}</button>`
+  ).join('');
+
   var mediaEl = isVid
-    ? '<video id="active-media-player" controls autoplay playsinline preload="auto" '
-        + 'style="width:100%;max-height:66vh;background:#000;'
-        + 'border-radius:var(--radius-md);display:block">'
-        + 'Your browser cannot play this video.</video>'
+    ? '<div id="video-stage-container" class="video-stage">'
+        + '<video id="active-media-player" autoplay playsinline preload="auto" '
+        +   'style="transform:scale(' + _videoZoom + ')" '
+        +   'onclick="toggleMediaPlayPause()" ondblclick="toggleVideoFullscreen()">'
+        +   'Your browser cannot play this video.</video>'
+        + '<div id="video-stage-hud" class="video-stage-hud" onclick="event.stopPropagation()">'
+        +   '<div style="display:flex;align-items:center;gap:var(--space-2)">'
+        +     '<span id="stage-time-current" style="font-family:var(--font-mono);font-size:11px;color:#fff;min-width:44px">0:00</span>'
+        +     '<input id="stage-timeline-slider" type="range" min="0" max="100" step="0.1" value="0" '
+        +       'style="flex:1;accent-color:var(--color-primary);cursor:pointer;height:5px" '
+        +       'oninput="onMediaTimelineScrubInput(this.value)" onchange="onMediaTimelineScrubChange(this.value)" title="Seek anywhere in video"/>'
+        +     '<span id="stage-time-total" style="font-family:var(--font-mono);font-size:11px;color:rgba(255,255,255,.78);min-width:44px;text-align:right">0:00</span>'
+        +   '</div>'
+        +   '<div class="video-hud-row">'
+        +     '<div class="video-hud-left">'
+        +       '<button class="hud-btn media-play-toggle-btn" onclick="toggleMediaPlayPause()" title="Play / Pause (Space)">'
+        +         '<svg data-lucide="pause" width="14" height="14"></svg>'
+        +       '</button>'
+        +       '<button class="hud-btn" onclick="skipMediaBy(-30)" title="Skip back 30 seconds (J or Shift+Left)">'
+        +         '<svg data-lucide="rotate-ccw" width="13" height="13"></svg> 30s'
+        +       '</button>'
+        +       '<button class="hud-btn" onclick="skipMediaBy(-10)" title="Skip back 10 seconds (Left Arrow)">'
+        +         '<svg data-lucide="rotate-ccw" width="13" height="13"></svg> 10s'
+        +       '</button>'
+        +       '<button class="hud-btn" onclick="skipMediaBy(10)" title="Skip forward 10 seconds (Right Arrow)">'
+        +         '10s <svg data-lucide="rotate-cw" width="13" height="13"></svg>'
+        +       '</button>'
+        +       '<button class="hud-btn" onclick="skipMediaBy(30)" title="Skip forward 30 seconds (L or Shift+Right)">'
+        +         '30s <svg data-lucide="rotate-cw" width="13" height="13"></svg>'
+        +       '</button>'
+        +       '<button class="hud-btn" id="stage-mute-btn" onclick="toggleMediaMute()" title="Mute / Unmute (M)">'
+        +         '<svg data-lucide="volume-2" width="14" height="14"></svg>'
+        +       '</button>'
+        +     '</div>'
+        +     '<div class="video-hud-right">'
+        +       '<span style="font-size:10px;color:rgba(255,255,255,.7);font-family:var(--font-mono)">Zoom</span>'
+        +       '<div class="hud-pill-group">' + hudZoomBtns + '</div>'
+        +       '<span style="font-size:10px;color:rgba(255,255,255,.7);font-family:var(--font-mono)">Speed</span>'
+        +       '<div class="hud-pill-group">' + hudSpeedBtns + '</div>'
+        +       '<button class="hud-btn fs-toggle-btn" onclick="toggleVideoFullscreen()" title="Fullscreen (F)">'
+        +         '<svg data-lucide="maximize" width="14" height="14"></svg>'
+        +       '</button>'
+        +     '</div>'
+        +   '</div>'
+        + '</div>'
+      + '</div>'
     : '<div style="display:flex;flex-direction:column;gap:var(--space-3);background:var(--color-surface-offset);padding:var(--space-4);border-radius:var(--radius-lg);border:1px solid var(--color-border)">'
         + '<div style="display:flex;align-items:center;gap:var(--space-3)">'
         +   '<div style="width:48px;height:48px;border-radius:var(--radius-md);background:var(--color-primary-highlight);color:var(--color-primary);display:flex;align-items:center;justify-content:center;flex-shrink:0">'
@@ -1496,12 +1762,8 @@ function openMedia(fJson, type) {
         +   'style="width:100%;display:block">'
         +   'Your browser cannot play this audio.</audio>'
       + '</div>';
-  var styleW = isVid ? 'max-width:860px' : 'max-width:560px';
+  var styleW = isVid ? 'max-width:900px' : 'max-width:560px';
   var fjEsc  = encodeFileArg(f);
-  var rates  = [0.5, 0.75, 1, 1.25, 1.5, 2];
-  var speedBtns = rates.map(r =>
-    `<button class="speed-btn ${_playbackRate === r ? 'active' : ''}" data-rate="${r}" onclick="setPlaybackRate(${r})">${r}x</button>`
-  ).join('');
 
   showModal(
     '<div class="modal-header">'
@@ -1518,12 +1780,31 @@ function openMedia(fJson, type) {
     +   '<div class="progress-track"><div id="media-stream-fill" class="progress-fill indeterminate"></div></div>'
     + '</div>'
     + mediaEl
-    + '<div id="media-timeline-bar" style="display:none;align-items:center;gap:var(--space-2);padding:6px 10px;background:var(--color-surface-offset);border:1px solid var(--color-border);border-radius:var(--radius-md)">'
-    +   '<span id="media-time-current" style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--color-text);min-width:46px">0:00</span>'
+    + '<div id="media-timeline-bar" style="display:flex;align-items:center;gap:var(--space-2);padding:6px 10px;background:var(--color-surface-offset);border:1px solid var(--color-border);border-radius:var(--radius-md)">'
+    +   '<button class="btn btn-secondary btn-sm media-play-toggle-btn" onclick="toggleMediaPlayPause()" title="Play / Pause (Space)" style="padding:4px 8px">'
+    +     '<svg data-lucide="pause" width="14" height="14"></svg>'
+    +   '</button>'
+    +   '<button class="btn btn-secondary btn-sm" onclick="skipMediaBy(-30)" title="Skip backward 30s (J or Shift+Left)" style="padding:4px 7px;font-family:var(--font-mono)">'
+    +     '<svg data-lucide="rotate-ccw" width="13" height="13"></svg> 30s'
+    +   '</button>'
+    +   '<button class="btn btn-secondary btn-sm" onclick="skipMediaBy(-10)" title="Skip backward 10s (Left Arrow)" style="padding:4px 7px;font-family:var(--font-mono)">'
+    +     '<svg data-lucide="rotate-ccw" width="13" height="13"></svg> 10s'
+    +   '</button>'
+    +   '<span id="media-time-current" style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--color-text);min-width:46px;text-align:center">0:00</span>'
     +   '<input id="media-timeline-slider" type="range" min="0" max="100" step="0.1" value="0" '
-    +     'style="flex:1;accent-color:var(--color-primary);cursor:pointer;height:6px" '
+    +     'style="flex:1;accent-color:var(--color-primary);cursor:pointer;height:6px;min-width:80px" '
     +     'oninput="onMediaTimelineScrubInput(this.value)" onchange="onMediaTimelineScrubChange(this.value)" title="Seek anywhere in full timeline"/>'
-    +   '<span id="media-time-total" style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--color-text-muted);min-width:46px;text-align:right">0:00</span>'
+    +   '<span id="media-time-total" style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--color-text-muted);min-width:46px;text-align:center">0:00</span>'
+    +   '<button class="btn btn-secondary btn-sm" onclick="skipMediaBy(10)" title="Skip forward 10s (Right Arrow)" style="padding:4px 7px;font-family:var(--font-mono)">'
+    +     '10s <svg data-lucide="rotate-cw" width="13" height="13"></svg>'
+    +   '</button>'
+    +   '<button class="btn btn-secondary btn-sm" onclick="skipMediaBy(30)" title="Skip forward 30s (L or Shift+Right)" style="padding:4px 7px;font-family:var(--font-mono)">'
+    +     '30s <svg data-lucide="rotate-cw" width="13" height="13"></svg>'
+    +   '</button>'
+    +   (isVid
+          ? '<button class="btn btn-secondary btn-sm fs-toggle-btn" onclick="toggleVideoFullscreen()" title="Fullscreen (F)" style="padding:4px 8px">'
+            + '<svg data-lucide="maximize" width="14" height="14"></svg></button>'
+          : '')
     + '</div>'
     + '<div class="media-controls-bar">'
     +   '<div class="media-nav-group">'
@@ -1535,12 +1816,16 @@ function openMedia(fJson, type) {
     +       'Next <svg data-lucide="skip-forward" width="14" height="14"></svg>'
     +     '</button>'
     +     (_mediaPlaylist.length > 1
-            ? '<label style="display:inline-flex;align-items:center;gap:4px;font-size:var(--text-xs);color:var(--color-text-muted);margin-left:var(--space-2);cursor:pointer">'
+            ? '<label style="display:inline-flex;align-items:center;gap:4px;font-size:var(--text-xs);color:var(--color-text-muted);margin-left:var(--space-1);cursor:pointer">'
               + '<input type="checkbox" ' + (_autoPlayNext ? 'checked' : '') + ' onchange="toggleAutoNext(this)" style="accent-color:var(--color-primary)"/> Auto-next</label>'
             : '')
     +   '</div>'
     +   '<div style="display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap">'
     +     '<select id="media-audio-track-select" class="form-input" style="display:none;width:auto;padding:2px 8px;font-size:var(--text-xs);height:26px" onchange="changeMediaAudioTrack(this.value)" title="Audio track"></select>'
+    +     (isVid
+            ? '<span style="font-size:var(--text-xs);color:var(--color-text-muted)">Zoom</span>'
+              + '<div class="zoom-group">' + zoomBtns + '</div>'
+            : '')
     +     '<span style="font-size:var(--text-xs);color:var(--color-text-muted)">Speed</span>'
     +     '<div class="speed-group">' + speedBtns + '</div>'
     +   '</div>'
@@ -1565,6 +1850,7 @@ function openMedia(fJson, type) {
   lucide.createIcons();
 
   const player = document.getElementById('active-media-player');
+  const stageContainer = document.getElementById('video-stage-container');
   const statusWrap = document.getElementById('media-stream-status');
   const statusText = document.getElementById('media-stream-text');
   const statusPct = document.getElementById('media-stream-pct');
@@ -1575,10 +1861,33 @@ function openMedia(fJson, type) {
   const trackSelect = document.getElementById('media-audio-track-select');
   const timelineBar = document.getElementById('media-timeline-bar');
   const timelineSlider = document.getElementById('media-timeline-slider');
+  const stageSlider = document.getElementById('stage-timeline-slider');
   const timeCurrentEl = document.getElementById('media-time-current');
+  const stageTimeCurrentEl = document.getElementById('stage-time-current');
   const timeTotalEl = document.getElementById('media-time-total');
+  const stageTimeTotalEl = document.getElementById('stage-time-total');
 
   if (!player) return;
+
+  if (stageContainer) {
+    const wakeHud = () => {
+      stageContainer.classList.remove('hud-hidden');
+      if (_hudIdleTimer) clearTimeout(_hudIdleTimer);
+      _hudIdleTimer = setTimeout(() => {
+        if (player && !player.paused && !_activeMediaState?.isScrubbing) {
+          stageContainer.classList.add('hud-hidden');
+        }
+      }, 2600);
+    };
+    stageContainer.addEventListener('mousemove', wakeHud);
+    stageContainer.addEventListener('touchstart', wakeHud, { passive: true });
+    stageContainer.addEventListener('mouseleave', () => {
+      if (player && !player.paused && !_activeMediaState?.isScrubbing && !document.fullscreenElement) {
+        stageContainer.classList.add('hud-hidden');
+      }
+    });
+    wakeHud();
+  }
 
   const state = {
     f,
@@ -1591,6 +1900,8 @@ function openMedia(fJson, type) {
     probeInfo: null,
     totalDuration: 0,
     seekOffset: 0,
+    pendingSeekTarget: null,
+    skipDebounceTimer: null,
     isScrubbing: false,
     ignoreNextSeeking: false,
     triedFallback: false,
@@ -1609,16 +1920,24 @@ function openMedia(fJson, type) {
     if (effTotal > 0) {
       state.totalDuration = effTotal;
       if (timelineBar) timelineBar.style.display = 'flex';
-      if (timelineSlider) timelineSlider.max = String(Math.ceil(effTotal * 10) / 10);
-      if (timeTotalEl) timeTotalEl.textContent = fmtMediaTime(effTotal);
+      const maxStr = String(Math.ceil(effTotal * 10) / 10);
+      const totFmt = fmtMediaTime(effTotal);
+      if (timelineSlider) timelineSlider.max = maxStr;
+      if (stageSlider) stageSlider.max = maxStr;
+      if (timeTotalEl) timeTotalEl.textContent = totFmt;
+      if (stageTimeTotalEl) stageTimeTotalEl.textContent = totFmt;
     }
-    if (!state.isScrubbing) {
+    if (!state.isScrubbing && state.pendingSeekTarget === null) {
       const curPos = Math.min(
         effTotal || Infinity,
         Math.max(0, state.seekOffset + (Number.isFinite(player.currentTime) ? player.currentTime : 0))
       );
-      if (timelineSlider) timelineSlider.value = String(Math.round(curPos * 10) / 10);
-      if (timeCurrentEl) timeCurrentEl.textContent = fmtMediaTime(curPos);
+      const valStr = String(Math.round(curPos * 10) / 10);
+      const curFmt = fmtMediaTime(curPos);
+      if (timelineSlider) timelineSlider.value = valStr;
+      if (stageSlider) stageSlider.value = valStr;
+      if (timeCurrentEl) timeCurrentEl.textContent = curFmt;
+      if (stageTimeCurrentEl) stageTimeCurrentEl.textContent = curFmt;
     }
   }
 
@@ -1667,12 +1986,12 @@ function openMedia(fJson, type) {
       statusFill.classList.add('indeterminate');
       const seekLabel = state.seekOffset > 0 ? ` at ${fmtMediaTime(state.seekOffset)}` : '';
       if (newMode === 'remux') {
-        const acName = (state.probeInfo && state.probeInfo.audio_codec) ? state.probeInfo.audio_codec.toUpperCase() : 'surround/unsupported';
-        statusText.textContent = `Converting ${acName} audio to stereo AAC${seekLabel}…`;
+        const acName = (state.probeInfo && state.probeInfo.audio_codec) ? state.probeInfo.audio_codec.toUpperCase() : 'audio';
+        statusText.textContent = `Streaming ${acName} → AAC${seekLabel}…`;
       } else if (newMode === 'full') {
-        statusText.textContent = `Transcoding video & audio for browser playback${seekLabel}…`;
+        statusText.textContent = `Transcoding video & audio${seekLabel}…`;
       } else if (newMode === 'audio') {
-        statusText.textContent = `Transcoding audio stream to stereo MP3${seekLabel}…`;
+        statusText.textContent = `Transcoding audio stream${seekLabel}…`;
       } else {
         statusText.textContent = 'Connecting to media stream…';
       }
@@ -1681,12 +2000,13 @@ function openMedia(fJson, type) {
     let targetUrl = src;
     const durParam = state.totalDuration > 0 ? `&duration=${encodeURIComponent(state.totalDuration.toFixed(2))}` : '';
     const ssParam = state.seekOffset > 0 ? `&ss=${encodeURIComponent(state.seekOffset.toFixed(2))}` : '';
+    const cacheBust = `&_t=${Date.now()}`;
     if (newMode === 'remux') {
-      targetUrl = `${src}&transcode=1&mode=remux&audio_track=${state.audioTrack}${durParam}${ssParam}`;
+      targetUrl = `${src}&transcode=1&mode=remux&audio_track=${state.audioTrack}${durParam}${ssParam}${cacheBust}`;
     } else if (newMode === 'full') {
-      targetUrl = `${src}&transcode=1&mode=full&audio_track=${state.audioTrack}${durParam}${ssParam}`;
+      targetUrl = `${src}&transcode=1&mode=full&audio_track=${state.audioTrack}${durParam}${ssParam}${cacheBust}`;
     } else if (newMode === 'audio') {
-      targetUrl = `${src}&transcode=audio${durParam}${ssParam}`;
+      targetUrl = `${src}&transcode=audio${durParam}${ssParam}${cacheBust}`;
     }
 
     state.ignoreNextSeeking = true;
@@ -1706,11 +2026,17 @@ function openMedia(fJson, type) {
 
   function seekTo(targetSec) {
     if (_activeMediaState !== state) return;
+    if (state.skipDebounceTimer) {
+      clearTimeout(state.skipDebounceTimer);
+      state.skipDebounceTimer = null;
+    }
+    state.pendingSeekTarget = null;
+
     const clamped = state.totalDuration > 0
       ? Math.max(0, Math.min(state.totalDuration - 0.5, targetSec))
       : Math.max(0, targetSec);
 
-    if (state.mode === 'direct' || _activeMediaBlobUrl) {
+    if (_activeMediaBlobUrl) {
       state.seekOffset = 0;
       state.ignoreNextSeeking = true;
       try { player.currentTime = clamped; } catch (_) {}
@@ -1718,26 +2044,39 @@ function openMedia(fJson, type) {
       return;
     }
 
-    let bufEnd = 0;
-    try {
-      if (player.buffered && player.buffered.length > 0) {
-        bufEnd = player.buffered.end(player.buffered.length - 1);
-      }
-    } catch (_) {}
+    if (state.mode === 'direct') {
+      let canNativeSeek = false;
+      try {
+        if (player.seekable && player.seekable.length > 0) {
+          const seekEnd = player.seekable.end(player.seekable.length - 1);
+          if (clamped <= seekEnd + 1) canNativeSeek = true;
+        }
+      } catch (_) {}
 
-    const relTarget = clamped - state.seekOffset;
-    if (relTarget >= 0 && bufEnd > 1 && relTarget <= bufEnd - 0.5) {
-      state.ignoreNextSeeking = true;
-      try { player.currentTime = relTarget; } catch (_) {}
-      syncTimelineUi();
+      if (canNativeSeek) {
+        state.seekOffset = 0;
+        state.ignoreNextSeeking = true;
+        try { player.currentTime = clamped; } catch (_) {}
+        syncTimelineUi();
+        return;
+      }
+      // If direct stream does not support byte-range seeking to target, switch to remux/full at target
+      const fallbackMode = state.isVid ? (state.canRemux ? 'remux' : 'full') : 'audio';
+      switchMode(fallbackMode, true, clamped);
       return;
     }
 
+    // In remux / full / audio transcode mode, always perform a server-side ?ss= seek
     switchMode(state.mode, true, clamped);
   }
   state.seekTo = seekTo;
 
   player.playbackRate = _playbackRate;
+  player.onplay = () => updatePlayPauseIcons();
+  player.onpause = () => {
+    updatePlayPauseIcons();
+    if (stageContainer) stageContainer.classList.remove('hud-hidden');
+  };
   player.onloadedmetadata = () => {
     player.playbackRate = _playbackRate;
     syncTimelineUi();
@@ -1752,12 +2091,14 @@ function openMedia(fJson, type) {
     state.ignoreNextSeeking = false;
     if (statusWrap) statusWrap.style.display = 'none';
     syncTimelineUi();
+    updatePlayPauseIcons();
   };
   player.oncanplay = () => {
     player.playbackRate = _playbackRate;
     state.ignoreNextSeeking = false;
     if (statusWrap) statusWrap.style.display = 'none';
     syncTimelineUi();
+    updatePlayPauseIcons();
   };
   player.onwaiting = () => {
     if (statusWrap && !_activeMediaBlobUrl) {
@@ -1770,31 +2111,12 @@ function openMedia(fJson, type) {
     state.ignoreNextSeeking = false;
     if (statusWrap) statusWrap.style.display = 'none';
     syncTimelineUi();
-  };
-  player.onseeking = () => {
-    if (_activeMediaState !== state) return;
-    if (state.ignoreNextSeeking) {
-      state.ignoreNextSeeking = false;
-      return;
-    }
-    if (state.mode !== 'direct' && !_activeMediaBlobUrl) {
-      let bufEnd = 0;
-      try {
-        if (player.buffered && player.buffered.length > 0) {
-          bufEnd = player.buffered.end(player.buffered.length - 1);
-        }
-      } catch (_) {}
-      const wantedRel = player.currentTime || 0;
-      if (wantedRel > bufEnd + 1.0 && state.totalDuration > 0) {
-        const absTarget = Math.min(state.totalDuration - 0.5, state.seekOffset + wantedRel);
-        switchMode(state.mode, true, absTarget);
-      }
-    }
+    updatePlayPauseIcons();
   };
   player.onended = () => {
+    updatePlayPauseIcons();
     const absPos = state.seekOffset + (Number.isFinite(player.currentTime) ? player.currentTime : 0);
     if (state.mode !== 'direct' && state.totalDuration > 0 && absPos < state.totalDuration - 5) {
-      // Stream stopped before reaching actual end of file: automatically resume at current position
       switchMode(state.mode, false, absPos);
       return;
     }
@@ -1812,7 +2134,6 @@ function openMedia(fJson, type) {
     if (player.currentTime < 1.5) return;
     state.silentCheckDone = true;
 
-    // If ffprobe already verified the audio codec is natively supported by browsers, do not override direct mode
     if (state.probeInfo && state.probeInfo.has_audio && !state.probeInfo.needs_audio_transcode && state.probeInfo.audio_codec) {
       return;
     }
@@ -1902,7 +2223,7 @@ function openMedia(fJson, type) {
           switchMode('full', false, 0);
           return;
         }
-        if (probe.needs_audio_transcode || probe.recommended_mode === 'remux') {
+        if (probe.needs_audio_transcode || probe.recommended_mode === 'remux' || ext === 'mkv') {
           switchMode(state.canRemux ? 'remux' : 'full', false, 0);
           return;
         }
@@ -1910,7 +2231,7 @@ function openMedia(fJson, type) {
           switchMode('full', false, 0);
           return;
         }
-      } else if (['avi', 'wmv', 'flv', 'ts', 'm2ts', 'mpg', 'mpeg', 'vob', 'divx'].includes(ext)) {
+      } else if (['mkv', 'avi', 'wmv', 'flv', 'ts', 'm2ts', 'mpg', 'mpeg', 'vob', 'divx'].includes(ext)) {
         switchMode('full', false, 0);
         return;
       }

@@ -622,7 +622,7 @@ function probeMediaItem(item) {
 
       const is10BitH264 = videoCodec === 'h264' && /(10le|10be|12le|12be)$/.test(videoPixFmt);
       const needsVideoTranscode = hasVideo && (!['h264', 'hevc', 'vp8', 'vp9', 'av1'].includes(videoCodec) || is10BitH264);
-      const nonNativeContainer = ['avi', 'wmv', 'flv', 'ts', 'm2ts', 'mpg', 'mpeg', 'vob', 'divx'].includes(ext);
+      const nonNativeContainer = ['mkv', 'avi', 'wmv', 'flv', 'ts', 'm2ts', 'mpg', 'mpeg', 'vob', 'divx'].includes(ext);
       const canRemuxVideo = hasVideo && ['h264', 'hevc'].includes(videoCodec) && !is10BitH264;
 
       let recommendedMode = 'direct';
@@ -757,7 +757,10 @@ async function streamFileResponse(req, res, item) {
     });
 
     const args = ['-hide_banner', '-loglevel', 'error'];
-    if (startTime > 0) args.push('-ss', String(startTime));
+    if (startTime > 0) {
+      if (mode === 'remux') args.push('-noaccurate_seek');
+      args.push('-ss', String(startTime));
+    }
     args.push('-i', blobPath, '-map', '0:V:0', '-map', `0:a:${audioTrack}?`, '-sn', '-dn');
     if (mode === 'remux') {
       const vtag = probeInfo.video_codec === 'hevc' ? 'hvc1' : 'avc1';
@@ -768,8 +771,9 @@ async function streamFileResponse(req, res, item) {
         '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p'
       );
     }
+    const afFilter = (mode === 'remux' && startTime > 0) ? 'aresample=async=1' : 'aresample=async=1:first_pts=0';
     args.push(
-      '-af', 'aresample=async=1:first_pts=0',
+      '-af', afFilter,
       '-c:a', 'aac', '-ac', '2', '-ar', '48000', '-b:a', '192k',
       '-avoid_negative_ts', 'make_zero',
       '-movflags', 'frag_keyframe+empty_moov+default_base_moof',

@@ -46,6 +46,7 @@ Repository: [https://github.com/Sage222/SageDrive2](https://github.com/Sage222/S
 - **Image Gallery & Document Viewer:** Inline high-resolution image lightbox with next/prev navigation, plus inline preview/editor for PDFs and text/code/markdown/config files.
 
 ### Security & Authentication
+- **Default Read-Only Login & PIN-Protected Administrator Mode:** Every new login session starts in **Read-Only Mode** by default—allowing safe browsing, media streaming, viewing, and downloading while hiding and blocking write/destructive actions (Upload, New Folder, Rename, Move, Copy, Delete, Edit Text, and Drive/Share changes). Users can unlock **Administrator Functions** in **Settings** (or by clicking the `Read-Only` status badge) by entering the Administrator PIN (`0022`, configurable via `ADMIN_PIN`).
 - **Anti-Hammering Login Lockout:** Protects against brute-force attacks by tracking failed login attempts. After **5 consecutive failed login attempts**, the account is automatically locked out for **15 minutes** with a live countdown timer on the sign-in screen.
 - **Path Traversal Guard:** All SMB file and directory operations strictly normalize paths and reject `..` traversal segments and null bytes.
 - **Hardened Session Management:** Username/password authentication with `bcrypt` hashed passwords, `HttpOnly` + `SameSite=Lax` session cookies, Bearer token sessions, full session revocation on logout, and configurable session TTL.

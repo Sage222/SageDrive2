@@ -58,7 +58,7 @@ def login_with_status(username, password):
             user["locked_until"] = 0
             _save_users(users)
         token = secrets.token_hex(32)
-        SESSIONS[token] = {"username": uname, "role": user["role"], "expires": now + SESSION_TTL}
+        SESSIONS[token] = {"username": uname, "role": user["role"], "admin_enabled": False, "expires": now + SESSION_TTL}
         return token, None, 200, {"locked": False, "attempts_remaining": MAX_FAILED_ATTEMPTS}
 
     fails = int(record.get("failed_attempts", 0) or 0) + 1
@@ -93,6 +93,23 @@ def get_session(token):
 
 VALID_THEMES = {"obsidian", "midnight", "amethyst", "emerald", "ember"}
 DEFAULT_THEME = "obsidian"
+ADMIN_PIN = os.environ.get("ADMIN_PIN", "0022")
+
+def is_admin_enabled(token):
+    s = get_session(token)
+    return bool(s and s.get("admin_enabled", False))
+
+def set_admin_mode(token, enabled, pin=""):
+    s = get_session(token)
+    if not s:
+        raise PermissionError("Unauthorised")
+    if enabled:
+        if str(pin or "").strip() != ADMIN_PIN:
+            raise ValueError("Invalid Administrator PIN")
+        s["admin_enabled"] = True
+    else:
+        s["admin_enabled"] = False
+    return bool(s["admin_enabled"])
 
 def get_user_theme(username):
     users = _load_users()
@@ -117,16 +134,33 @@ def set_user_theme(username, theme):
             sess["theme"] = clean_theme
     return clean_theme
 
+def _extract_request_token():
+    token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    if not token:
+        token = request.args.get("token", "").strip()
+    if not token:
+        token = request.cookies.get("sd_token", "")
+    return token
+
 def require_auth(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
-        token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-        if not token:
-            token = request.args.get("token", "").strip()
-        if not token:
-            token = request.cookies.get("sd_token", "")
+        token = _extract_request_token()
         if not get_session(token):
             return jsonify({"error": "Unauthorised"}), 401
         return f(*args, **kwargs)
     return wrapper
+
+def require_admin(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        token = _extract_request_token()
+        s = get_session(token)
+        if not s:
+            return jsonify({"error": "Unauthorised"}), 401
+        if not s.get("admin_enabled", False):
+            return jsonify({"error": "Read-Only Mode is active. Enable Administrator Functions in Settings (PIN required)."}), 403
+        return f(*args, **kwargs)
+    return wrapper
+
 

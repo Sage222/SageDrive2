@@ -456,6 +456,11 @@
     .settings-tab.active{background:var(--color-primary);color:#090d11;font-weight:600}
     .settings-grid{display:grid;gap:var(--space-5)}
     .settings-two-col{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:var(--space-5);align-items:start}
+    .admin-mode-banner{background:var(--color-surface);border:1px solid var(--color-border);
+                       border-radius:var(--radius-lg);padding:var(--space-4) var(--space-5);
+                       display:flex;align-items:center;justify-content:space-between;gap:var(--space-4);flex-wrap:wrap}
+    .admin-mode-banner.unlocked{border-color:var(--color-primary);box-shadow:0 0 0 1px color-mix(in oklab, var(--color-primary) 35%, transparent)}
+    .pin-input{font-family:var(--font-mono);font-size:var(--text-lg);letter-spacing:0.35em;text-align:center;font-weight:700}
     .share-list{display:flex;flex-direction:column;gap:var(--space-3)}
     .share-item{background:var(--color-surface-2);border:1px solid var(--color-border);
                 border-radius:var(--radius-lg);padding:var(--space-3) var(--space-4);
@@ -600,7 +605,7 @@
     <div style="flex:1;padding:var(--space-3) 0">
       <div class="sidebar-section">
         <span>Drives</span>
-        <button class="sidebar-section-btn" onclick="setView('settings')" title="Add or manage drives in Settings">
+        <button class="sidebar-section-btn" id="sidebar-add-drive-btn" onclick="setView('settings')" title="Add or manage drives in Settings" style="display:none">
           <svg data-lucide="plus" width="13" height="13"></svg>
         </button>
       </div>
@@ -613,9 +618,17 @@
     </div>
 
     <div class="sidebar-footer">
-      <div style="display:flex;align-items:center;justify-content:space-between">
-        <span id="sidebar-user" style="font-size:var(--text-sm);color:var(--color-text-muted)"></span>
-        <div style="display:flex;gap:var(--space-1)">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:var(--space-2)">
+        <div style="display:flex;align-items:center;gap:var(--space-2);min-width:0;overflow:hidden">
+          <span id="sidebar-user" style="font-size:var(--text-sm);color:var(--color-text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+          <button type="button" id="sidebar-mode-badge" class="badge badge-primary"
+                  onclick="onClickSidebarModeBadge()"
+                  style="cursor:pointer;border:none;font-size:10px;padding:2px 6px"
+                  title="Click to manage Administrator Functions in Settings">
+            Read-Only
+          </button>
+        </div>
+        <div style="display:flex;gap:var(--space-1);flex-shrink:0">
           <button class="btn-ghost btn-icon btn" onclick="cycleTheme()" title="Switch dark theme" aria-label="Switch dark theme">
             <svg data-lucide="palette"></svg>
           </button>
@@ -650,6 +663,7 @@
 const API = '';
 let _token = sessionStorage.getItem('sd_token') || null;
 let _user  = null;
+let _adminMode = false;
 let _view  = 'welcome';
 let _activeDrive = null;
 let _path  = '/';
@@ -828,6 +842,7 @@ document.getElementById('login-form').addEventListener('submit', async e => {
       }
     });
     _token = data.token;
+    _adminMode = false;
     sessionStorage.setItem('sd_token', _token);
     if (data.theme) applyTheme(data.theme, true);
     await initApp();
@@ -880,9 +895,149 @@ document.getElementById('login-form').addEventListener('submit', async e => {
 async function doLogout() {
   try { await apiFetch('/api/auth/logout', {method:'POST'}); } catch(_){}
   _token = null;
+  _user = null;
+  _adminMode = false;
   sessionStorage.removeItem('sd_token');
   document.getElementById('app').style.display = 'none';
   document.getElementById('login-screen').style.display = 'flex';
+}
+
+function updateAdminModeBadgeUI() {
+  const badge = document.getElementById('sidebar-mode-badge');
+  if (badge) {
+    badge.textContent = _adminMode ? 'Admin' : 'Read-Only';
+    badge.className = `badge ${_adminMode ? 'badge-success' : 'badge-primary'}`;
+    badge.title = _adminMode
+      ? 'Administrator Functions Enabled (click to lock or manage in Settings)'
+      : 'Read-Only Mode Active (click to unlock Administrator Functions with PIN)';
+  }
+  const addBtn = document.getElementById('sidebar-add-drive-btn');
+  if (addBtn) {
+    addBtn.style.display = _adminMode ? 'inline-flex' : 'none';
+  }
+}
+
+function onClickSidebarModeBadge() {
+  if (_adminMode) {
+    setView('settings', 'system');
+  } else {
+    showAdminPinModal();
+  }
+}
+
+function requireAdminFrontend(actionLabel = 'perform this action') {
+  if (_adminMode) return true;
+  toast(`Read-Only Mode is active. Enter the Administrator PIN in Settings to ${actionLabel}.`, 'error');
+  showAdminPinModal();
+  return false;
+}
+
+function showAdminPinModal() {
+  showModal(`
+    <div class="modal-header">
+      <div style="display:flex;align-items:center;gap:var(--space-2)">
+        <svg data-lucide="shield-alert" width="18" height="18" style="color:var(--color-primary)"></svg>
+        <span class="modal-title">Enable Administrator Functions</span>
+      </div>
+      <button class="btn btn-ghost btn-icon" onclick="closeModal()">
+        <svg data-lucide="x" width="16" height="16"></svg></button>
+    </div>
+    <div class="modal-body">
+      <p style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.5">
+        Sessions start in <strong>Read-Only Mode</strong> by default. Enter the 4-digit Administrator PIN to unlock file &amp; folder write actions (Move, Delete, Upload, Copy, New Folder, Rename, Edit Files, and Drive Management).
+      </p>
+      <div class="form-group">
+        <label class="form-label" for="admin-pin-input">Administrator PIN</label>
+        <input class="form-input pin-input" id="admin-pin-input" type="password" inputmode="numeric" maxlength="8"
+               placeholder="••••" autocomplete="off"
+               onkeydown="if(event.key==='Enter'){event.preventDefault();submitAdminPinModal()}" />
+      </div>
+      <div id="admin-pin-error" style="display:none;color:var(--color-error);font-size:var(--text-xs)"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal();if(_view==='settings')renderSettings();">Cancel</button>
+      <button class="btn btn-primary" id="admin-pin-submit-btn" onclick="submitAdminPinModal()">
+        <svg data-lucide="unlock" width="14" height="14"></svg> Unlock Administrator Mode
+      </button>
+    </div>
+  `, 'max-width:420px');
+  lucide.createIcons();
+  setTimeout(() => document.getElementById('admin-pin-input')?.focus(), 40);
+}
+
+async function submitAdminPinModal() {
+  const inp = document.getElementById('admin-pin-input');
+  const errEl = document.getElementById('admin-pin-error');
+  const btn = document.getElementById('admin-pin-submit-btn');
+  const pin = (inp ? inp.value : '').trim();
+  if (!pin) {
+    if (errEl) {
+      errEl.textContent = 'Please enter the Administrator PIN.';
+      errEl.style.display = 'block';
+    }
+    return;
+  }
+  if (btn) btn.disabled = true;
+  if (errEl) errEl.style.display = 'none';
+  try {
+    const res = await apiJSON('/api/auth/admin-mode', {
+      method: 'POST',
+      json: { enabled: true, pin }
+    });
+    _adminMode = Boolean(res.admin_enabled);
+    if (_user) _user.admin_enabled = _adminMode;
+    updateAdminModeBadgeUI();
+    closeModal();
+    toast('Administrator Functions enabled', 'success');
+    refreshCurrentViewAfterAdminToggle();
+  } catch (e) {
+    if (errEl) {
+      errEl.textContent = e.message || 'Invalid Administrator PIN';
+      errEl.style.display = 'block';
+    }
+    if (inp) {
+      inp.value = '';
+      inp.focus();
+    }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function disableAdminMode() {
+  try {
+    const res = await apiJSON('/api/auth/admin-mode', {
+      method: 'POST',
+      json: { enabled: false }
+    });
+    _adminMode = Boolean(res.admin_enabled);
+    if (_user) _user.admin_enabled = _adminMode;
+    updateAdminModeBadgeUI();
+    toast('Administrator Functions disabled (Read-Only Mode active)', 'success');
+    refreshCurrentViewAfterAdminToggle();
+  } catch (e) {
+    toast('Failed to update Administrator Mode: ' + e.message, 'error');
+  }
+}
+
+function onToggleAdminModeSetting(checked) {
+  if (checked) {
+    showAdminPinModal();
+  } else {
+    disableAdminMode();
+  }
+}
+
+function refreshCurrentViewAfterAdminToggle() {
+  renderSidebar();
+  if (_view === 'settings') {
+    renderSettings();
+  } else if (_view === 'files' && _activeDrive) {
+    setTopbarActions(fileToolbar(_activeDrive.type));
+    renderFileView(_currentFiles, _activeDrive.type, true);
+  } else if (_view === 'welcome') {
+    renderWelcome();
+  }
 }
 
 async function initApp() {
@@ -890,11 +1045,13 @@ async function initApp() {
     _user = await apiJSON('/api/auth/me');
   } catch(_) { doLogout(); return; }
 
+  _adminMode = Boolean(_user && _user.admin_enabled);
   if (_user && _user.theme) {
     applyTheme(_user.theme, true);
   }
 
   document.getElementById('sidebar-user').textContent = _user.username;
+  updateAdminModeBadgeUI();
   document.getElementById('login-screen').style.display = 'none';
   document.getElementById('app').style.display = 'flex';
 
@@ -1193,6 +1350,7 @@ function updateBatchBar() {
         <button class="btn btn-secondary btn-sm" onclick="downloadSelectedZip('${type}')">
           <svg data-lucide="archive" width="14" height="14"></svg> Download ZIP
         </button>
+        ${_adminMode ? `
         <button class="btn btn-secondary btn-sm" onclick="showTransferModal('${type}', null, 'copy')">
           <svg data-lucide="copy" width="14" height="14"></svg> Copy to…
         </button>
@@ -1202,6 +1360,7 @@ function updateBatchBar() {
         <button class="btn btn-danger btn-sm" onclick="deleteSelectedItems('${type}')">
           <svg data-lucide="trash-2" width="14" height="14"></svg> Delete Selected
         </button>
+        ` : ''}
         <button class="btn btn-ghost btn-sm" onclick="clearSelection()">
           <svg data-lucide="x" width="14" height="14"></svg> Clear
         </button>
@@ -1289,10 +1448,12 @@ function renderFileListHeader(type) {
     </div>
     <div class="file-actions" style="opacity:0;pointer-events:none">
       <button class="btn btn-ghost btn-icon btn-sm"><svg data-lucide="download" width="14" height="14"></svg></button>
+      ${_adminMode ? `
       <button class="btn btn-ghost btn-icon btn-sm"><svg data-lucide="edit-3" width="14" height="14"></svg></button>
       <button class="btn btn-ghost btn-icon btn-sm"><svg data-lucide="copy" width="14" height="14"></svg></button>
       <button class="btn btn-ghost btn-icon btn-sm"><svg data-lucide="folder-output" width="14" height="14"></svg></button>
       <button class="btn btn-danger btn-icon btn-sm"><svg data-lucide="trash-2" width="14" height="14"></svg></button>
+      ` : ''}
     </div>
     <button class="btn btn-ghost btn-icon btn-sm file-more-btn" style="opacity:0;pointer-events:none">
       <svg data-lucide="more-vertical" width="16" height="16"></svg>
@@ -1310,7 +1471,7 @@ function renderFileView(files, type, keepSelection = false) {
       <div class="empty-state">
         <svg data-lucide="folder-open" width="48" height="48"></svg>
         <h3>Empty folder</h3>
-        <p>Upload files or folders, or create a new folder to get started.</p>
+        <p>${_adminMode ? 'Upload files or folders, or create a new folder to get started.' : 'This folder is empty. (Enable Administrator Functions in Settings to upload or create folders.)'}</p>
       </div>`;
     lucide.createIcons(); return;
   }
@@ -1420,6 +1581,7 @@ function fileCardList(f, type) {
     <div class="file-actions" onclick="event.stopPropagation()">
       <button class="btn btn-ghost btn-icon btn-sm" onclick="dlFile('${fj}','${type}')" title="${f.type==='folder'?'Download ZIP':'Download'}">
         <svg data-lucide="download" width="14" height="14"></svg></button>
+      ${_adminMode ? `
       <button class="btn btn-ghost btn-icon btn-sm" onclick="showRenameModal('${fj}','${type}')" title="Rename">
         <svg data-lucide="edit-3" width="14" height="14"></svg></button>
       <button class="btn btn-ghost btn-icon btn-sm" onclick="showTransferModal('${type}','${fj}','copy')" title="Copy to…">
@@ -1428,6 +1590,7 @@ function fileCardList(f, type) {
         <svg data-lucide="folder-output" width="14" height="14"></svg></button>
       <button class="btn btn-danger btn-icon btn-sm" onclick="rmFile('${fj}','${type}')" title="Delete">
         <svg data-lucide="trash-2" width="14" height="14"></svg></button>
+      ` : ''}
     </div>
     <button class="btn btn-ghost btn-icon btn-sm file-more-btn"
             onclick="event.stopPropagation();openContextMenu(event,'${fj}','${type}')" title="More actions">
@@ -2729,6 +2892,10 @@ function updateEditorStats() {
 }
 
 function toggleTextEditorMode(forceEdit = null) {
+  if (!_adminMode) {
+    requireAdminFrontend('edit files');
+    return;
+  }
   const ta = document.getElementById('text-editor-area');
   const pre = document.getElementById('text-preview-box');
   const toggleBtn = document.getElementById('text-editor-mode-btn');
@@ -2783,6 +2950,7 @@ function handleEditorKeydown(e, fJson, type) {
 }
 
 async function saveEditedTextFile(fJson, type) {
+  if (!requireAdminFrontend('save file changes')) return;
   const f = parseFileArg(fJson);
   const ta = document.getElementById('text-editor-area');
   const saveBtn = document.getElementById('text-editor-save-btn');
@@ -2836,6 +3004,7 @@ async function saveEditedTextFile(fJson, type) {
 
 async function openBrowserPreview(fJson, type, startInEditMode = false) {
   cleanupActiveMedia();
+  if (!_adminMode) startInEditMode = false;
   const f = parseFileArg(fJson);
   const src = mediaApiUrl(f, type);
   const fjEsc = encodeFileArg(f);
@@ -2877,7 +3046,7 @@ async function openBrowserPreview(fJson, type, startInEditMode = false) {
       file: f,
       type,
       originalContent: '',
-      isEditing: Boolean(startInEditMode),
+      isEditing: Boolean(startInEditMode && _adminMode),
       wordWrap: true,
       dirty: false,
     };
@@ -2892,10 +3061,12 @@ async function openBrowserPreview(fJson, type, startInEditMode = false) {
           <button class="btn btn-secondary btn-sm active" id="text-editor-wrap-btn" onclick="toggleEditorWordWrap()" title="Toggle Word Wrap">
             <svg data-lucide="wrap-text" width="14" height="14"></svg> Wrap
           </button>
+          ${_adminMode ? `
           <button class="btn btn-secondary btn-sm" id="text-editor-mode-btn" onclick="toggleTextEditorMode()">
             <svg data-lucide="${startInEditMode ? 'eye' : 'edit-3'}" width="14" height="14"></svg>
             ${startInEditMode ? 'Preview' : 'Edit File'}
           </button>
+          ` : ''}
           <button class="btn btn-ghost btn-icon" onclick="if(!_editorState.dirty || confirm('Discard unsaved changes?')) closeModal()" title="Close">
             <svg data-lucide="x" width="18" height="18"></svg>
           </button>
@@ -2911,12 +3082,14 @@ async function openBrowserPreview(fJson, type, startInEditMode = false) {
         <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:var(--space-2)">
           <div style="display:flex;align-items:center;gap:var(--space-3);flex-wrap:wrap">
             <span id="text-editor-stats" style="font-size:var(--text-xs);color:var(--color-text-muted);font-family:var(--font-mono)">${fmtSize(f.size)}</span>
-            <span style="font-size:11px;color:var(--color-text-faint)">Tip: Press <kbd style="font-family:var(--font-mono)">Ctrl+S</kbd> to save while editing</span>
+            ${_adminMode ? `<span style="font-size:11px;color:var(--color-text-faint)">Tip: Press <kbd style="font-family:var(--font-mono)">Ctrl+S</kbd> to save while editing</span>` : `<span style="font-size:11px;color:var(--color-text-faint)">Read-Only Preview</span>`}
           </div>
           <div style="display:flex;gap:var(--space-2);flex-wrap:wrap">
+            ${_adminMode ? `
             <button class="btn btn-primary btn-sm" id="text-editor-save-btn" onclick="saveEditedTextFile('${fjEsc}','${type}')" style="display:${startInEditMode ? 'inline-flex' : 'none'}">
               <svg data-lucide="save" width="14" height="14"></svg> Save Changes
             </button>
+            ` : ''}
             <a class="btn btn-secondary btn-sm" href="${src}" target="_blank" rel="noopener noreferrer" style="text-decoration:none">
               <svg data-lucide="external-link" width="14" height="14"></svg> Open in New Tab
             </a>
@@ -3217,7 +3390,7 @@ function openContextMenu(e, fJson, type) {
     </button>`;
   }
 
-  if (isTxt) {
+  if (isTxt && _adminMode) {
     html += `<button class="ctx-item" onclick="closeContextMenu();openBrowserPreview('${fJson}','${type}', true)">
       <svg data-lucide="file-code"></svg> Edit Text / Config…
     </button>`;
@@ -3228,27 +3401,31 @@ function openContextMenu(e, fJson, type) {
     ${f.type === 'folder' ? 'Download ZIP' : 'Download'}
   </button>`;
 
-  html += `<button class="ctx-item" onclick="closeContextMenu();showRenameModal('${fJson}','${type}')">
-    <svg data-lucide="edit-3"></svg> Rename
-  </button>`;
+  if (_adminMode) {
+    html += `<button class="ctx-item" onclick="closeContextMenu();showRenameModal('${fJson}','${type}')">
+      <svg data-lucide="edit-3"></svg> Rename
+    </button>`;
 
-  html += `<button class="ctx-item" onclick="closeContextMenu();showTransferModal('${type}','${fJson}','copy')">
-    <svg data-lucide="copy"></svg> Copy to…
-  </button>`;
+    html += `<button class="ctx-item" onclick="closeContextMenu();showTransferModal('${type}','${fJson}','copy')">
+      <svg data-lucide="copy"></svg> Copy to…
+    </button>`;
 
-  html += `<button class="ctx-item" onclick="closeContextMenu();showTransferModal('${type}','${fJson}','move')">
-    <svg data-lucide="folder-output"></svg> Move to…
-  </button>`;
+    html += `<button class="ctx-item" onclick="closeContextMenu();showTransferModal('${type}','${fJson}','move')">
+      <svg data-lucide="folder-output"></svg> Move to…
+    </button>`;
+  }
 
   html += `<button class="ctx-item" onclick="closeContextMenu();toggleSelectItem('${fJson}','${type}')">
     <svg data-lucide="${isSel ? 'check-square' : 'square'}"></svg>
     ${isSel ? 'Deselect' : 'Select'}
   </button>`;
 
-  html += `<div class="ctx-divider"></div>`;
-  html += `<button class="ctx-item danger" onclick="closeContextMenu();rmFile('${fJson}','${type}')">
-    <svg data-lucide="trash-2"></svg> Delete
-  </button>`;
+  if (_adminMode) {
+    html += `<div class="ctx-divider"></div>`;
+    html += `<button class="ctx-item danger" onclick="closeContextMenu();rmFile('${fJson}','${type}')">
+      <svg data-lucide="trash-2"></svg> Delete
+    </button>`;
+  }
 
   menu.innerHTML = html;
   menu.style.display = 'flex';
@@ -3263,6 +3440,7 @@ function openContextMenu(e, fJson, type) {
 
 // ── In-Place Rename Modal ─────────────────────────────────────────────────────
 function showRenameModal(fJson, type) {
+  if (!requireAdminFrontend('rename items')) return;
   const f = parseFileArg(fJson);
   showModal(`
     <div class="modal-header">
@@ -3348,22 +3526,26 @@ function openDriveContextMenu(e, driveType, dJson) {
     <svg data-lucide="folder-open"></svg> Open ${escHtml(d.name)}
   </button>`;
 
-  html += `<button class="ctx-item" onclick="closeContextMenu();showDriveCustomNameModal('${driveType}','${dJson}')">
-    <svg data-lucide="edit-3"></svg> Set Custom Name…
-  </button>`;
+  if (_adminMode) {
+    html += `<button class="ctx-item" onclick="closeContextMenu();showDriveCustomNameModal('${driveType}','${dJson}')">
+      <svg data-lucide="edit-3"></svg> Set Custom Name…
+    </button>`;
 
-  html += `<button class="ctx-item" onclick="closeContextMenu();${addCall}">
-    <svg data-lucide="plus-circle"></svg> ${addLabel}
-  </button>`;
+    html += `<button class="ctx-item" onclick="closeContextMenu();${addCall}">
+      <svg data-lucide="plus-circle"></svg> ${addLabel}
+    </button>`;
+  }
 
   html += `<button class="ctx-item" onclick="closeContextMenu();setView('settings','${settingsTab}')">
     <svg data-lucide="settings"></svg> Manage in Settings
   </button>`;
 
-  html += `<div class="ctx-divider"></div>`;
-  html += `<button class="ctx-item danger" onclick="closeContextMenu();${removeCall}">
-    <svg data-lucide="${isSmb ? 'trash-2' : 'unlink'}"></svg> ${isSmb ? 'Remove Share' : 'Disconnect Drive'}
-  </button>`;
+  if (_adminMode) {
+    html += `<div class="ctx-divider"></div>`;
+    html += `<button class="ctx-item danger" onclick="closeContextMenu();${removeCall}">
+      <svg data-lucide="${isSmb ? 'trash-2' : 'unlink'}"></svg> ${isSmb ? 'Remove Share' : 'Disconnect Drive'}
+    </button>`;
+  }
 
   menu.innerHTML = html;
   menu.style.display = 'flex';
@@ -3377,6 +3559,7 @@ function openDriveContextMenu(e, driveType, dJson) {
 }
 
 function showDriveCustomNameModal(driveType, dJson) {
+  if (!requireAdminFrontend('rename drives or shares')) return;
   const d = parseFileArg(dJson);
   const isSmb = driveType === 'smb';
   const isOd = driveType === 'onedrive';
@@ -3548,6 +3731,7 @@ function downloadSelectedZip(type) {
 }
 
 async function deleteSelectedItems(type) {
+  if (!requireAdminFrontend('delete items')) return;
   const items = Array.from(_selectedItems.values());
   if (!items.length) return;
   if (!confirm(`Delete ${items.length} selected item${items.length > 1 ? 's' : ''}?`)) return;
@@ -3606,6 +3790,7 @@ function setTransferMode(mode) {
 }
 
 async function showTransferModal(srcType, singleItemJson = null, mode = 'copy') {
+  if (!requireAdminFrontend(mode === 'move' ? 'move items' : 'copy items')) return;
   _transferSrcType = srcType;
   _transferMode = mode === 'move' ? 'move' : 'copy';
   _transferItems = singleItemJson
@@ -3828,6 +4013,7 @@ async function doTransfer() {
 }
 
 async function rmFile(fJson, type) {
+  if (!requireAdminFrontend('delete items')) return;
   const f = parseFileArg(fJson);
   if (!confirm(`Delete "${f.name}"?`)) return;
   try {
@@ -3853,12 +4039,18 @@ function fileToolbar(type) {
   const dirIcon = _sortDir === 'asc' ? 'arrow-up-narrow-wide' : 'arrow-down-wide-narrow';
   const dirTitle = _sortDir === 'asc' ? 'Sort ascending (click to sort descending)' : 'Sort descending (click to sort ascending)';
   return `
+    ${_adminMode ? `
     <button class="btn btn-secondary btn-sm" onclick="showMkdirModal('${type}')" title="New Folder">
       <svg data-lucide="folder-plus" width="14" height="14"></svg> <span class="btn-label">New Folder</span>
     </button>
     <button class="btn btn-primary btn-sm" onclick="showUploadModal('${type}')" title="Upload">
       <svg data-lucide="upload" width="14" height="14"></svg> <span class="btn-label">Upload</span>
     </button>
+    ` : `
+    <button class="btn btn-ghost btn-sm" onclick="showAdminPinModal()" title="Read-Only Mode is active. Click to unlock Administrator Functions (PIN required)" style="font-size:var(--text-xs);color:var(--color-text-muted)">
+      <svg data-lucide="lock" width="13" height="13"></svg> <span class="btn-label">Read-Only</span>
+    </button>
+    `}
     <div class="sort-group" title="Sort files">
       <select class="sort-select" aria-label="Sort by" onchange="setFileSort(this.value)">
         <option value="name" ${_sortBy === 'name' ? 'selected' : ''}>Sort: Name</option>
@@ -3885,6 +4077,7 @@ function setViewMode(m) {
 }
 
 function showUploadModal(type) {
+  if (!requireAdminFrontend('upload files')) return;
   showModal(`
     <div class="modal-header">
       <span class="modal-title">Upload Files or Folders</span>
@@ -4038,6 +4231,7 @@ async function uploadFileEntries(entries, type) {
 }
 
 function showMkdirModal(type) {
+  if (!requireAdminFrontend('create folders')) return;
   showModal(`
     <div class="modal-header">
       <span class="modal-title">New Folder</span>
@@ -4157,9 +4351,50 @@ async function renderSettings() {
       <div>
         <h2 style="font-size:var(--text-lg);font-weight:700;letter-spacing:-.01em">Settings &amp; Connections</h2>
         <p style="font-size:var(--text-xs);color:var(--color-text-muted);margin-top:2px">
-          Manage Google Drive &amp; OneDrive accounts, SMB shares, network credentials, dark themes, and security policies.
+          Manage Google Drive &amp; OneDrive accounts, SMB shares, network credentials, dark themes, and administrator functions.
         </p>
       </div>
+
+      <!-- Administrator Functions (PIN Protected) Banner -->
+      <div class="admin-mode-banner ${_adminMode ? 'unlocked' : ''}" style="width:100%">
+        <div style="display:flex;align-items:center;gap:var(--space-3);min-width:0;flex:1">
+          <div class="share-icon-box" style="background:${_adminMode ? 'color-mix(in oklab, var(--color-primary) 18%, var(--color-surface-offset))' : 'var(--color-surface-offset)'}">
+            <svg data-lucide="${_adminMode ? 'shield-check' : 'lock'}" width="18" height="18"></svg>
+          </div>
+          <div style="min-width:0">
+            <div style="display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap">
+              <span style="font-weight:600;font-size:var(--text-sm);color:var(--color-text)">Administrator Functions</span>
+              <span class="badge ${_adminMode ? 'badge-success' : 'badge-primary'}" style="font-size:10px">
+                ${_adminMode ? 'Unlocked (Full Access)' : 'Read-Only Mode'}
+              </span>
+            </div>
+            <div style="font-size:var(--text-xs);color:var(--color-text-muted);margin-top:2px">
+              ${_adminMode
+                ? 'Move, Delete, Upload, Copy, New Folder, Rename, File Editing, and Drive/Share Management are active for this session.'
+                : 'Default login is Read-Only. Turn on Administrator Functions (PIN required) to enable Move, Delete, Upload, Copy, Rename, and New Folder.'}
+            </div>
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:var(--space-3);flex-shrink:0">
+          <label class="proxy-switch-label" title="${_adminMode ? 'Disable Administrator Functions (return to Read-Only)' : 'Enable Administrator Functions (PIN required)'}">
+            <input type="checkbox" class="proxy-switch-input"
+                   ${_adminMode ? 'checked' : ''}
+                   onchange="onToggleAdminModeSetting(this.checked)" />
+            <span class="proxy-switch"></span>
+            <span>${_adminMode ? 'Enabled' : 'Off'}</span>
+          </label>
+          ${_adminMode ? `
+            <button class="btn btn-secondary btn-sm" onclick="disableAdminMode()">
+              <svg data-lucide="lock" width="13" height="13"></svg> Lock
+            </button>
+          ` : `
+            <button class="btn btn-primary btn-sm" onclick="showAdminPinModal()">
+              <svg data-lucide="unlock" width="13" height="13"></svg> Enter PIN
+            </button>
+          `}
+        </div>
+      </div>
+
       <div class="settings-tabs">
         <button class="settings-tab ${_settingsTab==='gdrive'?'active':''}" onclick="setSettingsTab('gdrive')">
           <svg data-lucide="hard-drive"></svg> Google Drives (${_gdAccounts.length})
@@ -4199,9 +4434,11 @@ async function renderSettings() {
               ${_gdAccounts.length ? `${_gdAccounts.length} Connected` : 'None'}
             </span>
           </div>
+          ${_adminMode ? `
           <button class="btn btn-primary btn-sm" onclick="showAddGDriveModal()">
             <svg data-lucide="plus" width="14" height="14"></svg> Add Google Drive
           </button>
+          ` : ''}
         </div>
         <div class="card-body" style="display:flex;flex-direction:column;gap:var(--space-3)">
           <div class="share-list">
@@ -4223,6 +4460,7 @@ async function renderSettings() {
                   <button class="btn btn-secondary btn-sm" onclick="openGDrive('${escAttr(acc.id)}','${escAttr(acc.name)}')" title="Browse Google Drive">
                     <svg data-lucide="folder-open" width="13" height="13"></svg>
                   </button>
+                  ${_adminMode ? `
                   <button class="btn btn-secondary btn-sm" onclick="showDriveCustomNameModal('gdrive','${accJson}')" title="Set custom display name">
                     <svg data-lucide="edit-3" width="13" height="13"></svg>
                   </button>
@@ -4232,6 +4470,7 @@ async function renderSettings() {
                   <button class="btn btn-danger btn-sm" onclick="disconnectGDrive('${escAttr(acc.id)}','${escAttr(acc.name)}')" title="Disconnect account">
                     <svg data-lucide="unlink" width="13" height="13"></svg>
                   </button>
+                  ` : ''}
                 </div>
               </div>`;
             }).join('') : `
@@ -4240,7 +4479,7 @@ async function renderSettings() {
                 <h3 style="font-size:var(--text-sm)">No Google Drives connected</h3>
                 <p style="font-size:var(--text-xs);margin-bottom:0">
                   ${_gdStatus.configured
-                    ? 'Click "Add Google Drive" to connect one or more Google Drive accounts.'
+                    ? 'Unlock Administrator Functions and click "Add Google Drive" to connect one or more Google Drive accounts.'
                     : 'Configure your Google OAuth Client ID &amp; Secret in the Google OAuth tab first, then connect your drives.'}
                 </p>
               </div>`}
@@ -4260,9 +4499,11 @@ async function renderSettings() {
               ${_odAccounts.length ? `${_odAccounts.length} Connected` : 'None'}
             </span>
           </div>
+          ${_adminMode ? `
           <button class="btn btn-primary btn-sm" onclick="showAddOneDriveModal()">
             <svg data-lucide="plus" width="14" height="14"></svg> Add OneDrive
           </button>
+          ` : ''}
         </div>
         <div class="card-body" style="display:flex;flex-direction:column;gap:var(--space-3)">
           <div class="share-list">
@@ -4285,6 +4526,7 @@ async function renderSettings() {
                   <button class="btn btn-secondary btn-sm" onclick="openOneDrive('${escAttr(acc.id)}','${escAttr(acc.name)}')" title="Browse OneDrive">
                     <svg data-lucide="folder-open" width="13" height="13"></svg>
                   </button>
+                  ${_adminMode ? `
                   <button class="btn btn-secondary btn-sm" onclick="showDriveCustomNameModal('onedrive','${accJson}')" title="Set custom display name">
                     <svg data-lucide="edit-3" width="13" height="13"></svg>
                   </button>
@@ -4294,6 +4536,7 @@ async function renderSettings() {
                   <button class="btn btn-danger btn-sm" onclick="disconnectOneDrive('${escAttr(acc.id)}','${escAttr(acc.name)}')" title="Disconnect account">
                     <svg data-lucide="unlink" width="13" height="13"></svg>
                   </button>
+                  ` : ''}
                 </div>
               </div>`;
             }).join('') : `
@@ -4302,7 +4545,7 @@ async function renderSettings() {
                 <h3 style="font-size:var(--text-sm)">No Microsoft OneDrive accounts connected</h3>
                 <p style="font-size:var(--text-xs);margin-bottom:0">
                   ${_odStatus.configured
-                    ? 'Click "Add OneDrive" to connect one or more Personal or Work/School OneDrive accounts.'
+                    ? 'Unlock Administrator Functions and click "Add OneDrive" to connect one or more Personal or Work/School OneDrive accounts.'
                     : 'Configure your Azure App Registration Client ID &amp; Secret in the OneDrive OAuth tab first, then connect your drives.'}
                 </p>
               </div>`}
@@ -4320,9 +4563,11 @@ async function renderSettings() {
             <span class="card-title">SMB / NAS Shares</span>
             <span class="badge badge-primary">${_shares.length}</span>
           </div>
+          ${_adminMode ? `
           <button class="btn btn-primary btn-sm" onclick="showAddShareModal()">
             <svg data-lucide="plus" width="14" height="14"></svg> Add Share
           </button>
+          ` : ''}
         </div>
         <div class="card-body" style="display:flex;flex-direction:column;gap:var(--space-3)">
           <div class="share-list" id="share-list">
@@ -4345,12 +4590,14 @@ async function renderSettings() {
                   <button class="btn btn-secondary btn-sm" onclick="openShare('${escAttr(s.id)}','${escAttr(s.name)}')" title="Browse share">
                     <svg data-lucide="folder-open" width="13" height="13"></svg>
                   </button>
+                  ${_adminMode ? `
                   <button class="btn btn-secondary btn-sm" onclick="showDriveCustomNameModal('smb','${sJson}')" title="Set custom display name">
                     <svg data-lucide="edit-3" width="13" height="13"></svg>
                   </button>
                   <button class="btn btn-danger btn-sm" onclick="deleteShare('${escAttr(s.id)}')" title="Remove share">
                     <svg data-lucide="trash-2" width="13" height="13"></svg>
                   </button>
+                  ` : ''}
                 </div>
               </div>`;
             }).join('') : `
@@ -4401,7 +4648,7 @@ async function renderSettings() {
           <button class="btn btn-primary btn-sm" onclick="saveGDConfig()">
             <svg data-lucide="save" width="14" height="14"></svg> Save OAuth Config
           </button>
-          ${_gdStatus.configured ? `
+          ${_gdStatus.configured && _adminMode ? `
           <button class="btn btn-secondary btn-sm" onclick="showAddGDriveModal()">
             <svg data-lucide="plus" width="14" height="14"></svg> Connect New Google Drive Account
           </button>` : ''}
@@ -4458,7 +4705,7 @@ async function renderSettings() {
           <button class="btn btn-primary btn-sm" onclick="saveODConfig()">
             <svg data-lucide="save" width="14" height="14"></svg> Save OneDrive OAuth Config
           </button>
-          ${_odStatus.configured ? `
+          ${_odStatus.configured && _adminMode ? `
           <button class="btn btn-secondary btn-sm" onclick="showAddOneDriveModal()">
             <svg data-lucide="plus" width="14" height="14"></svg> Connect New OneDrive Account
           </button>` : ''}
@@ -4627,11 +4874,19 @@ async function renderSettings() {
         <div class="card-header">
           <div style="display:flex;align-items:center;gap:var(--space-2)">
             <svg data-lucide="shield-check" width="16" height="16" style="color:var(--color-primary)"></svg>
-            <span class="card-title">Security &amp; Login Protection</span>
+            <span class="card-title">Security &amp; Access Policy</span>
           </div>
           <span class="badge badge-success">Active</span>
         </div>
         <div class="card-body" style="display:flex;flex-direction:column;gap:var(--space-3);font-size:var(--text-xs);color:var(--color-text-muted)">
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:var(--space-2) 0;border-bottom:1px solid var(--color-divider)">
+            <span>Default Login Access</span>
+            <strong style="color:var(--color-text);font-family:var(--font-mono)">Read-Only Mode</strong>
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:var(--space-2) 0;border-bottom:1px solid var(--color-divider)">
+            <span>Administrator Functions (PIN Protected)</span>
+            <strong style="color:${_adminMode ? 'var(--color-success)' : 'var(--color-text-muted)'};font-family:var(--font-mono)">${_adminMode ? 'Unlocked' : 'Locked (Read-Only)'}</strong>
+          </div>
           <div style="display:flex;justify-content:space-between;padding:var(--space-2) 0;border-bottom:1px solid var(--color-divider)">
             <span>Anti-Hammering Lockout</span>
             <strong style="color:var(--color-text);font-family:var(--font-mono)">5 failed attempts → 15 min lock</strong>
@@ -4764,6 +5019,7 @@ async function refreshODStatus() {
 }
 
 function showAddShareModal() {
+  if (!requireAdminFrontend('add SMB shares')) return;
   showModal(`
     <div class="modal-header">
       <span class="modal-title">Add SMB Share</span>
@@ -4824,6 +5080,7 @@ async function doAddShare() {
 }
 
 async function deleteShare(id) {
+  if (!requireAdminFrontend('remove SMB shares')) return;
   const s = _shares.find(item => item.id === id);
   if (!confirm(`Remove SMB share "${s ? s.name : id}"?`)) return;
   try {
@@ -4840,6 +5097,7 @@ async function deleteShare(id) {
 }
 
 async function saveGDConfig() {
+  if (!requireAdminFrontend('save OAuth configuration')) return;
   try {
     const body = {
       client_id: document.getElementById('gdcid').value.trim(),
@@ -4855,6 +5113,7 @@ async function saveGDConfig() {
 }
 
 async function saveODConfig() {
+  if (!requireAdminFrontend('save OneDrive OAuth configuration')) return;
   try {
     const body = {
       client_id: document.getElementById('odcid').value.trim(),
@@ -4870,6 +5129,7 @@ async function saveODConfig() {
 }
 
 async function saveSmbProxyCreds() {
+  if (!requireAdminFrontend('update SMB Proxy credentials')) return;
   const user = document.getElementById('smb-proxy-user').value.trim();
   const pass = document.getElementById('smb-proxy-pass').value;
   const msg  = document.getElementById('smb-proxy-msg');
@@ -4887,6 +5147,10 @@ async function saveSmbProxyCreds() {
 }
 
 async function toggleDriveSmbProxy(accountId, enabled, provider = '') {
+  if (!requireAdminFrontend('modify SMB Proxy shares')) {
+    await renderSettings();
+    return;
+  }
   try {
     await apiJSON(`/api/smb/proxy-shares/${encodeURIComponent(accountId)}`, {
       method: 'POST',
@@ -4901,6 +5165,7 @@ async function toggleDriveSmbProxy(accountId, enabled, provider = '') {
 }
 
 async function saveDriveSmbShareName(accountId, provider = '') {
+  if (!requireAdminFrontend('rename SMB Proxy shares')) return;
   const prov = provider || 'gdrive';
   const inp = document.getElementById(`smb-share-name-${prov}-${accountId}`) || document.getElementById(`smb-share-name-${accountId}`);
   const rawName = (inp ? inp.value : '').trim();
@@ -4922,6 +5187,7 @@ async function saveDriveSmbShareName(accountId, provider = '') {
 }
 
 async function reconcileSmbProxy() {
+  if (!requireAdminFrontend('sync SMB Proxy shares')) return;
   try {
     await apiJSON('/api/smb/proxy-reconcile', { method: 'POST' });
     toast('SMB Proxy mounts & Samba shares synchronized', 'success');
@@ -4932,6 +5198,7 @@ async function reconcileSmbProxy() {
 }
 
 function showAddGDriveModal() {
+  if (!requireAdminFrontend('connect Google Drive accounts')) return;
   if (!_gdStatus.configured) {
     _oauthFormExpanded = true;
     setView('settings', 'oauth');
@@ -4979,6 +5246,7 @@ function doStartAddGDrive() {
 }
 
 async function connectGDrive(customName = '', accountId = '') {
+  if (!requireAdminFrontend('connect Google Drive accounts')) return;
   try {
     const qs = new URLSearchParams();
     if (customName) qs.set('name', customName);
@@ -4999,6 +5267,7 @@ async function connectGDrive(customName = '', accountId = '') {
 }
 
 async function disconnectGDrive(accountId = '', accountName = 'Google Drive') {
+  if (!requireAdminFrontend('disconnect Google Drive accounts')) return;
   if (!confirm(`Disconnect "${accountName}"?`)) return;
   try {
     if (accountId) {
@@ -5018,6 +5287,7 @@ async function disconnectGDrive(accountId = '', accountName = 'Google Drive') {
 }
 
 function showAddOneDriveModal() {
+  if (!requireAdminFrontend('connect OneDrive accounts')) return;
   if (!_odStatus.configured) {
     setView('settings', 'od_oauth');
     toast('Save your Microsoft OneDrive OAuth Client ID and Secret first', 'error');
@@ -5064,6 +5334,7 @@ function doStartAddOneDrive() {
 }
 
 async function connectOneDrive(customName = '', accountId = '') {
+  if (!requireAdminFrontend('connect OneDrive accounts')) return;
   try {
     const qs = new URLSearchParams();
     if (customName) qs.set('name', customName);
@@ -5083,6 +5354,7 @@ async function connectOneDrive(customName = '', accountId = '') {
 }
 
 async function disconnectOneDrive(accountId = '', accountName = 'OneDrive') {
+  if (!requireAdminFrontend('disconnect OneDrive accounts')) return;
   if (!confirm(`Disconnect "${accountName}"?`)) return;
   try {
     if (accountId) {

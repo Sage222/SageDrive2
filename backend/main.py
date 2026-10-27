@@ -49,7 +49,7 @@ def _auth_login_with_status(username, password):
                 user["locked_until"] = 0
                 auth._save_users(users)
             token = secrets.token_hex(32)
-            auth.SESSIONS[token] = {"username": uname, "role": user["role"], "expires": now + auth.SESSION_TTL}
+            auth.SESSIONS[token] = {"username": uname, "role": user["role"], "admin_enabled": False, "expires": now + auth.SESSION_TTL}
             return token, None, 200, {"locked": False, "attempts_remaining": _AUTH_MAX_ATTEMPTS}
 
         fails = int(record.get("failed_attempts", 0) or 0) + 1
@@ -1761,7 +1761,7 @@ def api_login():
     token, err_msg, status_code, meta = auth.login_with_status(u, pw)
     if token:
         theme = auth.get_user_theme(u)
-        resp = jsonify({"token": token, "theme": theme})
+        resp = jsonify({"token": token, "theme": theme, "admin_enabled": False})
         resp.set_cookie("sd_token", token, max_age=auth.SESSION_TTL, path="/", httponly=True, samesite="Lax")
         return resp
     return jsonify({
@@ -1790,7 +1790,29 @@ def api_me():
         t = request.args.get("token", "").strip() or request.cookies.get("sd_token", "")
     s = auth.get_session(t)
     theme = auth.get_user_theme(s["username"])
-    return jsonify({"username": s["username"], "role": s["role"], "theme": theme})
+    return jsonify({
+        "username": s["username"],
+        "role": s["role"],
+        "theme": theme,
+        "admin_enabled": bool(s.get("admin_enabled", False)),
+    })
+
+@app.post("/api/auth/admin-mode")
+@auth.require_auth
+def api_admin_mode():
+    t = request.headers.get("Authorization","").removeprefix("Bearer ").strip()
+    if not t:
+        t = request.args.get("token", "").strip() or request.cookies.get("sd_token", "")
+    b = request.get_json(force=True) or {}
+    enabled = bool(b.get("enabled", False))
+    pin = str(b.get("pin", "")).strip()
+    try:
+        state = auth.set_admin_mode(t, enabled, pin=pin)
+        return jsonify({"ok": True, "admin_enabled": state})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 403
+    except PermissionError as e:
+        return jsonify({"error": str(e)}), 401
 
 @app.post("/api/auth/theme")
 @auth.require_auth
@@ -1814,7 +1836,7 @@ def smb_list_shares():
                     for s in smb_manager.list_shares()])
 
 @app.post("/api/smb/shares")
-@auth.require_auth
+@auth.require_admin
 def smb_add_share():
     b = request.get_json(force=True) or {}
     try:
@@ -1828,7 +1850,7 @@ def smb_add_share():
         return jsonify({"error": str(e)}), 400
 
 @app.post("/api/smb/shares/<share_id>/rename")
-@auth.require_auth
+@auth.require_admin
 def smb_rename_share(share_id):
     b = request.get_json(force=True) or {}
     new_name = (b.get("name") or b.get("custom_name") or "").strip()
@@ -1839,7 +1861,7 @@ def smb_rename_share(share_id):
         return jsonify({"error": str(e)}), 400
 
 @app.delete("/api/smb/shares/<share_id>")
-@auth.require_auth
+@auth.require_admin
 def smb_delete_share(share_id):
     smb_manager.remove_share(share_id)
     return jsonify({"ok": True})
@@ -2002,7 +2024,7 @@ def smb_download(share_id):
         return jsonify({"error": str(e)}), 500
 
 @app.post("/api/smb/upload/<share_id>")
-@auth.require_auth
+@auth.require_admin
 def smb_upload(share_id):
     dest = request.args.get("path", "/")
     rel_path = (request.form.get("relative_path") or request.args.get("relative_path") or "").strip()
@@ -2022,7 +2044,7 @@ def smb_upload(share_id):
         return jsonify({"error": str(e)}), 500
 
 @app.put("/api/smb/content/<share_id>")
-@auth.require_auth
+@auth.require_admin
 def smb_save_content(share_id):
     b = request.get_json(force=True) or {}
     raw_path = (b.get("path") or request.args.get("path") or "").strip()
@@ -2041,7 +2063,7 @@ def smb_save_content(share_id):
         return jsonify({"error": str(e)}), 500
 
 @app.post("/api/smb/rename/<share_id>")
-@auth.require_auth
+@auth.require_admin
 def smb_rename(share_id):
     b = request.get_json(force=True) or {}
     old_path = (b.get("path") or "").strip()
@@ -2085,7 +2107,7 @@ def smb_zip(share_id):
         return jsonify({"error": str(e)}), 500
 
 @app.delete("/api/smb/delete/<share_id>")
-@auth.require_auth
+@auth.require_admin
 def smb_delete_file(share_id):
     b = request.get_json(force=True) or {}
     try:
@@ -2099,7 +2121,7 @@ def smb_delete_file(share_id):
         return jsonify({"error": str(e)}), 500
 
 @app.post("/api/smb/mkdir/<share_id>")
-@auth.require_auth
+@auth.require_admin
 def smb_mkdir(share_id):
     b = request.get_json(force=True) or {}
     try:
@@ -2128,7 +2150,7 @@ def gdrive_list_accounts():
     return jsonify(gdrive_manager.list_accounts())
 
 @app.post("/api/gdrive/accounts/<account_id>/rename")
-@auth.require_auth
+@auth.require_admin
 def gdrive_rename_account(account_id):
     b = request.get_json(force=True) or {}
     new_name = (b.get("name") or b.get("custom_name") or "").strip()
@@ -2139,7 +2161,7 @@ def gdrive_rename_account(account_id):
         return jsonify({"error": str(e)}), 400
 
 @app.delete("/api/gdrive/accounts/<account_id>")
-@auth.require_auth
+@auth.require_admin
 def gdrive_delete_account(account_id):
     gdrive_manager.remove_account(account_id)
     try:
@@ -2154,7 +2176,7 @@ def gdrive_get_config():
     return jsonify(gdrive_manager.get_config())
 
 @app.post("/api/gdrive/config")
-@auth.require_auth
+@auth.require_admin
 def gdrive_save_config():
     b = request.get_json(force=True) or {}
     cfg = gdrive_manager.save_config(
@@ -2165,7 +2187,7 @@ def gdrive_save_config():
     return jsonify({"ok": True, "configured": gdrive_manager.is_configured()})
 
 @app.get("/api/gdrive/auth")
-@auth.require_auth
+@auth.require_admin
 def gdrive_auth():
     if not gdrive_manager.is_configured():
         return jsonify({"error": "Google OAuth not configured"}), 400
@@ -2190,7 +2212,7 @@ def gdrive_callback():
         return f"OAuth error: {e}", 500
 
 @app.delete("/api/gdrive/revoke")
-@auth.require_auth
+@auth.require_admin
 def gdrive_revoke():
     account_id = request.args.get("account_id", "").strip() or None
     gdrive_manager.revoke(account_id=account_id)
@@ -2371,7 +2393,7 @@ def gdrive_download(file_id):
         return jsonify({"error": str(e)}), 500
 
 @app.post("/api/gdrive/upload")
-@auth.require_auth
+@auth.require_admin
 def gdrive_upload():
     folder_id = request.args.get("folder","root")
     account_id = request.args.get("account_id", "").strip() or None
@@ -2395,7 +2417,7 @@ def gdrive_upload():
         return jsonify({"error": str(e)}), 500
 
 @app.put("/api/gdrive/content/<file_id>")
-@auth.require_auth
+@auth.require_admin
 def gdrive_save_content(file_id):
     b = request.get_json(force=True) or {}
     account_id = (request.args.get("account_id") or b.get("account_id") or "").strip() or None
@@ -2419,7 +2441,7 @@ def gdrive_save_content(file_id):
         return jsonify({"error": str(e)}), 500
 
 @app.post("/api/gdrive/rename/<file_id>")
-@auth.require_auth
+@auth.require_admin
 def gdrive_rename(file_id):
     b = request.get_json(force=True) or {}
     account_id = (request.args.get("account_id") or b.get("account_id") or "").strip() or None
@@ -2457,7 +2479,7 @@ def gdrive_zip():
         return jsonify({"error": str(e)}), 500
 
 @app.delete("/api/gdrive/delete/<file_id>")
-@auth.require_auth
+@auth.require_admin
 def gdrive_delete(file_id):
     account_id = request.args.get("account_id", "").strip() or None
     try:
@@ -2467,7 +2489,7 @@ def gdrive_delete(file_id):
         return jsonify({"error": str(e)}), 500
 
 @app.post("/api/gdrive/mkdir")
-@auth.require_auth
+@auth.require_admin
 def gdrive_mkdir():
     b = request.get_json(force=True) or {}
     account_id = (request.args.get("account_id") or b.get("account_id") or "").strip() or None
@@ -2494,7 +2516,7 @@ def onedrive_list_accounts():
     return jsonify(onedrive_manager.list_accounts())
 
 @app.post("/api/onedrive/accounts/<account_id>/rename")
-@auth.require_auth
+@auth.require_admin
 def onedrive_rename_account(account_id):
     b = request.get_json(force=True) or {}
     new_name = (b.get("name") or b.get("custom_name") or "").strip()
@@ -2505,7 +2527,7 @@ def onedrive_rename_account(account_id):
         return jsonify({"error": str(e)}), 400
 
 @app.delete("/api/onedrive/accounts/<account_id>")
-@auth.require_auth
+@auth.require_admin
 def onedrive_delete_account(account_id):
     onedrive_manager.remove_account(account_id)
     try:
@@ -2520,7 +2542,7 @@ def onedrive_get_config():
     return jsonify(onedrive_manager.get_config())
 
 @app.post("/api/onedrive/config")
-@auth.require_auth
+@auth.require_admin
 def onedrive_save_config():
     b = request.get_json(force=True) or {}
     onedrive_manager.save_config(
@@ -2532,7 +2554,7 @@ def onedrive_save_config():
     return jsonify({"ok": True, "configured": onedrive_manager.is_configured()})
 
 @app.get("/api/onedrive/auth")
-@auth.require_auth
+@auth.require_admin
 def onedrive_auth():
     if not onedrive_manager.is_configured():
         return jsonify({"error": "OneDrive OAuth not configured"}), 400
@@ -2557,7 +2579,7 @@ def onedrive_callback():
         return f"OneDrive OAuth error: {e}", 500
 
 @app.delete("/api/onedrive/revoke")
-@auth.require_auth
+@auth.require_admin
 def onedrive_revoke():
     account_id = request.args.get("account_id", "").strip() or None
     onedrive_manager.revoke(account_id=account_id)
@@ -2728,7 +2750,7 @@ def onedrive_download(file_id):
         return jsonify({"error": str(e)}), 500
 
 @app.post("/api/onedrive/upload")
-@auth.require_auth
+@auth.require_admin
 def onedrive_upload():
     folder_id = request.args.get("folder", "root")
     account_id = request.args.get("account_id", "").strip() or None
@@ -2752,7 +2774,7 @@ def onedrive_upload():
         return jsonify({"error": str(e)}), 500
 
 @app.put("/api/onedrive/content/<file_id>")
-@auth.require_auth
+@auth.require_admin
 def onedrive_save_content(file_id):
     b = request.get_json(force=True) or {}
     account_id = (request.args.get("account_id") or b.get("account_id") or "").strip() or None
@@ -2776,7 +2798,7 @@ def onedrive_save_content(file_id):
         return jsonify({"error": str(e)}), 500
 
 @app.post("/api/onedrive/rename/<file_id>")
-@auth.require_auth
+@auth.require_admin
 def onedrive_rename(file_id):
     b = request.get_json(force=True) or {}
     account_id = (request.args.get("account_id") or b.get("account_id") or "").strip() or None
@@ -2814,7 +2836,7 @@ def onedrive_zip():
         return jsonify({"error": str(e)}), 500
 
 @app.delete("/api/onedrive/delete/<file_id>")
-@auth.require_auth
+@auth.require_admin
 def onedrive_delete(file_id):
     account_id = request.args.get("account_id", "").strip() or None
     try:
@@ -2824,7 +2846,7 @@ def onedrive_delete(file_id):
         return jsonify({"error": str(e)}), 500
 
 @app.post("/api/onedrive/mkdir")
-@auth.require_auth
+@auth.require_admin
 def onedrive_mkdir():
     b = request.get_json(force=True) or {}
     account_id = (request.args.get("account_id") or b.get("account_id") or "").strip() or None
@@ -2896,7 +2918,7 @@ def _copy_item_across_drives(src_type, src_drive, item, dest_type, dest_drive, d
             raise ValueError(f"Unsupported destination drive type: {dest_type!r}")
 
 @app.post("/api/transfer")
-@auth.require_auth
+@auth.require_admin
 def transfer_items():
     b = request.get_json(force=True) or {}
     operation = (b.get("operation") or "copy").strip().lower()
@@ -3270,7 +3292,7 @@ def get_smb_proxy_shares():
         return jsonify(_get_smb_proxy_status_unlocked())
 
 @app.post("/api/smb/proxy-shares/<account_id>")
-@auth.require_auth
+@auth.require_admin
 def update_smb_proxy_share(account_id):
     b = request.get_json(force=True) or {}
     smb_enabled = b.get("smb_enabled") if "smb_enabled" in b else None
@@ -3302,7 +3324,7 @@ def update_smb_proxy_share(account_id):
         return jsonify({"error": str(e)}), 500
 
 @app.post("/api/smb/proxy-reconcile")
-@auth.require_auth
+@auth.require_admin
 def reconcile_smb_proxy_route():
     try:
         status = _reconcile_smb_proxy()
@@ -3311,7 +3333,7 @@ def reconcile_smb_proxy_route():
         return jsonify({"error": str(e)}), 500
 
 @app.post("/api/smb/proxy-credentials")
-@auth.require_auth
+@auth.require_admin
 def set_smb_proxy_creds():
     body = request.get_json(force=True) or {}
     username = (body.get("username") or "sagedrive").strip()

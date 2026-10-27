@@ -301,8 +301,13 @@ function ensureSampleMediaFiles() {
 }
 ensureSampleMediaFiles();
 
-// Persistent Sessions
+// Persistent Sessions (default to Read-Only mode on startup/login)
 const sessionsMap = new Map(Object.entries(loadJson(SESSIONS_FILE, {})));
+for (const sess of sessionsMap.values()) {
+  if (sess && typeof sess === 'object') {
+    sess.admin_enabled = Boolean(sess.admin_enabled);
+  }
+}
 function persistSessions() {
   saveJson(SESSIONS_FILE, Object.fromEntries(sessionsMap.entries()));
 }
@@ -588,11 +593,29 @@ function extractToken(req) {
   return '';
 }
 
+const ADMIN_PIN = String(process.env.ADMIN_PIN || '0022').trim();
+
 function requireAuth(req, res, next) {
   const token = extractToken(req);
   const session = getSession(token);
   if (!session) {
     return res.status(401).json({ error: 'Unauthorised' });
+  }
+  req.session = session;
+  req.token = token;
+  next();
+}
+
+function requireAdmin(req, res, next) {
+  const token = extractToken(req);
+  const session = getSession(token);
+  if (!session) {
+    return res.status(401).json({ error: 'Unauthorised' });
+  }
+  if (!session.admin_enabled) {
+    return res.status(403).json({
+      error: 'Read-Only Mode is active. Enable Administrator Functions in Settings (PIN required).',
+    });
   }
   req.session = session;
   req.token = token;
@@ -1081,6 +1104,7 @@ app.post('/api/auth/login', (req, res) => {
       username: u,
       role: user.role,
       theme,
+      admin_enabled: false,
       expires: Date.now() + SESSION_TTL,
     });
     persistSessions();
@@ -1088,7 +1112,7 @@ app.post('/api/auth/login', (req, res) => {
       'Set-Cookie',
       `sd_token=${encodeURIComponent(token)}; Path=/; Max-Age=${Math.floor(SESSION_TTL / 1000)}; HttpOnly; SameSite=Lax`
     );
-    return res.json({ token, theme });
+    return res.json({ token, theme, admin_enabled: false });
   }
 
   const fails = Number(record.failed_attempts || 0) + 1;
@@ -1123,7 +1147,28 @@ app.post('/api/auth/logout', requireAuth, (req, res) => {
 
 app.get('/api/auth/me', requireAuth, (req, res) => {
   const theme = getUserTheme(req.session.username);
-  return res.json({ username: req.session.username, role: req.session.role, theme });
+  return res.json({
+    username: req.session.username,
+    role: req.session.role,
+    theme,
+    admin_enabled: Boolean(req.session.admin_enabled),
+  });
+});
+
+app.post('/api/auth/admin-mode', requireAuth, (req, res) => {
+  const b = req.body || {};
+  const enabled = Boolean(b.enabled);
+  const pin = String(b.pin || '').trim();
+  if (enabled) {
+    if (pin !== ADMIN_PIN) {
+      return res.status(403).json({ error: 'Invalid Administrator PIN' });
+    }
+    req.session.admin_enabled = true;
+  } else {
+    req.session.admin_enabled = false;
+  }
+  persistSessions();
+  return res.json({ ok: true, admin_enabled: Boolean(req.session.admin_enabled) });
 });
 
 app.post('/api/auth/theme', requireAuth, (req, res) => {
@@ -1188,7 +1233,7 @@ app.get('/api/smb/shares', requireAuth, (req, res) => {
   return res.json(shares);
 });
 
-app.post('/api/smb/shares', requireAuth, (req, res) => {
+app.post('/api/smb/shares', requireAdmin, (req, res) => {
   const b = req.body || {};
   if (!b.name || !b.host || !b.share) {
     return res.status(400).json({ error: 'name, host, and share are required' });
@@ -1221,7 +1266,7 @@ app.post('/api/smb/shares', requireAuth, (req, res) => {
   return res.status(201).json(safeEntry);
 });
 
-app.post('/api/smb/shares/:share_id/rename', requireAuth, (req, res) => {
+app.post('/api/smb/shares/:share_id/rename', requireAdmin, (req, res) => {
   const { share_id } = req.params;
   const b = req.body || {};
   const newName = String(b.name || b.custom_name || '').trim();
@@ -1243,7 +1288,7 @@ app.post('/api/smb/shares/:share_id/rename', requireAuth, (req, res) => {
   return res.json(safeEntry);
 });
 
-app.delete('/api/smb/shares/:share_id', requireAuth, (req, res) => {
+app.delete('/api/smb/shares/:share_id', requireAdmin, (req, res) => {
   const { share_id } = req.params;
   const shares = listShares().filter((s) => s.id !== share_id);
   saveJson(SHARES_FILE, shares);
@@ -1303,7 +1348,7 @@ app.get('/api/smb/download/:share_id', requireAuth, (req, res) => {
   return streamFileResponse(req, res, item);
 });
 
-app.post('/api/smb/upload/:share_id', requireAuth, upload.single('file'), (req, res) => {
+app.post('/api/smb/upload/:share_id', requireAdmin, upload.single('file'), (req, res) => {
   const { share_id } = req.params;
   const f = req.file;
   if (!f) {
@@ -1333,7 +1378,7 @@ app.post('/api/smb/upload/:share_id', requireAuth, upload.single('file'), (req, 
   }
 });
 
-app.put('/api/smb/content/:share_id', requireAuth, (req, res) => {
+app.put('/api/smb/content/:share_id', requireAdmin, (req, res) => {
   const { share_id } = req.params;
   const b = req.body || {};
   const rawPath = b.path || req.query.path || '';
@@ -1368,7 +1413,7 @@ app.put('/api/smb/content/:share_id', requireAuth, (req, res) => {
   }
 });
 
-app.post('/api/smb/rename/:share_id', requireAuth, (req, res) => {
+app.post('/api/smb/rename/:share_id', requireAdmin, (req, res) => {
   const { share_id } = req.params;
   const b = req.body || {};
   const oldPath = String(b.path || '').replace(/\/+$/, '');
@@ -1463,7 +1508,7 @@ app.post('/api/smb/zip/:share_id', requireAuth, (req, res) => {
   return res.end(zipBuf);
 });
 
-app.delete('/api/smb/delete/:share_id', requireAuth, (req, res) => {
+app.delete('/api/smb/delete/:share_id', requireAdmin, (req, res) => {
   const { share_id } = req.params;
   const b = req.body || {};
   const targetPath = b.path || '';
@@ -1479,7 +1524,7 @@ app.delete('/api/smb/delete/:share_id', requireAuth, (req, res) => {
   return res.json({ ok: true });
 });
 
-app.post('/api/smb/mkdir/:share_id', requireAuth, (req, res) => {
+app.post('/api/smb/mkdir/:share_id', requireAdmin, (req, res) => {
   const { share_id } = req.params;
   const b = req.body || {};
   const rawPath = (b.path || '').replace(/\/+$/, '');
@@ -1739,7 +1784,7 @@ app.get('/api/gdrive/accounts', requireAuth, (req, res) => {
   return res.json(listGDriveAccounts());
 });
 
-app.post('/api/gdrive/accounts/:account_id/rename', requireAuth, (req, res) => {
+app.post('/api/gdrive/accounts/:account_id/rename', requireAdmin, (req, res) => {
   const { account_id } = req.params;
   const b = req.body || {};
   const newName = String(b.name || b.custom_name || '').trim();
@@ -1765,7 +1810,7 @@ app.post('/api/gdrive/accounts/:account_id/rename', requireAuth, (req, res) => {
   });
 });
 
-app.delete('/api/gdrive/accounts/:account_id', requireAuth, (req, res) => {
+app.delete('/api/gdrive/accounts/:account_id', requireAdmin, (req, res) => {
   const { account_id } = req.params;
   const accounts = loadGDriveAccountsRaw().filter((a) => a.id !== account_id);
   saveGDriveAccountsRaw(accounts);
@@ -1776,7 +1821,7 @@ app.get('/api/gdrive/config', requireAuth, (req, res) => {
   return res.json(getGDriveConfig());
 });
 
-app.post('/api/gdrive/config', requireAuth, (req, res) => {
+app.post('/api/gdrive/config', requireAdmin, (req, res) => {
   const b = req.body || {};
   const cfg = {
     client_id: String(b.client_id || '').trim(),
@@ -1787,7 +1832,7 @@ app.post('/api/gdrive/config', requireAuth, (req, res) => {
   return res.json({ ok: true, configured: isGDriveConfigured() });
 });
 
-app.get('/api/gdrive/auth', requireAuth, (req, res) => {
+app.get('/api/gdrive/auth', requireAdmin, (req, res) => {
   if (!isGDriveConfigured()) {
     return res.status(400).json({ error: 'Google OAuth not configured' });
   }
@@ -1840,7 +1885,7 @@ app.get('/api/gdrive/callback', (req, res) => {
   return res.redirect('/#gdrive-connected');
 });
 
-app.delete('/api/gdrive/revoke', requireAuth, (req, res) => {
+app.delete('/api/gdrive/revoke', requireAdmin, (req, res) => {
   const accountId = String(req.query.account_id || '').trim();
   if (accountId) {
     const accounts = loadGDriveAccountsRaw().filter((a) => a.id !== accountId);
@@ -1911,7 +1956,7 @@ app.get('/api/gdrive/download/:file_id', requireAuth, (req, res) => {
   return streamFileResponse(req, res, f);
 });
 
-app.post('/api/gdrive/upload', requireAuth, upload.single('file'), (req, res) => {
+app.post('/api/gdrive/upload', requireAdmin, upload.single('file'), (req, res) => {
   const folderId = req.query.folder || 'root';
   const accId = resolveGDriveAccountId(req.query.account_id);
   const relPath = String(req.body?.relative_path || req.query?.relative_path || '').trim().replace(/^\/+/, '');
@@ -1946,7 +1991,7 @@ app.post('/api/gdrive/upload', requireAuth, upload.single('file'), (req, res) =>
   return res.json({ ok: true });
 });
 
-app.put('/api/gdrive/content/:file_id', requireAuth, (req, res) => {
+app.put('/api/gdrive/content/:file_id', requireAdmin, (req, res) => {
   const { file_id } = req.params;
   const b = req.body || {};
   if (b.content === undefined || b.content === null) {
@@ -1969,7 +2014,7 @@ app.put('/api/gdrive/content/:file_id', requireAuth, (req, res) => {
   return res.json({ ok: true, size: buf.length, file: item });
 });
 
-app.post('/api/gdrive/rename/:file_id', requireAuth, (req, res) => {
+app.post('/api/gdrive/rename/:file_id', requireAdmin, (req, res) => {
   const { file_id } = req.params;
   const b = req.body || {};
   const newName = String(b.name || b.new_name || '').trim();
@@ -2030,7 +2075,7 @@ app.post('/api/gdrive/zip', requireAuth, (req, res) => {
   return res.end(zipBuf);
 });
 
-app.delete('/api/gdrive/delete/:file_id', requireAuth, (req, res) => {
+app.delete('/api/gdrive/delete/:file_id', requireAdmin, (req, res) => {
   const { file_id } = req.params;
   function deleteRecursive(fid) {
     const item = gdriveFSData[fid];
@@ -2047,7 +2092,7 @@ app.delete('/api/gdrive/delete/:file_id', requireAuth, (req, res) => {
   return res.json({ ok: true });
 });
 
-app.post('/api/gdrive/mkdir', requireAuth, (req, res) => {
+app.post('/api/gdrive/mkdir', requireAdmin, (req, res) => {
   const b = req.body || {};
   const accId = resolveGDriveAccountId(req.query.account_id || b.account_id);
   const parent = b.parent || 'root';
@@ -2284,7 +2329,7 @@ app.get('/api/onedrive/accounts', requireAuth, (req, res) => {
   return res.json(listOneDriveAccounts());
 });
 
-app.post('/api/onedrive/accounts/:account_id/rename', requireAuth, (req, res) => {
+app.post('/api/onedrive/accounts/:account_id/rename', requireAdmin, (req, res) => {
   const { account_id } = req.params;
   const b = req.body || {};
   const newName = String(b.name || b.custom_name || '').trim();
@@ -2310,7 +2355,7 @@ app.post('/api/onedrive/accounts/:account_id/rename', requireAuth, (req, res) =>
   });
 });
 
-app.delete('/api/onedrive/accounts/:account_id', requireAuth, (req, res) => {
+app.delete('/api/onedrive/accounts/:account_id', requireAdmin, (req, res) => {
   const { account_id } = req.params;
   const accounts = loadOneDriveAccountsRaw().filter((a) => a.id !== account_id);
   saveOneDriveAccountsRaw(accounts);
@@ -2321,7 +2366,7 @@ app.get('/api/onedrive/config', requireAuth, (req, res) => {
   return res.json(getOneDriveConfig());
 });
 
-app.post('/api/onedrive/config', requireAuth, (req, res) => {
+app.post('/api/onedrive/config', requireAdmin, (req, res) => {
   const b = req.body || {};
   const cfg = {
     client_id: String(b.client_id || '').trim(),
@@ -2333,7 +2378,7 @@ app.post('/api/onedrive/config', requireAuth, (req, res) => {
   return res.json({ ok: true, configured: isOneDriveConfigured() });
 });
 
-app.get('/api/onedrive/auth', requireAuth, (req, res) => {
+app.get('/api/onedrive/auth', requireAdmin, (req, res) => {
   if (!isOneDriveConfigured()) {
     return res.status(400).json({ error: 'Microsoft OneDrive OAuth not configured' });
   }
@@ -2390,7 +2435,7 @@ app.get('/api/onedrive/callback', (req, res) => {
   return res.redirect('/#onedrive-connected');
 });
 
-app.delete('/api/onedrive/revoke', requireAuth, (req, res) => {
+app.delete('/api/onedrive/revoke', requireAdmin, (req, res) => {
   const accountId = String(req.query.account_id || '').trim();
   if (accountId) {
     const accounts = loadOneDriveAccountsRaw().filter((a) => a.id !== accountId);
@@ -2441,7 +2486,7 @@ app.get('/api/onedrive/download/:file_id', requireAuth, (req, res) => {
   return streamFileResponse(req, res, f);
 });
 
-app.post('/api/onedrive/upload', requireAuth, upload.single('file'), (req, res) => {
+app.post('/api/onedrive/upload', requireAdmin, upload.single('file'), (req, res) => {
   const folderId = req.query.folder || 'root';
   const accId = resolveOneDriveAccountId(req.query.account_id);
   const relPath = String(req.body?.relative_path || req.query?.relative_path || '').trim().replace(/^\/+/, '');
@@ -2476,7 +2521,7 @@ app.post('/api/onedrive/upload', requireAuth, upload.single('file'), (req, res) 
   return res.json({ ok: true });
 });
 
-app.put('/api/onedrive/content/:file_id', requireAuth, (req, res) => {
+app.put('/api/onedrive/content/:file_id', requireAdmin, (req, res) => {
   const { file_id } = req.params;
   const b = req.body || {};
   if (b.content === undefined || b.content === null) {
@@ -2499,7 +2544,7 @@ app.put('/api/onedrive/content/:file_id', requireAuth, (req, res) => {
   return res.json({ ok: true, size: buf.length, file: item });
 });
 
-app.post('/api/onedrive/rename/:file_id', requireAuth, (req, res) => {
+app.post('/api/onedrive/rename/:file_id', requireAdmin, (req, res) => {
   const { file_id } = req.params;
   const b = req.body || {};
   const newName = String(b.name || b.new_name || '').trim();
@@ -2560,7 +2605,7 @@ app.post('/api/onedrive/zip', requireAuth, (req, res) => {
   return res.end(zipBuf);
 });
 
-app.delete('/api/onedrive/delete/:file_id', requireAuth, (req, res) => {
+app.delete('/api/onedrive/delete/:file_id', requireAdmin, (req, res) => {
   const { file_id } = req.params;
   function deleteRecursive(fid) {
     const item = onedriveFSData[fid];
@@ -2577,7 +2622,7 @@ app.delete('/api/onedrive/delete/:file_id', requireAuth, (req, res) => {
   return res.json({ ok: true });
 });
 
-app.post('/api/onedrive/mkdir', requireAuth, (req, res) => {
+app.post('/api/onedrive/mkdir', requireAdmin, (req, res) => {
   const b = req.body || {};
   const accId = resolveOneDriveAccountId(req.query.account_id || b.account_id);
   const parent = b.parent || 'root';
@@ -2780,7 +2825,7 @@ function moveSmbPathSameShare(shareId, oldPath, destDir) {
   return newPath;
 }
 
-app.post('/api/transfer', requireAuth, (req, res) => {
+app.post('/api/transfer', requireAdmin, (req, res) => {
   const b = req.body || {};
   const operation = String(b.operation || 'copy').trim().toLowerCase();
   const isMove = operation === 'move';
@@ -2891,7 +2936,7 @@ app.get('/api/smb/proxy-shares', requireAuth, (req, res) => {
   return res.json(getSmbProxyStatus());
 });
 
-app.post('/api/smb/proxy-shares/:account_id', requireAuth, (req, res) => {
+app.post('/api/smb/proxy-shares/:account_id', requireAdmin, (req, res) => {
   const { account_id } = req.params;
   const b = req.body || {};
   const provider = String(b.provider || req.query.provider || '').trim().toLowerCase();
@@ -2963,11 +3008,11 @@ app.post('/api/smb/proxy-shares/:account_id', requireAuth, (req, res) => {
   });
 });
 
-app.post('/api/smb/proxy-reconcile', requireAuth, (req, res) => {
+app.post('/api/smb/proxy-reconcile', requireAdmin, (req, res) => {
   return res.json({ ok: true, ...getSmbProxyStatus() });
 });
 
-app.post('/api/smb/proxy-credentials', requireAuth, (req, res) => {
+app.post('/api/smb/proxy-credentials', requireAdmin, (req, res) => {
   const body = req.body || {};
   const username = String(body.username || 'sagedrive').trim() || 'sagedrive';
   const password = String(body.password || '').trim();

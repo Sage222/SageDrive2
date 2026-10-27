@@ -50,8 +50,9 @@ Repository: [https://github.com/Sage222/SageDrive2](https://github.com/Sage222/S
 - **Path Traversal Guard:** All SMB file and directory operations strictly normalize paths and reject `..` traversal segments and null bytes.
 - **Hardened Session Management:** Username/password authentication with `bcrypt` hashed passwords, `HttpOnly` + `SameSite=Lax` session cookies, Bearer token sessions, full session revocation on logout, and configurable session TTL.
 
-### Tidied Settings Page & Multi-Drive SMB Proxy (Google Drive & OneDrive)
-- **Dedicated Category Tabs:** Organized into **Google Drives**, **OneDrive**, **SMB**, **Google OAuth**, **OneDrive OAuth**, **SMB Proxy**, and **Security & About** tabs for clean, focused configuration.
+### Tidied Settings Page, Themes & Multi-Drive SMB Proxy (Google Drive & OneDrive)
+- **Dedicated Category Tabs:** Organized into **Google Drives**, **OneDrive**, **SMB**, **Google OAuth**, **OneDrive OAuth**, **SMB Proxy**, **Themes**, and **Security & About** tabs for clean, focused configuration.
+- **5 Modern Dark Themes (Persistent Across Logins):** Choose between **Obsidian Teal**, **Midnight Cobalt**, **Nebula Violet**, **Forest Matrix**, and **Crimson Ember** in **Settings → Themes** (or cycle themes from the sidebar palette button). Your selected theme is saved both locally and in your server-side user profile (`users.json`) so it persists across logins and devices.
 - **Dedicated Cloud & SMB Tabs:** Manage connected Google Drive accounts, Microsoft OneDrive accounts, and SMB/NAS shares in their own dedicated tabs with inline custom name editing, status badges, and quick **+ Add** buttons.
 - **Google & Microsoft OAuth Credentials:** Configure and copy your Google OAuth and Microsoft Azure App Registration credentials and Authorized Redirect URIs in their dedicated tabs.
 - **Multi-Drive Cloud SMB Proxy (Google Drive & OneDrive):**
@@ -62,7 +63,7 @@ Repository: [https://github.com/Sage222/SageDrive2](https://github.com/Sage222/S
 
 ### Tech Stack
 - **Backend:** Python, Flask, `pysmb`, Google Drive API v3, Microsoft Graph API v1.0 (OneDrive), `ffmpeg` (live audio remuxing & WebVTT subtitle extraction), `rclone` + Samba
-- **Frontend:** Single-file vanilla JS SPA, Lucide icons, responsive CSS with light & dark themes
+- **Frontend:** Single-file vanilla JS SPA, Lucide icons, responsive CSS with 5 modern dark themes (`Obsidian Teal`, `Midnight Cobalt`, `Nebula Violet`, `Forest Matrix`, `Crimson Ember`)
 - **Deployment:** Docker & Docker Compose (`1G` container memory limit tuned for multi-drive FUSE & FFmpeg remuxing)
 
 ---

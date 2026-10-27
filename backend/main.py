@@ -1760,7 +1760,8 @@ def api_login():
     pw = body.get("password","")
     token, err_msg, status_code, meta = auth.login_with_status(u, pw)
     if token:
-        resp = jsonify({"token": token})
+        theme = auth.get_user_theme(u)
+        resp = jsonify({"token": token, "theme": theme})
         resp.set_cookie("sd_token", token, max_age=auth.SESSION_TTL, path="/", httponly=True, samesite="Lax")
         return resp
     return jsonify({
@@ -1788,7 +1789,22 @@ def api_me():
     if not t:
         t = request.args.get("token", "").strip() or request.cookies.get("sd_token", "")
     s = auth.get_session(t)
-    return jsonify({"username": s["username"], "role": s["role"]})
+    theme = auth.get_user_theme(s["username"])
+    return jsonify({"username": s["username"], "role": s["role"], "theme": theme})
+
+@app.post("/api/auth/theme")
+@auth.require_auth
+def api_save_theme():
+    t = request.headers.get("Authorization","").removeprefix("Bearer ").strip()
+    if not t:
+        t = request.args.get("token", "").strip() or request.cookies.get("sd_token", "")
+    s = auth.get_session(t)
+    b = request.get_json(force=True) or {}
+    try:
+        saved = auth.set_user_theme(s["username"], b.get("theme", "obsidian"))
+        return jsonify({"ok": True, "theme": saved})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
 
 # ── SMB ───────────────────────────────────────────────────────────────────────
 @app.get("/api/smb/shares")

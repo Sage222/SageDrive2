@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en" data-theme="obsidian">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -11,24 +11,23 @@
   <link rel="alternate icon" href="/favicon.svg" />
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300..700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <script src="https://unpkg.com/lucide@latest"></script>
   <style>
-    :root,[data-theme="light"]{
-      --color-bg:#f7f6f2;--color-surface:#f9f8f5;--color-surface-2:#fbfbf9;
-      --color-surface-offset:#f3f0ec;--color-surface-dynamic:#e6e4df;
-      --color-divider:#dcd9d5;--color-border:#d4d1ca;
-      --color-text:#28251d;--color-text-muted:#7a7974;--color-text-faint:#bab9b4;
-      --color-primary:#01696f;--color-primary-hover:#0c4e54;
-      --color-primary-highlight:#cedcd8;
-      --color-error:#a12c7b;--color-success:#437a22;
-      --color-warning:#964219;
+    :root,[data-theme="obsidian"],[data-theme="dark"]{
+      --color-bg:#111315;--color-surface:#171a1d;--color-surface-2:#1c2024;
+      --color-surface-offset:#1f2429;--color-surface-dynamic:#293036;
+      --color-divider:#24292e;--color-border:#30373e;
+      --color-text:#e6edf3;--color-text-muted:#8b949e;--color-text-faint:#626b75;
+      --color-primary:#2dd4bf;--color-primary-hover:#14b8a6;
+      --color-primary-highlight:rgba(45,212,191,.13);
+      --color-error:#f472b6;--color-success:#4ade80;--color-warning:#fb923c;
       --radius-sm:.375rem;--radius-md:.5rem;--radius-lg:.75rem;--radius-xl:1rem;
       --radius-full:9999px;
-      --shadow-sm:0 1px 2px oklch(0.2 0.01 80/.06);
-      --shadow-md:0 4px 12px oklch(0.2 0.01 80/.08);
-      --shadow-lg:0 12px 32px oklch(0.2 0.01 80/.12);
-      --font-body:'Inter',sans-serif;--font-mono:'JetBrains Mono',monospace;
+      --shadow-sm:0 1px 2px rgba(0,0,0,.3);
+      --shadow-md:0 4px 14px rgba(0,0,0,.4);
+      --shadow-lg:0 14px 36px rgba(0,0,0,.55);
+      --font-body:'Plus Jakarta Sans',sans-serif;--font-mono:'JetBrains Mono',monospace;
       --space-1:.25rem;--space-2:.5rem;--space-3:.75rem;--space-4:1rem;
       --space-5:1.25rem;--space-6:1.5rem;--space-8:2rem;--space-10:2.5rem;
       --space-12:3rem;--space-16:4rem;
@@ -40,18 +39,55 @@
       --transition-interactive:180ms cubic-bezier(.16,1,.3,1);
       --sidebar-width:240px;
     }
-    [data-theme="dark"]{
-      --color-bg:#171614;--color-surface:#1c1b19;--color-surface-2:#201f1d;
-      --color-surface-offset:#1d1c1a;--color-surface-dynamic:#2d2c2a;
-      --color-divider:#262523;--color-border:#393836;
-      --color-text:#cdccca;--color-text-muted:#797876;--color-text-faint:#5a5957;
-      --color-primary:#4f98a3;--color-primary-hover:#227f8b;
-      --color-primary-highlight:#313b3b;
-      --color-error:#d163a7;--color-success:#6daa45;--color-warning:#bb653b;
-      --shadow-sm:0 1px 2px oklch(0 0 0/.2);
-      --shadow-md:0 4px 12px oklch(0 0 0/.3);
-      --shadow-lg:0 12px 32px oklch(0 0 0/.4);
+    [data-theme="midnight"]{
+      --color-bg:#0b1120;--color-surface:#111827;--color-surface-2:#162033;
+      --color-surface-offset:#1e293b;--color-surface-dynamic:#283548;
+      --color-divider:#1e293b;--color-border:#334155;
+      --color-text:#f1f5f9;--color-text-muted:#94a3b8;--color-text-faint:#64748b;
+      --color-primary:#38bdf8;--color-primary-hover:#0ea5e9;
+      --color-primary-highlight:rgba(56,189,248,.14);
+      --color-error:#fb7185;--color-success:#34d399;--color-warning:#fbbf24;
     }
+    [data-theme="amethyst"]{
+      --color-bg:#0e0c16;--color-surface:#151221;--color-surface-2:#1b172b;
+      --color-surface-offset:#211c35;--color-surface-dynamic:#2c2545;
+      --color-divider:#231e38;--color-border:#352e52;
+      --color-text:#ede9fe;--color-text-muted:#a59ec4;--color-text-faint:#716994;
+      --color-primary:#a78bfa;--color-primary-hover:#8b5cf6;
+      --color-primary-highlight:rgba(167,139,250,.15);
+      --color-error:#f472b6;--color-success:#34d399;--color-warning:#fbbf24;
+    }
+    [data-theme="emerald"]{
+      --color-bg:#0a120e;--color-surface:#101b16;--color-surface-2:#15231c;
+      --color-surface-offset:#1a2c23;--color-surface-dynamic:#233a2f;
+      --color-divider:#1c2e25;--color-border:#2b4437;
+      --color-text:#ecfdf5;--color-text-muted:#86a897;--color-text-faint:#597a6a;
+      --color-primary:#34d399;--color-primary-hover:#10b981;
+      --color-primary-highlight:rgba(52,211,153,.14);
+      --color-error:#fb7185;--color-success:#4ade80;--color-warning:#fbbf24;
+    }
+    [data-theme="ember"]{
+      --color-bg:#141011;--color-surface:#1c1618;--color-surface-2:#231b1e;
+      --color-surface-offset:#2a2024;--color-surface-dynamic:#36292e;
+      --color-divider:#292023;--color-border:#3f3035;
+      --color-text:#f5ebed;--color-text-muted:#a89499;--color-text-faint:#756368;
+      --color-primary:#fb7185;--color-primary-hover:#f43f5e;
+      --color-primary-highlight:rgba(251,113,133,.14);
+      --color-error:#f87171;--color-success:#4ade80;--color-warning:#fbbf24;
+    }
+    .theme-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:var(--space-4)}
+    .theme-card{background:var(--color-surface-2);border:1px solid var(--color-border);
+                border-radius:var(--radius-lg);padding:var(--space-4);cursor:pointer;
+                display:flex;flex-direction:column;gap:var(--space-3);text-align:left;
+                transition:border-color var(--transition-interactive),transform var(--transition-interactive),box-shadow var(--transition-interactive)}
+    .theme-card:hover{border-color:var(--color-primary);transform:translateY(-1px);box-shadow:var(--shadow-md)}
+    .theme-card.active{border-color:var(--color-primary);box-shadow:0 0 0 1px var(--color-primary)}
+    .theme-preview{height:92px;border-radius:var(--radius-md);overflow:hidden;
+                   border:1px solid rgba(255,255,255,.08);display:flex;position:relative}
+    .theme-preview-sidebar{width:30%;height:100%;padding:8px;display:flex;flex-direction:column;gap:5px;border-right:1px solid rgba(255,255,255,.07)}
+    .theme-preview-main{flex:1;height:100%;padding:8px 10px;display:flex;flex-direction:column;gap:6px}
+    .theme-swatch-row{display:flex;align-items:center;gap:6px}
+    .theme-swatch-dot{width:14px;height:14px;border-radius:var(--radius-sm);border:1px solid rgba(255,255,255,.14)}
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
     html{-webkit-font-smoothing:antialiased;scroll-behavior:smooth}
     body{min-height:100dvh;font-family:var(--font-body);font-size:var(--text-base);
@@ -581,8 +617,8 @@
       <div style="display:flex;align-items:center;justify-content:space-between">
         <span id="sidebar-user" style="font-size:var(--text-sm);color:var(--color-text-muted)"></span>
         <div style="display:flex;gap:var(--space-1)">
-          <button class="btn-ghost btn-icon btn" onclick="toggleTheme()" aria-label="Toggle theme">
-            <svg data-lucide="sun"></svg>
+          <button class="btn-ghost btn-icon btn" onclick="cycleTheme()" title="Switch dark theme" aria-label="Switch dark theme">
+            <svg data-lucide="palette"></svg>
           </button>
           <button class="btn-ghost btn-icon btn" onclick="doLogout()" aria-label="Sign out">
             <svg data-lucide="log-out"></svg>
@@ -642,6 +678,86 @@ let _mediaIndex = -1;
 let _playbackRate = 1;
 let _videoZoom = 1;
 let _autoPlayNext = true;
+
+const DARK_THEMES = [
+  {
+    id: 'obsidian',
+    name: 'Obsidian Teal',
+    subtitle: 'Deep carbon slate with crisp cyan-teal highlights',
+    bg: '#111315',
+    surface: '#171a1d',
+    surfaceOffset: '#1f2429',
+    border: '#30373e',
+    text: '#e6edf3',
+    muted: '#8b949e',
+    primary: '#2dd4bf',
+  },
+  {
+    id: 'midnight',
+    name: 'Midnight Cobalt',
+    subtitle: 'Nordic deep navy canvas with electric sky-blue accents',
+    bg: '#0b1120',
+    surface: '#111827',
+    surfaceOffset: '#1e293b',
+    border: '#334155',
+    text: '#f1f5f9',
+    muted: '#94a3b8',
+    primary: '#38bdf8',
+  },
+  {
+    id: 'amethyst',
+    name: 'Nebula Violet',
+    subtitle: 'Velvet obsidian-plum surfaces with luminous iris accents',
+    bg: '#0e0c16',
+    surface: '#151221',
+    surfaceOffset: '#211c35',
+    border: '#352e52',
+    text: '#ede9fe',
+    muted: '#a59ec4',
+    primary: '#a78bfa',
+  },
+  {
+    id: 'emerald',
+    name: 'Forest Matrix',
+    subtitle: 'Dark pine charcoal with vibrant emerald-mint accents',
+    bg: '#0a120e',
+    surface: '#101b16',
+    surfaceOffset: '#1a2c23',
+    border: '#2b4437',
+    text: '#ecfdf5',
+    muted: '#86a897',
+    primary: '#34d399',
+  },
+  {
+    id: 'ember',
+    name: 'Crimson Ember',
+    subtitle: 'Warm volcanic basalt with rose-coral highlights',
+    bg: '#141011',
+    surface: '#1c1618',
+    surfaceOffset: '#2a2024',
+    border: '#3f3035',
+    text: '#f5ebed',
+    muted: '#a89499',
+    primary: '#fb7185',
+  },
+];
+
+let _activeTheme = 'obsidian';
+function applyTheme(themeId, persistLocal = true) {
+  let clean = String(themeId || 'obsidian').trim().toLowerCase();
+  if (clean === 'dark' || !DARK_THEMES.some(t => t.id === clean)) {
+    clean = 'obsidian';
+  }
+  _activeTheme = clean;
+  document.documentElement.setAttribute('data-theme', clean);
+  if (persistLocal) {
+    try { localStorage.setItem('sd_theme', clean); } catch (_) {}
+  }
+}
+try {
+  const savedLocalTheme = localStorage.getItem('sd_theme');
+  if (savedLocalTheme) applyTheme(savedLocalTheme, false);
+} catch (_) {}
 
 async function apiFetch(path, opts={}) {
   const headers = { ...(opts.headers||{}) };
@@ -714,6 +830,7 @@ document.getElementById('login-form').addEventListener('submit', async e => {
     });
     _token = data.token;
     sessionStorage.setItem('sd_token', _token);
+    if (data.theme) applyTheme(data.theme, true);
     await initApp();
   } catch(err) {
     if (err.locked && err.retry_after > 0) {
@@ -773,6 +890,10 @@ async function initApp() {
   try {
     _user = await apiJSON('/api/auth/me');
   } catch(_) { doLogout(); return; }
+
+  if (_user && _user.theme) {
+    applyTheme(_user.theme, true);
+  }
 
   document.getElementById('sidebar-user').textContent = _user.username;
   document.getElementById('login-screen').style.display = 'none';
@@ -3986,7 +4107,7 @@ async function renderSettings() {
   await refreshODStatus();
   try { smbProxyCreds = await apiJSON('/api/smb/proxy-credentials'); } catch(_) {}
 
-  const validTabs = ['gdrive', 'onedrive', 'smb', 'oauth', 'od_oauth', 'proxy', 'system'];
+  const validTabs = ['gdrive', 'onedrive', 'smb', 'oauth', 'od_oauth', 'proxy', 'themes', 'system'];
   if (!validTabs.includes(_settingsTab)) {
     _settingsTab = 'gdrive';
   }
@@ -3997,6 +4118,7 @@ async function renderSettings() {
   const showOAuth    = _settingsTab === 'oauth';
   const showOdOAuth  = _settingsTab === 'od_oauth';
   const showProxy    = _settingsTab === 'proxy';
+  const showThemes   = _settingsTab === 'themes';
   const showSystem   = _settingsTab === 'system';
   const oauthOpen    = true;
   const defaultRedir   = _gdConfig.redirect_uri || `${location.origin}/api/gdrive/callback`;
@@ -4036,7 +4158,7 @@ async function renderSettings() {
       <div>
         <h2 style="font-size:var(--text-lg);font-weight:700;letter-spacing:-.01em">Settings &amp; Connections</h2>
         <p style="font-size:var(--text-xs);color:var(--color-text-muted);margin-top:2px">
-          Manage Google Drive &amp; OneDrive accounts, SMB shares, network credentials, and security policies.
+          Manage Google Drive &amp; OneDrive accounts, SMB shares, network credentials, dark themes, and security policies.
         </p>
       </div>
       <div class="settings-tabs">
@@ -4057,6 +4179,9 @@ async function renderSettings() {
         </button>
         <button class="settings-tab ${_settingsTab==='proxy'?'active':''}" onclick="setSettingsTab('proxy')">
           <svg data-lucide="network"></svg> SMB Proxy
+        </button>
+        <button class="settings-tab ${_settingsTab==='themes'?'active':''}" onclick="setSettingsTab('themes')">
+          <svg data-lucide="palette"></svg> Themes
         </button>
         <button class="settings-tab ${_settingsTab==='system'?'active':''}" onclick="setSettingsTab('system')">
           <svg data-lucide="shield-check"></svg> Security &amp; About
@@ -4546,6 +4671,71 @@ async function renderSettings() {
     </div>
     ` : ''}
 
+    ${showThemes ? `
+    <div class="card">
+      <div class="card-header">
+        <div style="display:flex;align-items:center;gap:var(--space-2)">
+          <svg data-lucide="palette" width="16" height="16" style="color:var(--color-primary)"></svg>
+          <span class="card-title">Appearance &amp; Dark Themes</span>
+        </div>
+        <span style="font-size:var(--text-xs);color:var(--color-text-muted)">
+          Active: <strong style="color:var(--color-text)">${escHtml((DARK_THEMES.find(t => t.id === _activeTheme) || DARK_THEMES[0]).name)}</strong> · Saved to account
+        </span>
+      </div>
+      <div class="card-body" style="display:flex;flex-direction:column;gap:var(--space-4)">
+        <p style="font-size:var(--text-xs);color:var(--color-text-muted)">
+          Select a dark theme below. Your preference is saved to your SageDrive user profile and automatically restored whenever you sign in on any device.
+        </p>
+        <div class="theme-grid">
+          ${DARK_THEMES.map(t => {
+            const isSelected = _activeTheme === t.id;
+            return `
+            <button type="button" class="theme-card ${isSelected ? 'active' : ''}" onclick="selectTheme('${escAttr(t.id)}')">
+              <div class="theme-preview" style="background:${t.bg}">
+                <div class="theme-preview-sidebar" style="background:${t.surface}">
+                  <div style="width:70%;height:7px;border-radius:3px;background:${t.primary}"></div>
+                  <div style="width:90%;height:6px;border-radius:3px;background:${t.surfaceOffset};margin-top:4px"></div>
+                  <div style="width:80%;height:6px;border-radius:3px;background:${t.surfaceOffset}"></div>
+                  <div style="width:60%;height:6px;border-radius:3px;background:${t.surfaceOffset}"></div>
+                </div>
+                <div class="theme-preview-main">
+                  <div style="display:flex;align-items:center;justify-content:space-between">
+                    <div style="width:45%;height:7px;border-radius:3px;background:${t.text};opacity:.85"></div>
+                    <div style="width:24px;height:10px;border-radius:3px;background:${t.primary}"></div>
+                  </div>
+                  <div style="height:20px;border-radius:4px;background:${t.surface};border:1px solid ${t.border};display:flex;align-items:center;padding:0 6px;gap:5px;margin-top:2px">
+                    <div style="width:8px;height:8px;border-radius:2px;background:${t.primary}"></div>
+                    <div style="width:55%;height:5px;border-radius:2px;background:${t.text};opacity:.75"></div>
+                  </div>
+                  <div style="height:20px;border-radius:4px;background:${t.surface};border:1px solid ${t.border};display:flex;align-items:center;padding:0 6px;gap:5px">
+                    <div style="width:8px;height:8px;border-radius:2px;background:${t.muted}"></div>
+                    <div style="width:42%;height:5px;border-radius:2px;background:${t.muted};opacity:.7"></div>
+                  </div>
+                </div>
+              </div>
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:var(--space-2)">
+                <span style="font-weight:600;font-size:var(--text-sm);color:var(--color-text)">${escHtml(t.name)}</span>
+                ${isSelected
+                  ? `<span style="display:inline-flex;align-items:center;gap:4px;font-size:var(--text-xs);font-weight:600;color:var(--color-primary)"><svg data-lucide="check" width="14" height="14"></svg> Active</span>`
+                  : `<span style="font-size:var(--text-xs);color:var(--color-text-muted)">Select</span>`}
+              </div>
+              <div style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.4">
+                ${escHtml(t.subtitle)}
+              </div>
+              <div class="theme-swatch-row">
+                <span class="theme-swatch-dot" style="background:${t.bg}" title="Canvas ${t.bg}"></span>
+                <span class="theme-swatch-dot" style="background:${t.surface}" title="Surface ${t.surface}"></span>
+                <span class="theme-swatch-dot" style="background:${t.surfaceOffset}" title="Elevated ${t.surfaceOffset}"></span>
+                <span class="theme-swatch-dot" style="background:${t.primary}" title="Accent ${t.primary}"></span>
+                <span style="margin-left:auto;font-family:var(--font-mono);font-size:11px;color:var(--color-text-faint)">${escHtml(t.primary)}</span>
+              </div>
+            </button>`;
+          }).join('')}
+        </div>
+      </div>
+    </div>
+    ` : ''}
+
   </div>`;
   lucide.createIcons();
 }
@@ -4980,10 +5170,28 @@ function escHtml(s) {
   return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 function escAttr(s) { return escHtml(s); }
-function toggleTheme() {
-  const html = document.documentElement;
-  const t = html.getAttribute('data-theme')==='dark' ? 'light' : 'dark';
-  html.setAttribute('data-theme', t);
+
+async function selectTheme(themeId, silent = false) {
+  applyTheme(themeId, true);
+  if (_user) _user.theme = _activeTheme;
+  if (_view === 'settings' && _settingsTab === 'themes') {
+    renderSettings();
+  }
+  const themeObj = DARK_THEMES.find(t => t.id === _activeTheme) || DARK_THEMES[0];
+  try {
+    if (_token) {
+      await apiJSON('/api/auth/theme', { method: 'POST', json: { theme: _activeTheme } });
+    }
+    if (!silent) toast(`Theme set to ${themeObj.name}`, 'success');
+  } catch (e) {
+    if (!silent) toast('Failed to save theme: ' + e.message, 'error');
+  }
+}
+
+function cycleTheme() {
+  const idx = DARK_THEMES.findIndex(t => t.id === _activeTheme);
+  const next = DARK_THEMES[(idx + 1) % DARK_THEMES.length];
+  selectTheme(next.id, false);
 }
 
 function isCompactViewport() {

@@ -91,6 +91,32 @@ def get_session(token):
     SESSIONS.pop(token, None)
     return None
 
+VALID_THEMES = {"obsidian", "midnight", "amethyst", "emerald", "ember"}
+DEFAULT_THEME = "obsidian"
+
+def get_user_theme(username):
+    users = _load_users()
+    user = users.get((username or "").strip()) or {}
+    theme = str(user.get("theme") or DEFAULT_THEME).strip().lower()
+    if theme == "dark":
+        theme = DEFAULT_THEME
+    return theme if theme in VALID_THEMES else DEFAULT_THEME
+
+def set_user_theme(username, theme):
+    uname = (username or "").strip()
+    clean_theme = str(theme or DEFAULT_THEME).strip().lower()
+    if clean_theme not in VALID_THEMES:
+        raise ValueError(f"Invalid theme '{theme}'. Choose from: {', '.join(sorted(VALID_THEMES))}")
+    users = _load_users()
+    if uname not in users:
+        raise ValueError("User not found")
+    users[uname]["theme"] = clean_theme
+    _save_users(users)
+    for sess in SESSIONS.values():
+        if sess.get("username") == uname:
+            sess["theme"] = clean_theme
+    return clean_theme
+
 def require_auth(f):
     @wraps(f)
     def wrapper(*args, **kwargs):

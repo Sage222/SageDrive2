@@ -1028,6 +1028,17 @@ async function streamFileResponse(req, res, item) {
   return stream.pipe(res);
 }
 
+const VALID_THEMES = new Set(['obsidian', 'midnight', 'amethyst', 'emerald', 'ember']);
+const DEFAULT_THEME = 'obsidian';
+
+function getUserTheme(username) {
+  const users = loadJson(USERS_FILE, {});
+  const user = users[String(username || '').trim()] || {};
+  let t = String(user.theme || DEFAULT_THEME).trim().toLowerCase();
+  if (t === 'dark') t = DEFAULT_THEME;
+  return VALID_THEMES.has(t) ? t : DEFAULT_THEME;
+}
+
 // ── Auth (with 5-Strike / 15-Minute Anti-Hammering Lockout) ───────────────────
 app.post('/api/auth/login', (req, res) => {
   const body = req.body || {};
@@ -1065,9 +1076,11 @@ app.post('/api/auth/login', (req, res) => {
       saveJson(USERS_FILE, users);
     }
     const token = crypto.randomBytes(32).toString('hex');
+    const theme = getUserTheme(u);
     sessionsMap.set(token, {
       username: u,
       role: user.role,
+      theme,
       expires: Date.now() + SESSION_TTL,
     });
     persistSessions();
@@ -1075,7 +1088,7 @@ app.post('/api/auth/login', (req, res) => {
       'Set-Cookie',
       `sd_token=${encodeURIComponent(token)}; Path=/; Max-Age=${Math.floor(SESSION_TTL / 1000)}; HttpOnly; SameSite=Lax`
     );
-    return res.json({ token });
+    return res.json({ token, theme });
   }
 
   const fails = Number(record.failed_attempts || 0) + 1;
@@ -1109,7 +1122,25 @@ app.post('/api/auth/logout', requireAuth, (req, res) => {
 });
 
 app.get('/api/auth/me', requireAuth, (req, res) => {
-  return res.json({ username: req.session.username, role: req.session.role });
+  const theme = getUserTheme(req.session.username);
+  return res.json({ username: req.session.username, role: req.session.role, theme });
+});
+
+app.post('/api/auth/theme', requireAuth, (req, res) => {
+  const rawTheme = String((req.body && req.body.theme) || DEFAULT_THEME).trim().toLowerCase();
+  if (!VALID_THEMES.has(rawTheme)) {
+    return res.status(400).json({ error: `Invalid theme '${rawTheme}'` });
+  }
+  const users = loadJson(USERS_FILE, {});
+  const uname = req.session.username;
+  if (!users[uname]) {
+    return res.status(404).json({ error: 'User not found' });
+  }
+  users[uname].theme = rawTheme;
+  saveJson(USERS_FILE, users);
+  req.session.theme = rawTheme;
+  persistSessions();
+  return res.json({ ok: true, theme: rawTheme });
 });
 
 // ── SMB Helpers & Routes ──────────────────────────────────────────────────────

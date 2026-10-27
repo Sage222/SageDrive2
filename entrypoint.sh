@@ -12,6 +12,8 @@ data_dir = Path('/app/data')
 accounts_file = data_dir / 'gdrive_accounts.json'
 token_file = data_dir / 'gdrive_token.json'
 config_file = data_dir / 'gdrive_client.json'
+od_accounts_file = data_dir / 'onedrive_accounts.json'
+od_config_file = data_dir / 'onedrive_client.json'
 
 cfg = {}
 if config_file.exists():
@@ -19,6 +21,13 @@ if config_file.exists():
         cfg = json.loads(config_file.read_text())
     except Exception:
         cfg = {}
+
+od_cfg = {}
+if od_config_file.exists():
+    try:
+        od_cfg = json.loads(od_config_file.read_text())
+    except Exception:
+        od_cfg = {}
 
 accounts = []
 if accounts_file.exists():
@@ -42,6 +51,15 @@ if not accounts and token_file.exists():
                 "smb_share_name": "GoogleDrive",
                 "creds": legacy,
             }]
+    except Exception:
+        pass
+
+od_accounts = []
+if od_accounts_file.exists():
+    try:
+        loaded_od = json.loads(od_accounts_file.read_text())
+        if isinstance(loaded_od, list):
+            od_accounts = loaded_od
     except Exception:
         pass
 
@@ -74,6 +92,8 @@ smb_conf_lines = [
 os.makedirs('/root/.config/rclone', exist_ok=True)
 os.makedirs('/mnt/gdrive_mounts', exist_ok=True)
 
+used_share_names = set()
+
 for idx, acc in enumerate(accounts):
     d = acc.get("creds") or {}
     if not (d.get("token") or d.get("refresh_token")):
@@ -103,13 +123,64 @@ scope = drive
 token = {rclone_token}
 """)
     if bool(acc.get("smb_enabled", True)):
-        share_name = safe_share_name(acc.get("smb_share_name") or ("GoogleDrive" if idx == 0 else f"GoogleDrive_{idx+1}"))
+        base_share = safe_share_name(acc.get("smb_share_name") or ("GoogleDrive" if idx == 0 else f"GoogleDrive_{idx+1}"))
+        share_name = base_share
+        s_idx = 2
+        while share_name.lower() in used_share_names:
+            share_name = f"{base_share}_{s_idx}"
+            s_idx += 1
+        used_share_names.add(share_name.lower())
         mpath = f"/mnt/gdrive_mounts/{rc_id}"
         os.makedirs(mpath, exist_ok=True)
         smb_conf_lines.extend([
             f"[{share_name}]",
             f"   path = {mpath}",
             f"   comment = SageDrive - {acc.get('custom_name') or acc.get('name') or share_name}",
+            "   valid users = @sambausers",
+            "   writable = yes",
+            "   browseable = yes",
+            "   create mask = 0775",
+            "   directory mask = 0775",
+            "",
+        ])
+
+for idx, acc in enumerate(od_accounts):
+    d = acc.get("creds") or {}
+    if not (d.get("access_token") or d.get("refresh_token")):
+        continue
+    rc_id = safe_rclone_id(f"onedrive_{acc.get('id', f'od_{idx+1}')}")
+    rclone_token = json.dumps({
+        "access_token": d.get("access_token", ""),
+        "token_type": "Bearer",
+        "refresh_token": d.get("refresh_token", ""),
+        "expiry": "2020-01-01T00:00:00Z"
+    })
+    cid = d.get("client_id") or od_cfg.get("client_id", "")
+    csec = d.get("client_secret") or od_cfg.get("client_secret", "")
+    drive_id = acc.get("drive_id") or d.get("drive_id") or ""
+    drive_type = acc.get("drive_type") or d.get("drive_type") or "personal"
+    rclone_blocks.append(f"""[onedrive_{rc_id}]
+type = onedrive
+client_id = {cid}
+client_secret = {csec}
+token = {rclone_token}
+drive_id = {drive_id}
+drive_type = {drive_type}
+""")
+    if bool(acc.get("smb_enabled", True)):
+        base_share = safe_share_name(acc.get("smb_share_name") or ("OneDrive" if idx == 0 else f"OneDrive_{idx+1}"), fallback="OneDrive")
+        share_name = base_share
+        s_idx = 2
+        while share_name.lower() in used_share_names:
+            share_name = f"{base_share}_{s_idx}"
+            s_idx += 1
+        used_share_names.add(share_name.lower())
+        mpath = f"/mnt/gdrive_mounts/{rc_id}"
+        os.makedirs(mpath, exist_ok=True)
+        smb_conf_lines.extend([
+            f"[{share_name}]",
+            f"   path = {mpath}",
+            f"   comment = SageDrive OneDrive - {acc.get('custom_name') or acc.get('name') or share_name}",
             "   valid users = @sambausers",
             "   writable = yes",
             "   browseable = yes",
@@ -144,7 +215,26 @@ for idx, acc in enumerate(accounts):
     ], check=False)
     mounted_count += 1
 
-print(f"✅ Configured {len(accounts)} Google Drive account(s) and mounted {mounted_count} SMB Proxy share(s).")
+for idx, acc in enumerate(od_accounts):
+    d = acc.get("creds") or {}
+    if not bool(acc.get("smb_enabled", True)) or not (d.get("access_token") or d.get("refresh_token")):
+        continue
+    rc_id = safe_rclone_id(f"onedrive_{acc.get('id', f'od_{idx+1}')}")
+    mpath = f"/mnt/gdrive_mounts/{rc_id}"
+    subprocess.run([
+        "rclone", "mount", f"onedrive_{rc_id}:", mpath,
+        "--config", "/root/.config/rclone/rclone.conf",
+        "--allow-other",
+        "--buffer-size", "16M",
+        "--vfs-read-chunk-size", "32M",
+        "--vfs-cache-mode", "writes",
+        "--vfs-cache-max-size", "512M",
+        "--dir-cache-time", "5m",
+        "--daemon"
+    ], check=False)
+    mounted_count += 1
+
+print(f"✅ Configured {len(accounts)} Google Drive(s), {len(od_accounts)} OneDrive(s), and mounted {mounted_count} SMB Proxy share(s).")
 PYEOF
 sleep 2
 

@@ -10,7 +10,7 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
-import auth, smb_manager, gdrive_manager
+import auth, smb_manager, gdrive_manager, onedrive_manager
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 CORS(app, supports_credentials=True, expose_headers=["Content-Length", "Content-Range", "Accept-Ranges", "Content-Disposition"])
@@ -984,6 +984,12 @@ class _InternalMediaRangeHandler(BaseHTTPRequestHandler):
                 meta = gdrive_manager.get_file_meta(file_id, account_id=account_id)
                 file_size = meta["size"]
                 kind = "gdrive"
+            elif parsed.path.startswith("/onedrive/"):
+                file_id = unquote(parsed.path[len("/onedrive/"):])
+                account_id = qs.get("account_id", [None])[0]
+                meta = onedrive_manager.get_file_meta(file_id, account_id=account_id)
+                file_size = meta["size"]
+                kind = "onedrive"
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -1034,6 +1040,9 @@ class _InternalMediaRangeHandler(BaseHTTPRequestHandler):
             fetch_len = length
             if kind == "smb":
                 gen = smb_manager.stream_file_range(share_id, smb_path, start=start, length=fetch_len)
+            elif kind == "onedrive":
+                end_byte = (start + fetch_len - 1) if fetch_len > 0 else None
+                gen = onedrive_manager.stream_file_range(file_id, start=start, end=end_byte, account_id=account_id)
             else:
                 end_byte = (start + fetch_len - 1) if fetch_len > 0 else None
                 gen = gdrive_manager.stream_file_range(file_id, start=start, end=end_byte, account_id=account_id)
@@ -1072,6 +1081,12 @@ def _internal_smb_url(share_id, path):
 
 def _internal_gdrive_url(file_id, account_id=None):
     base = f"http://127.0.0.1:{_INTERNAL_MEDIA_PORT}/gdrive/{quote(str(file_id))}"
+    if account_id:
+        return f"{base}?account_id={quote(str(account_id))}"
+    return base
+
+def _internal_onedrive_url(file_id, account_id=None):
+    base = f"http://127.0.0.1:{_INTERNAL_MEDIA_PORT}/onedrive/{quote(str(file_id))}"
     if account_id:
         return f"{base}?account_id={quote(str(account_id))}"
     return base
@@ -1284,6 +1299,25 @@ def _analyze_probe_data(data, filename=""):
             "title": tags.get("title") or tags.get("TITLE") or "",
         })
 
+    bitmap_sub_codecs = {"hdmv_pgs_subtitle", "pgssub", "dvd_subtitle", "dvdsub", "dvb_subtitle", "dvbsub", "xsub"}
+    subtitle_streams = [s for s in streams if s.get("codec_type") == "subtitle"]
+    subtitle_tracks_out = []
+    for s_idx, s in enumerate(subtitle_streams):
+        scodec = (s.get("codec_name") or "unknown").lower()
+        if scodec in bitmap_sub_codecs:
+            continue
+        tags = s.get("tags") or {}
+        disp = s.get("disposition") or {}
+        subtitle_tracks_out.append({
+            "index": s_idx,
+            "stream_index": s.get("index", s_idx),
+            "codec": scodec,
+            "language": tags.get("language") or tags.get("LANGUAGE") or "",
+            "title": tags.get("title") or tags.get("TITLE") or "",
+            "forced": bool(disp.get("forced")),
+            "default": bool(disp.get("default")),
+        })
+
     duration = _extract_probe_duration(fmt, streams)
 
     return {
@@ -1294,6 +1328,7 @@ def _analyze_probe_data(data, filename=""):
         "audio_codec": audio_codec,
         "audio_channels": audio_channels,
         "audio_streams": audio_tracks_out,
+        "subtitle_streams": subtitle_tracks_out,
         "duration": duration,
         "needs_audio_transcode": needs_audio_transcode,
         "needs_video_transcode": needs_video_transcode,
@@ -1307,7 +1342,7 @@ def probe_media_info(cache_key, internal_url, filename="", fallback_gen_fn=None)
     if cached and (now - cached[0]) < _PROBE_TTL:
         return cached[1]
 
-    show_entries = "stream=index,codec_type,codec_name,profile,pix_fmt,channels,sample_rate,duration:stream_tags:format=format_name,duration:format_tags"
+    show_entries = "stream=index,codec_type,codec_name,profile,pix_fmt,channels,sample_rate,duration:stream_disposition=default,forced:stream_tags:format=format_name,duration:format_tags"
     cmd = [
         "ffprobe",
         "-v", "error",
@@ -1684,6 +1719,29 @@ def transcode_audio_stream(chunk_iterable, internal_url=None, start_time=0.0):
             except Exception:
                 pass
 
+def extract_webvtt_subtitles(internal_url, subtitle_track=0, start_time=0.0):
+    """
+    Extracts an embedded MKV/MP4 subtitle track (SRT/SubRip, ASS/SSA, WebVTT, mov_text)
+    and converts it on the fly to WebVTT aligned to start_time (?ss=).
+    """
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+    if start_time and start_time > 0:
+        cmd += ["-ss", f"{start_time:.3f}"]
+    cmd += [
+        "-i", internal_url,
+        "-map", f"0:s:{max(0, int(subtitle_track))}",
+        "-c:s", "webvtt",
+        "-f", "webvtt",
+        "pipe:1",
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if res.stdout and "WEBVTT" in res.stdout:
+            return res.stdout
+    except Exception:
+        pass
+    return "WEBVTT\n\n"
+
 # ── SPA catch-all ─────────────────────────────────────────────────────────────
 @app.route("/", defaults={"path": ""}, methods=["GET"])
 @app.route("/<path:path>", methods=["GET"])
@@ -1795,6 +1853,23 @@ def smb_probe(share_id):
             fallback_gen_fn=lambda: smb_manager.stream_file_range(share_id, path, start=0, length=4 * 1024 * 1024),
         )
         return jsonify(info)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.get("/api/smb/subtitles/<share_id>")
+@auth.require_auth
+def smb_subtitles(share_id):
+    try:
+        path = _sanitize_smb_path(request.args.get("path", ""), allow_root=False)
+        track = int(request.args.get("track", "0") or 0)
+        start_time = float(request.args.get("ss", "0") or 0.0)
+        internal_url = _internal_smb_url(share_id, path)
+        vtt = extract_webvtt_subtitles(internal_url, subtitle_track=track, start_time=start_time)
+        resp = app.response_class(vtt, status=200, mimetype="text/vtt; charset=utf-8")
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
@@ -2139,6 +2214,21 @@ def gdrive_probe(file_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.get("/api/gdrive/subtitles/<file_id>")
+@auth.require_auth
+def gdrive_subtitles(file_id):
+    account_id = request.args.get("account_id", "").strip() or None
+    try:
+        track = int(request.args.get("track", "0") or 0)
+        start_time = float(request.args.get("ss", "0") or 0.0)
+        internal_url = _internal_gdrive_url(file_id, account_id=account_id)
+        vtt = extract_webvtt_subtitles(internal_url, subtitle_track=track, start_time=start_time)
+        resp = app.response_class(vtt, status=200, mimetype="text/vtt; charset=utf-8")
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.get("/api/gdrive/download/<file_id>")
 @auth.require_auth
 def gdrive_download(file_id):
@@ -2371,79 +2461,423 @@ def gdrive_mkdir():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ── Cross-Drive Transfer & Move (SMB <-> Google Drive & SMB <-> SMB & GDrive <-> GDrive) ──
-def _copy_smb_item_to_gdrive(src_share, smb_path, is_folder, dest_folder_id, dest_account_id=None):
-    norm_smb = _sanitize_smb_path(smb_path, allow_root=False)
-    name = norm_smb.rstrip("/").split("/")[-1]
+# ── Microsoft OneDrive ────────────────────────────────────────────────────────
+@app.get("/api/onedrive/status")
+@auth.require_auth
+def onedrive_status():
+    accounts = onedrive_manager.list_accounts()
+    return jsonify({
+        "configured": onedrive_manager.is_configured(),
+        "authenticated": onedrive_manager.is_authenticated(),
+        "accounts": accounts,
+    })
+
+@app.get("/api/onedrive/accounts")
+@auth.require_auth
+def onedrive_list_accounts():
+    return jsonify(onedrive_manager.list_accounts())
+
+@app.post("/api/onedrive/accounts/<account_id>/rename")
+@auth.require_auth
+def onedrive_rename_account(account_id):
+    b = request.get_json(force=True) or {}
+    new_name = (b.get("name") or b.get("custom_name") or "").strip()
+    try:
+        acc = onedrive_manager.rename_account(account_id, new_name)
+        return jsonify(acc)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.delete("/api/onedrive/accounts/<account_id>")
+@auth.require_auth
+def onedrive_delete_account(account_id):
+    onedrive_manager.remove_account(account_id)
+    try:
+        _reconcile_smb_proxy()
+    except Exception:
+        pass
+    return jsonify({"ok": True})
+
+@app.get("/api/onedrive/config")
+@auth.require_auth
+def onedrive_get_config():
+    return jsonify(onedrive_manager.get_config())
+
+@app.post("/api/onedrive/config")
+@auth.require_auth
+def onedrive_save_config():
+    b = request.get_json(force=True) or {}
+    onedrive_manager.save_config(
+        b.get("client_id", ""),
+        b.get("client_secret", ""),
+        b.get("redirect_uri", ""),
+        b.get("tenant_id", "common"),
+    )
+    return jsonify({"ok": True, "configured": onedrive_manager.is_configured()})
+
+@app.get("/api/onedrive/auth")
+@auth.require_auth
+def onedrive_auth():
+    if not onedrive_manager.is_configured():
+        return jsonify({"error": "OneDrive OAuth not configured"}), 400
+    custom_name = request.args.get("name", "").strip()
+    account_id = request.args.get("account_id", "").strip()
+    return jsonify({"url": onedrive_manager.get_auth_url(custom_name=custom_name, account_id=account_id)})
+
+@app.get("/api/onedrive/callback")
+def onedrive_callback():
+    code = request.args.get("code")
+    state = request.args.get("state")
+    if not code:
+        return "Missing code", 400
+    try:
+        onedrive_manager.handle_callback(code, state)
+        try:
+            _reconcile_smb_proxy()
+        except Exception:
+            pass
+        return redirect("/#onedrive-connected")
+    except Exception as e:
+        return f"OneDrive OAuth error: {e}", 500
+
+@app.delete("/api/onedrive/revoke")
+@auth.require_auth
+def onedrive_revoke():
+    account_id = request.args.get("account_id", "").strip() or None
+    onedrive_manager.revoke(account_id=account_id)
+    try:
+        _reconcile_smb_proxy()
+    except Exception:
+        pass
+    return jsonify({"ok": True})
+
+@app.get("/api/onedrive/files")
+@auth.require_auth
+def onedrive_files():
+    folder_id = request.args.get("folder", "root")
+    account_id = request.args.get("account_id", "").strip() or None
+    try:
+        return jsonify(onedrive_manager.list_files(folder_id, account_id=account_id))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.get("/api/onedrive/probe/<file_id>")
+@auth.require_auth
+def onedrive_probe(file_id):
+    account_id = request.args.get("account_id", "").strip() or None
+    try:
+        meta = onedrive_manager.get_file_meta(file_id, account_id=account_id)
+        filename = meta["name"]
+        file_size = meta["size"]
+        internal_url = _internal_onedrive_url(file_id, account_id=account_id)
+        end_byte = min(file_size - 1, 4 * 1024 * 1024 - 1) if file_size > 0 else 4 * 1024 * 1024 - 1
+        info = probe_media_info(
+            cache_key=f"onedrive:{account_id or 'default'}:{file_id}",
+            internal_url=internal_url,
+            filename=filename,
+            fallback_gen_fn=lambda: onedrive_manager.stream_file_range(file_id, start=0, end=end_byte, account_id=account_id),
+        )
+        return jsonify(info)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.get("/api/onedrive/subtitles/<file_id>")
+@auth.require_auth
+def onedrive_subtitles(file_id):
+    account_id = request.args.get("account_id", "").strip() or None
+    try:
+        track = int(request.args.get("track", "0") or 0)
+        start_time = float(request.args.get("ss", "0") or 0.0)
+        internal_url = _internal_onedrive_url(file_id, account_id=account_id)
+        vtt = extract_webvtt_subtitles(internal_url, subtitle_track=track, start_time=start_time)
+        resp = app.response_class(vtt, status=200, mimetype="text/vtt; charset=utf-8")
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.get("/api/onedrive/download/<file_id>")
+@auth.require_auth
+def onedrive_download(file_id):
+    account_id = request.args.get("account_id", "").strip() or None
+    try:
+        meta = onedrive_manager.get_file_meta(file_id, account_id=account_id)
+        filename = meta["name"]
+        raw_mime = meta["mimeType"]
+        file_size = meta["size"]
+
+        disposition = make_content_disposition(filename, bool(request.args.get("dl")))
+        internal_url = _internal_onedrive_url(file_id, account_id=account_id)
+
+        if request.args.get("transcode") == "1":
+            mode = request.args.get("mode", "auto")
+            audio_track = int(request.args.get("audio_track", "0") or 0)
+            start_time = float(request.args.get("ss", "0") or 0.0)
+            duration_hint = float(request.args.get("duration", "0") or 0.0)
+            end_byte = min(file_size - 1, 8 * 1024 * 1024 - 1) if file_size > 0 else 8 * 1024 * 1024 - 1
+            probe_info = probe_media_info(
+                cache_key=f"onedrive:{account_id or 'default'}:{file_id}",
+                internal_url=internal_url,
+                filename=filename,
+                fallback_gen_fn=lambda: onedrive_manager.stream_file_range(file_id, start=0, end=end_byte, account_id=account_id),
+            )
+            resp = app.response_class(
+                transcode_media_stream(
+                    internal_url=internal_url,
+                    chunk_iterable_fn=lambda: onedrive_manager.stream_file_range(file_id, start=0, end=None, account_id=account_id),
+                    filename=filename,
+                    mode=mode,
+                    audio_track=audio_track,
+                    start_time=start_time,
+                    probe_info=probe_info,
+                    duration_hint=duration_hint,
+                ),
+                status=200,
+                mimetype="video/mp4",
+                direct_passthrough=True,
+            )
+            resp.headers["Cache-Control"] = "no-cache"
+            resp.headers["Content-Disposition"] = disposition
+            return resp
+
+        if request.args.get("transcode") == "audio":
+            start_time = float(request.args.get("ss", "0") or 0.0)
+            resp = app.response_class(
+                transcode_audio_stream(
+                    lambda: onedrive_manager.stream_file_range(file_id, start=0, end=None, account_id=account_id),
+                    internal_url=internal_url,
+                    start_time=start_time,
+                ),
+                status=200,
+                mimetype="audio/mpeg",
+                direct_passthrough=True,
+            )
+            resp.headers["Cache-Control"] = "no-cache"
+            resp.headers["Content-Disposition"] = disposition
+            return resp
+
+        mime = guess_media_mime(filename, raw_mime)
+        range_header = request.headers.get("Range")
+
+        if range_header and file_size > 0:
+            m = re.search(r"bytes=(\d*)-(\d*)", range_header)
+            if not m:
+                resp = app.response_class("", status=416)
+                resp.headers["Content-Range"] = f"bytes */{file_size}"
+                return resp
+
+            if not m.group(1) and m.group(2):
+                suffix = int(m.group(2))
+                start = max(0, file_size - suffix)
+                end = file_size - 1
+            else:
+                start = int(m.group(1)) if m.group(1) else 0
+                end = int(m.group(2)) if m.group(2) else file_size - 1
+
+            if start >= file_size or start > end:
+                resp = app.response_class("", status=416)
+                resp.headers["Content-Range"] = f"bytes */{file_size}"
+                return resp
+
+            end = min(end, file_size - 1)
+            length = end - start + 1
+
+            resp = app.response_class(
+                onedrive_manager.stream_file_range(file_id, start=start, end=end, account_id=account_id),
+                status=206,
+                mimetype=mime,
+                direct_passthrough=True,
+            )
+            resp.headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+            resp.headers["Content-Length"] = str(length)
+            resp.headers["Accept-Ranges"] = "bytes"
+            resp.headers["Cache-Control"] = "no-cache"
+            resp.headers["Content-Disposition"] = disposition
+            return resp
+        else:
+            resp = app.response_class(
+                onedrive_manager.stream_file_range(file_id, start=0, end=None, account_id=account_id),
+                status=200,
+                mimetype=mime,
+                direct_passthrough=True,
+            )
+            if file_size > 0:
+                resp.headers["Content-Length"] = str(file_size)
+            resp.headers["Accept-Ranges"] = "bytes"
+            resp.headers["Cache-Control"] = "no-cache"
+            resp.headers["Content-Disposition"] = disposition
+            return resp
+    except Exception as e:
+        print(f"ONEDRIVE DOWNLOAD ERROR file_id={file_id}: {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
+
+@app.post("/api/onedrive/upload")
+@auth.require_auth
+def onedrive_upload():
+    folder_id = request.args.get("folder", "root")
+    account_id = request.args.get("account_id", "").strip() or None
+    rel_path = (request.form.get("relative_path") or request.args.get("relative_path") or "").strip()
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "No file provided"}), 400
+    try:
+        onedrive_manager.upload_file(
+            folder_id,
+            f.filename,
+            f.stream,
+            f.content_type or "application/octet-stream",
+            relative_path=rel_path or None,
+            account_id=account_id,
+        )
+        return jsonify({"ok": True})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.put("/api/onedrive/content/<file_id>")
+@auth.require_auth
+def onedrive_save_content(file_id):
+    b = request.get_json(force=True) or {}
+    account_id = (request.args.get("account_id") or b.get("account_id") or "").strip() or None
+    content = b.get("content")
+    if content is None:
+        return jsonify({"error": "content is required"}), 400
+    try:
+        meta = onedrive_manager.get_file_meta(file_id, account_id=account_id)
+        mime = guess_media_mime(meta.get("name", "file.txt"), meta.get("mimeType"))
+        if mime == "application/octet-stream":
+            mime = "text/plain; charset=utf-8"
+        encoded = str(content).encode("utf-8")
+        updated = onedrive_manager.update_file_content(
+            file_id,
+            io.BytesIO(encoded),
+            mime_type=mime,
+            account_id=account_id,
+        )
+        return jsonify({"ok": True, "size": len(encoded), "file": updated})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.post("/api/onedrive/rename/<file_id>")
+@auth.require_auth
+def onedrive_rename(file_id):
+    b = request.get_json(force=True) or {}
+    account_id = (request.args.get("account_id") or b.get("account_id") or "").strip() or None
+    new_name = (b.get("name") or b.get("new_name") or "").strip()
+    if not new_name:
+        return jsonify({"error": "New name is required"}), 400
+    try:
+        onedrive_manager.rename_file(file_id, new_name, account_id=account_id)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.post("/api/onedrive/zip")
+@auth.require_auth
+def onedrive_zip():
+    b = request.get_json(force=True) or {}
+    account_id = (request.args.get("account_id") or b.get("account_id") or "").strip() or None
+    ids = b.get("ids") or []
+    if not ids:
+        return jsonify({"error": "No file IDs provided"}), 400
+    try:
+        tmp_path, zip_size = onedrive_manager.create_zip_tmpfile(ids, account_id=account_id)
+        archive_name = b.get("name") or "OneDrive_Download.zip"
+        resp = app.response_class(
+            _stream_and_unlink_tmpfile(tmp_path),
+            status=200,
+            mimetype="application/zip",
+            direct_passthrough=True,
+        )
+        resp.headers["Content-Length"] = str(zip_size)
+        resp.headers["Content-Disposition"] = make_content_disposition(archive_name, True)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.delete("/api/onedrive/delete/<file_id>")
+@auth.require_auth
+def onedrive_delete(file_id):
+    account_id = request.args.get("account_id", "").strip() or None
+    try:
+        onedrive_manager.delete_file(file_id, account_id=account_id)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.post("/api/onedrive/mkdir")
+@auth.require_auth
+def onedrive_mkdir():
+    b = request.get_json(force=True) or {}
+    account_id = (request.args.get("account_id") or b.get("account_id") or "").strip() or None
+    try:
+        fid = onedrive_manager.create_folder(b.get("parent", "root"), b.get("name", "New Folder"), account_id=account_id)
+        return jsonify({"id": fid})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ── Cross-Drive Transfer & Move (SMB <-> Google Drive <-> OneDrive) ───────────
+def _read_source_item_tree(src_type, src_drive, item):
+    """
+    Returns (name, is_folder, children_or_None, read_bytes_and_mime_fn).
+    """
+    if src_type == "smb":
+        norm_smb = _sanitize_smb_path(item["path"], allow_root=False)
+        name = norm_smb.rstrip("/").split("/")[-1]
+        is_folder = item.get("type") == "folder"
+        if is_folder:
+            children = smb_manager.browse(src_drive, norm_smb)
+            return name, True, children, None
+        return name, False, None, lambda: (smb_manager.read_file_bytes(src_drive, norm_smb), guess_media_mime(name))
+    elif src_type == "gdrive":
+        fid = item["id"]
+        meta = gdrive_manager.get_file_meta(fid, account_id=src_drive)
+        name = meta["name"]
+        is_folder = item.get("type") == "folder" or meta.get("mimeType") == "application/vnd.google-apps.folder"
+        if is_folder:
+            children = gdrive_manager.list_files(fid, account_id=src_drive)
+            return name, True, children, None
+        return name, False, None, lambda: (gdrive_manager.download_file(fid, account_id=src_drive)[0], meta.get("mimeType") or guess_media_mime(name))
+    elif src_type == "onedrive":
+        fid = item["id"]
+        meta = onedrive_manager.get_file_meta(fid, account_id=src_drive)
+        name = meta["name"]
+        is_folder = item.get("type") == "folder" or meta.get("isFolder") or meta.get("mimeType") == "application/vnd.ms-folder"
+        if is_folder:
+            children = onedrive_manager.list_files(fid, account_id=src_drive)
+            return name, True, children, None
+        return name, False, None, lambda: (onedrive_manager.download_file(fid, account_id=src_drive)[0], meta.get("mimeType") or guess_media_mime(name))
+    raise ValueError(f"Unsupported source drive type: {src_type!r}")
+
+def _copy_item_across_drives(src_type, src_drive, item, dest_type, dest_drive, dest_folder):
+    name, is_folder, children, read_fn = _read_source_item_tree(src_type, src_drive, item)
     if is_folder:
-        new_folder_id = gdrive_manager.ensure_folder_path(dest_folder_id, [name], account_id=dest_account_id)
-        for child in smb_manager.browse(src_share, norm_smb):
-            _copy_smb_item_to_gdrive(
-                src_share,
-                child["path"],
-                child["type"] == "folder",
-                new_folder_id,
-                dest_account_id=dest_account_id,
-            )
+        if dest_type == "smb":
+            norm_dest = _sanitize_smb_path(dest_folder, allow_root=True)
+            next_dest = _sanitize_smb_path(norm_dest.rstrip("/") + "/" + name, allow_root=False)
+            smb_manager.create_directory(dest_drive, next_dest)
+        elif dest_type == "gdrive":
+            next_dest = gdrive_manager.ensure_folder_path(dest_folder, [name], account_id=dest_drive)
+        elif dest_type == "onedrive":
+            next_dest = onedrive_manager.ensure_folder_path(dest_folder, [name], account_id=dest_drive)
+        else:
+            raise ValueError(f"Unsupported destination drive type: {dest_type!r}")
+        for ch in (children or []):
+            _copy_item_across_drives(src_type, src_drive, ch, dest_type, dest_drive, next_dest)
     else:
-        data = smb_manager.read_file_bytes(src_share, norm_smb)
-        mime = guess_media_mime(name)
-        gdrive_manager.upload_file(dest_folder_id, name, data, mime, account_id=dest_account_id)
-
-def _copy_gdrive_item_to_smb(file_id, is_folder, dest_share, dest_smb_dir, src_account_id=None):
-    meta = gdrive_manager.get_file_meta(file_id, account_id=src_account_id)
-    name = meta["name"]
-    norm_dest = _sanitize_smb_path(dest_smb_dir, allow_root=True)
-    target_path = _sanitize_smb_path(norm_dest.rstrip("/") + "/" + name, allow_root=False)
-    if is_folder or meta["mimeType"] == "application/vnd.google-apps.folder":
-        smb_manager.create_directory(dest_share, target_path)
-        for child in gdrive_manager.list_files(file_id, account_id=src_account_id):
-            _copy_gdrive_item_to_smb(
-                child["id"],
-                child["type"] == "folder",
-                dest_share,
-                target_path,
-                src_account_id=src_account_id,
-            )
-    else:
-        data, _, _ = gdrive_manager.download_file(file_id, account_id=src_account_id)
-        smb_manager.upload_file(dest_share, target_path, data)
-
-def _copy_smb_item_to_smb(src_share, smb_path, is_folder, dest_share, dest_smb_dir):
-    norm_smb = _sanitize_smb_path(smb_path, allow_root=False)
-    name = norm_smb.rstrip("/").split("/")[-1]
-    norm_dest = _sanitize_smb_path(dest_smb_dir, allow_root=True)
-    target_path = _sanitize_smb_path(norm_dest.rstrip("/") + "/" + name, allow_root=False)
-    if is_folder:
-        smb_manager.create_directory(dest_share, target_path)
-        for child in smb_manager.browse(src_share, norm_smb):
-            _copy_smb_item_to_smb(
-                src_share,
-                child["path"],
-                child["type"] == "folder",
-                dest_share,
-                target_path,
-            )
-    else:
-        data = smb_manager.read_file_bytes(src_share, norm_smb)
-        smb_manager.upload_file(dest_share, target_path, data)
-
-def _copy_gdrive_item_to_gdrive(file_id, is_folder, dest_folder_id, src_account_id=None, dest_account_id=None):
-    meta = gdrive_manager.get_file_meta(file_id, account_id=src_account_id)
-    name = meta["name"]
-    if is_folder or meta["mimeType"] == "application/vnd.google-apps.folder":
-        new_folder_id = gdrive_manager.ensure_folder_path(dest_folder_id, [name], account_id=dest_account_id)
-        for child in gdrive_manager.list_files(file_id, account_id=src_account_id):
-            _copy_gdrive_item_to_gdrive(
-                child["id"],
-                child["type"] == "folder",
-                new_folder_id,
-                src_account_id=src_account_id,
-                dest_account_id=dest_account_id,
-            )
-    else:
-        data, _, mime = gdrive_manager.download_file(file_id, account_id=src_account_id)
-        gdrive_manager.upload_file(dest_folder_id, name, data, mime, account_id=dest_account_id)
+        data, mime = read_fn()
+        if dest_type == "smb":
+            norm_dest = _sanitize_smb_path(dest_folder, allow_root=True)
+            target_path = _sanitize_smb_path(norm_dest.rstrip("/") + "/" + name, allow_root=False)
+            smb_manager.upload_file(dest_drive, target_path, data)
+        elif dest_type == "gdrive":
+            gdrive_manager.upload_file(dest_folder, name, data, mime, account_id=dest_drive)
+        elif dest_type == "onedrive":
+            onedrive_manager.upload_file(dest_folder, name, data, mime, account_id=dest_drive)
+        else:
+            raise ValueError(f"Unsupported destination drive type: {dest_type!r}")
 
 @app.post("/api/transfer")
 @auth.require_auth
@@ -2460,6 +2894,8 @@ def transfer_items():
 
     if not items:
         return jsonify({"error": "No items selected for transfer"}), 400
+    if src_type not in ("smb", "gdrive", "onedrive") or dest_type not in ("smb", "gdrive", "onedrive"):
+        return jsonify({"error": "Invalid source or destination type"}), 400
 
     try:
         if dest_type == "smb":
@@ -2467,34 +2903,26 @@ def transfer_items():
         count = 0
         for item in items:
             is_folder = item.get("type") == "folder"
-            if is_move and src_type == "smb" and dest_type == "smb" and src_drive == dest_drive:
-                src_path = _sanitize_smb_path(item["path"], allow_root=False)
-                smb_manager.move_path(src_drive, src_path, dest_folder)
-                _SMB_SIZE_CACHE.pop(f"{src_drive}:{src_path}", None)
-            elif is_move and src_type == "gdrive" and dest_type == "gdrive" and src_drive == dest_drive:
-                gdrive_manager.move_file(item["id"], dest_folder, account_id=src_drive)
-            elif src_type == "smb" and dest_type == "gdrive":
-                src_path = _sanitize_smb_path(item["path"], allow_root=False)
-                _copy_smb_item_to_gdrive(src_drive, src_path, is_folder, dest_folder, dest_account_id=dest_drive)
-                if is_move:
-                    smb_manager.delete_path(src_drive, src_path, is_folder)
+            if is_move and src_type == dest_type and src_drive == dest_drive:
+                if src_type == "smb":
+                    src_path = _sanitize_smb_path(item["path"], allow_root=False)
+                    smb_manager.move_path(src_drive, src_path, dest_folder)
                     _SMB_SIZE_CACHE.pop(f"{src_drive}:{src_path}", None)
-            elif src_type == "gdrive" and dest_type == "smb":
-                _copy_gdrive_item_to_smb(item["id"], is_folder, dest_drive, dest_folder, src_account_id=src_drive)
-                if is_move:
-                    gdrive_manager.delete_file(item["id"], account_id=src_drive)
-            elif src_type == "smb" and dest_type == "smb":
-                src_path = _sanitize_smb_path(item["path"], allow_root=False)
-                _copy_smb_item_to_smb(src_drive, src_path, is_folder, dest_drive, dest_folder)
-                if is_move:
-                    smb_manager.delete_path(src_drive, src_path, is_folder)
-                    _SMB_SIZE_CACHE.pop(f"{src_drive}:{src_path}", None)
-            elif src_type == "gdrive" and dest_type == "gdrive":
-                _copy_gdrive_item_to_gdrive(item["id"], is_folder, dest_folder, src_account_id=src_drive, dest_account_id=dest_drive)
-                if is_move:
-                    gdrive_manager.delete_file(item["id"], account_id=src_drive)
+                elif src_type == "gdrive":
+                    gdrive_manager.move_file(item["id"], dest_folder, account_id=src_drive)
+                elif src_type == "onedrive":
+                    onedrive_manager.move_file(item["id"], dest_folder, account_id=src_drive)
             else:
-                return jsonify({"error": "Invalid source or destination type"}), 400
+                _copy_item_across_drives(src_type, src_drive, item, dest_type, dest_drive, dest_folder)
+                if is_move:
+                    if src_type == "smb":
+                        src_path = _sanitize_smb_path(item["path"], allow_root=False)
+                        smb_manager.delete_path(src_drive, src_path, is_folder)
+                        _SMB_SIZE_CACHE.pop(f"{src_drive}:{src_path}", None)
+                    elif src_type == "gdrive":
+                        gdrive_manager.delete_file(item["id"], account_id=src_drive)
+                    elif src_type == "onedrive":
+                        onedrive_manager.delete_file(item["id"], account_id=src_drive)
             count += 1
         return jsonify({"ok": True, "copied": count, "moved": count if is_move else 0, "operation": "move" if is_move else "copy"})
     except ValueError as e:
@@ -2502,7 +2930,7 @@ def transfer_items():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ── Multi-Drive SMB Proxy Manager & Credentials ───────────────────────────────
+# ── Multi-Drive SMB Proxy Manager & Credentials (Google Drive + OneDrive) ────
 _smb_proxy_lock = threading.Lock()
 _SMB_MOUNTS_BASE = Path("/mnt/gdrive_mounts")
 
@@ -2535,12 +2963,14 @@ def _unmount_path(mount_path):
 
 def _reconcile_smb_proxy():
     with _smb_proxy_lock:
-        accounts = _gd_load_accounts_raw()
-        cfg = gdrive_manager.get_config()
+        gd_accounts = _gd_load_accounts_raw()
+        od_accounts = onedrive_manager._load_accounts_raw()
+        gd_cfg = gdrive_manager.get_config()
+        od_cfg = onedrive_manager.get_config()
 
-        # 1. Write multi-account rclone.conf
+        # 1. Write multi-account rclone.conf (Google Drive + OneDrive)
         rclone_blocks = []
-        for idx, acc in enumerate(accounts):
+        for idx, acc in enumerate(gd_accounts):
             d = acc.get("creds") or {}
             if not (d.get("token") or d.get("refresh_token")):
                 continue
@@ -2551,8 +2981,8 @@ def _reconcile_smb_proxy():
                 "refresh_token": d.get("refresh_token", ""),
                 "expiry": "2020-01-01T00:00:00Z",
             })
-            client_id = d.get("client_id") or cfg.get("client_id", "")
-            client_secret = d.get("client_secret") or cfg.get("client_secret", "")
+            client_id = d.get("client_id") or gd_cfg.get("client_id", "")
+            client_secret = d.get("client_secret") or gd_cfg.get("client_secret", "")
             block = (
                 f"[gdrive_{rc_id}]\n"
                 f"type = drive\n"
@@ -2572,6 +3002,34 @@ def _reconcile_smb_proxy():
                     f"token = {rclone_token}\n"
                 )
 
+        for acc in od_accounts:
+            d = acc.get("creds") or {}
+            if not (d.get("token") or d.get("refresh_token")):
+                continue
+            rc_id = _safe_rclone_id(acc["id"])
+            rclone_token = json.dumps({
+                "access_token": d.get("token", ""),
+                "token_type": "Bearer",
+                "refresh_token": d.get("refresh_token", ""),
+                "expiry": d.get("expiry") or "2020-01-01T00:00:00Z",
+            })
+            client_id = d.get("client_id") or od_cfg.get("client_id", "")
+            client_secret = d.get("client_secret") or od_cfg.get("client_secret", "")
+            drive_id = acc.get("drive_id", "")
+            drive_type = acc.get("drive_type", "personal") or "personal"
+            lines = [
+                f"[onedrive_{rc_id}]",
+                "type = onedrive",
+                f"client_id = {client_id}",
+                f"client_secret = {client_secret}",
+                f"token = {rclone_token}",
+            ]
+            if drive_id:
+                lines.append(f"drive_id = {drive_id}")
+            if drive_type:
+                lines.append(f"drive_type = {drive_type}")
+            rclone_blocks.append("\n".join(lines) + "\n")
+
         try:
             os.makedirs("/root/.config/rclone", exist_ok=True)
             Path("/root/.config/rclone/rclone.conf").write_text("\n".join(rclone_blocks))
@@ -2586,20 +3044,25 @@ def _reconcile_smb_proxy():
             pass
 
         mounted_paths = _get_active_mount_points()
-        # Unmount legacy single-drive /mnt/gdrive if mounted so per-drive shares take over cleanly
         if "/mnt/gdrive" in mounted_paths:
             _unmount_path("/mnt/gdrive")
             mounted_paths = _get_active_mount_points()
 
         desired_mounts = {}
-        for acc in accounts:
+        for acc in gd_accounts:
             d = acc.get("creds") or {}
             if bool(acc.get("smb_enabled", True)) and (d.get("token") or d.get("refresh_token")):
                 rc_id = _safe_rclone_id(acc["id"])
-                mpath = str(_SMB_MOUNTS_BASE / rc_id)
+                mpath = str(_SMB_MOUNTS_BASE / f"gd_{rc_id}")
                 desired_mounts[mpath] = f"gdrive_{rc_id}:"
 
-        # Unmount any stale or disabled mounts under /mnt/gdrive_mounts/
+        for acc in od_accounts:
+            d = acc.get("creds") or {}
+            if bool(acc.get("smb_enabled", True)) and (d.get("token") or d.get("refresh_token")):
+                rc_id = _safe_rclone_id(acc["id"])
+                mpath = str(_SMB_MOUNTS_BASE / f"od_{rc_id}")
+                desired_mounts[mpath] = f"onedrive_{rc_id}:"
+
         for mp in list(mounted_paths):
             if mp.startswith(str(_SMB_MOUNTS_BASE) + "/") and mp not in desired_mounts:
                 _unmount_path(mp)
@@ -2637,7 +3100,7 @@ def _reconcile_smb_proxy():
                     if all(mp in mounted_paths for mp in desired_mounts):
                         break
 
-        # 3. Generate /etc/samba/smb.conf with a separate share stanza per enabled Google Drive
+        # 3. Generate /etc/samba/smb.conf with a separate share stanza per enabled Google Drive & OneDrive
         smb_conf_lines = [
             "[global]",
             "   workgroup = WORKGROUP",
@@ -2653,12 +3116,16 @@ def _reconcile_smb_proxy():
             "   server min protocol = NT1",
             "",
         ]
-        for acc in accounts:
+        used_share_names = set()
+        for acc in gd_accounts:
             if not bool(acc.get("smb_enabled", True)):
                 continue
             share_name = _gd_sanitize_smb_share_name(acc.get("smb_share_name") or "GoogleDrive")
+            while share_name.lower() in used_share_names:
+                share_name = f"{share_name[:28]}_gd"
+            used_share_names.add(share_name.lower())
             rc_id = _safe_rclone_id(acc["id"])
-            mpath = str(_SMB_MOUNTS_BASE / rc_id)
+            mpath = str(_SMB_MOUNTS_BASE / f"gd_{rc_id}")
             try:
                 os.makedirs(mpath, exist_ok=True)
             except Exception:
@@ -2666,7 +3133,32 @@ def _reconcile_smb_proxy():
             smb_conf_lines.extend([
                 f"[{share_name}]",
                 f"   path = {mpath}",
-                f"   comment = SageDrive - {acc.get('custom_name') or acc.get('name') or share_name}",
+                f"   comment = SageDrive Google Drive - {acc.get('custom_name') or acc.get('name') or share_name}",
+                "   valid users = @sambausers",
+                "   writable = yes",
+                "   browseable = yes",
+                "   create mask = 0775",
+                "   directory mask = 0775",
+                "",
+            ])
+
+        for acc in od_accounts:
+            if not bool(acc.get("smb_enabled", True)):
+                continue
+            share_name = onedrive_manager.sanitize_smb_share_name(acc.get("smb_share_name") or "OneDrive")
+            while share_name.lower() in used_share_names:
+                share_name = f"{share_name[:28]}_od"
+            used_share_names.add(share_name.lower())
+            rc_id = _safe_rclone_id(acc["id"])
+            mpath = str(_SMB_MOUNTS_BASE / f"od_{rc_id}")
+            try:
+                os.makedirs(mpath, exist_ok=True)
+            except Exception:
+                pass
+            smb_conf_lines.extend([
+                f"[{share_name}]",
+                f"   path = {mpath}",
+                f"   comment = SageDrive OneDrive - {acc.get('custom_name') or acc.get('name') or share_name}",
                 "   valid users = @sambausers",
                 "   writable = yes",
                 "   browseable = yes",
@@ -2708,21 +3200,38 @@ def _get_smb_proxy_status_unlocked():
             configured = True
         except Exception:
             pass
-    accounts = _gd_load_accounts_raw()
+    gd_accounts = _gd_load_accounts_raw()
+    od_accounts = onedrive_manager._load_accounts_raw()
     mounted_paths = _get_active_mount_points()
     has_rclone = bool(shutil.which("rclone"))
     shares = []
-    for acc in accounts:
+    for acc in gd_accounts:
         rc_id = _safe_rclone_id(acc["id"])
-        mpath = str(_SMB_MOUNTS_BASE / rc_id)
+        mpath = str(_SMB_MOUNTS_BASE / f"gd_{rc_id}")
         enabled = bool(acc.get("smb_enabled", True))
         is_mounted = (mpath in mounted_paths) if has_rclone else enabled
         shares.append({
+            "provider": "gdrive",
             "account_id": acc["id"],
             "account_name": acc.get("custom_name") or acc.get("name") or "Google Drive",
             "email": acc.get("email", ""),
             "smb_enabled": enabled,
             "smb_share_name": acc.get("smb_share_name") or "GoogleDrive",
+            "mount_path": mpath,
+            "mounted": is_mounted,
+        })
+    for acc in od_accounts:
+        rc_id = _safe_rclone_id(acc["id"])
+        mpath = str(_SMB_MOUNTS_BASE / f"od_{rc_id}")
+        enabled = bool(acc.get("smb_enabled", True))
+        is_mounted = (mpath in mounted_paths) if has_rclone else enabled
+        shares.append({
+            "provider": "onedrive",
+            "account_id": acc["id"],
+            "account_name": acc.get("custom_name") or acc.get("name") or "OneDrive",
+            "email": acc.get("email", ""),
+            "smb_enabled": enabled,
+            "smb_share_name": acc.get("smb_share_name") or "OneDrive",
             "mount_path": mpath,
             "mounted": is_mounted,
         })
@@ -2750,12 +3259,21 @@ def update_smb_proxy_share(account_id):
     b = request.get_json(force=True) or {}
     smb_enabled = b.get("smb_enabled") if "smb_enabled" in b else None
     smb_share_name = b.get("smb_share_name") if "smb_share_name" in b else None
+    provider = (b.get("provider") or "").strip().lower()
     try:
-        updated = gdrive_manager.update_account_smb_proxy(
-            account_id,
-            smb_enabled=smb_enabled,
-            smb_share_name=smb_share_name,
-        )
+        od_ids = {a["id"] for a in onedrive_manager._load_accounts_raw()}
+        if provider == "onedrive" or account_id in od_ids or str(account_id).startswith("onedrive"):
+            updated = onedrive_manager.update_account_smb_proxy(
+                account_id,
+                smb_enabled=smb_enabled,
+                smb_share_name=smb_share_name,
+            )
+        else:
+            updated = gdrive_manager.update_account_smb_proxy(
+                account_id,
+                smb_enabled=smb_enabled,
+                smb_share_name=smb_share_name,
+            )
         status = _reconcile_smb_proxy()
         return jsonify({
             "ok": True,

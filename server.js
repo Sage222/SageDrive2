@@ -30,6 +30,9 @@ const GDRIVE_FS_FILE = path.join(DATA_DIR, 'gdrive_fs.json');
 const GDRIVE_CONFIG_FILE = path.join(DATA_DIR, 'gdrive_client.json');
 const GDRIVE_CREDS_FILE = path.join(DATA_DIR, 'gdrive_token.json');
 const GDRIVE_ACCOUNTS_FILE = path.join(DATA_DIR, 'gdrive_accounts.json');
+const ONEDRIVE_FS_FILE = path.join(DATA_DIR, 'onedrive_fs.json');
+const ONEDRIVE_CONFIG_FILE = path.join(DATA_DIR, 'onedrive_client.json');
+const ONEDRIVE_ACCOUNTS_FILE = path.join(DATA_DIR, 'onedrive_accounts.json');
 const SMB_PROXY_FILE = path.join(DATA_DIR, 'smb_proxy_credentials.json');
 
 const SESSION_TTL = (parseInt(process.env.SESSION_TTL_HOURS || '24', 10) || 24) * 3600 * 1000;
@@ -315,6 +318,11 @@ function saveGDriveFS() {
   saveJson(GDRIVE_FS_FILE, gdriveFSData);
 }
 
+const onedriveFSData = loadJson(ONEDRIVE_FS_FILE, {});
+function saveOneDriveFS() {
+  saveJson(ONEDRIVE_FS_FILE, onedriveFSData);
+}
+
 function seedGDrive() {
   if (Object.keys(gdriveFSData).length > 0) return;
   const now = new Date().toISOString();
@@ -370,6 +378,78 @@ function seedGDrive() {
   saveGDriveFS();
 }
 seedGDrive();
+
+function seedOneDrive() {
+  if (Object.keys(onedriveFSData).length > 0) return;
+  const now = new Date().toISOString();
+  onedriveFSData['od-folder-docs'] = {
+    id: 'od-folder-docs',
+    accountId: 'default',
+    name: 'Documents',
+    type: 'folder',
+    size: 0,
+    modified: now,
+    mimeType: 'application/vnd.onedrive.folder',
+    parent: 'root',
+  };
+  onedriveFSData['od-folder-media'] = {
+    id: 'od-folder-media',
+    accountId: 'default',
+    name: 'Media',
+    type: 'folder',
+    size: 0,
+    modified: now,
+    mimeType: 'application/vnd.onedrive.folder',
+    parent: 'root',
+  };
+
+  const readmePath = path.join(BLOBS_DIR, 'onedrive_welcome.txt');
+  const readmeContent = Buffer.from(
+    'Welcome to SageDrive Microsoft OneDrive integration.\nYou can upload, download, edit, and stream media files here.\n'
+  );
+  fs.writeFileSync(readmePath, readmeContent);
+
+  onedriveFSData['od-file-readme'] = {
+    id: 'od-file-readme',
+    accountId: 'default',
+    name: 'Welcome.txt',
+    type: 'file',
+    size: readmeContent.length,
+    modified: now,
+    mimeType: 'text/plain',
+    parent: 'root',
+    blobPath: readmePath,
+  };
+
+  if (fs.existsSync(SAMPLE_WAV_PATH)) {
+    onedriveFSData['od-file-sample-audio'] = {
+      id: 'od-file-sample-audio',
+      accountId: 'default',
+      name: 'Sample_Audio.wav',
+      type: 'file',
+      size: fs.statSync(SAMPLE_WAV_PATH).size,
+      modified: now,
+      mimeType: 'audio/wav',
+      parent: 'root',
+      blobPath: SAMPLE_WAV_PATH,
+    };
+  }
+  if (fs.existsSync(SAMPLE_MP4_PATH) && fs.statSync(SAMPLE_MP4_PATH).size > 0) {
+    onedriveFSData['od-file-sample-video'] = {
+      id: 'od-file-sample-video',
+      accountId: 'default',
+      name: 'Sample_Video.mp4',
+      type: 'file',
+      size: fs.statSync(SAMPLE_MP4_PATH).size,
+      modified: now,
+      mimeType: 'video/mp4',
+      parent: 'root',
+      blobPath: SAMPLE_MP4_PATH,
+    };
+  }
+  saveOneDriveFS();
+}
+seedOneDrive();
 
 function ensureShareFS(shareId) {
   if (!smbFSData[shareId]) {
@@ -555,6 +635,7 @@ function probeMediaItem(item) {
         audio_codec: '',
         audio_channels: 0,
         audio_streams: [],
+        subtitle_streams: [],
         duration: 0,
         needs_audio_transcode: false,
         needs_video_transcode: false,
@@ -567,7 +648,7 @@ function probeMediaItem(item) {
       '-v', 'error',
       '-probesize', '10000000',
       '-analyzeduration', '10000000',
-      '-show_entries', 'stream=index,codec_type,codec_name,profile,pix_fmt,channels,sample_rate,duration:stream_tags:format=format_name,duration:format_tags',
+      '-show_entries', 'stream=index,codec_type,codec_name,profile,pix_fmt,channels,sample_rate,duration:stream_disposition=default,forced:stream_tags:format=format_name,duration:format_tags',
       '-of', 'json',
       blobPath,
     ]);
@@ -582,6 +663,7 @@ function probeMediaItem(item) {
         audio_codec: '',
         audio_channels: 0,
         audio_streams: [],
+        subtitle_streams: [],
         duration: 0,
         needs_audio_transcode: false,
         needs_video_transcode: false,
@@ -599,6 +681,7 @@ function probeMediaItem(item) {
       );
       const videoStreams = nonCoverVideos.length ? nonCoverVideos : streams.filter((s) => s.codec_type === 'video');
       const audioStreams = streams.filter((s) => s.codec_type === 'audio');
+      const subtitleStreams = streams.filter((s) => s.codec_type === 'subtitle');
       const v0 = videoStreams[0] || null;
       const a0 = audioStreams[0] || null;
       const videoCodec = v0 ? String(v0.codec_name || '').toLowerCase() : '';
@@ -644,6 +727,24 @@ function probeMediaItem(item) {
         };
       });
 
+      const bitmapSubCodecs = new Set(['hdmv_pgs_subtitle', 'pgssub', 'dvd_subtitle', 'dvdsub', 'dvb_subtitle', 'dvbsub', 'xsub']);
+      const subtitleTracksOut = [];
+      subtitleStreams.forEach((s, idx) => {
+        const scodec = String(s.codec_name || 'unknown').toLowerCase();
+        if (bitmapSubCodecs.has(scodec)) return;
+        const tags = s.tags || {};
+        const disp = s.disposition || {};
+        subtitleTracksOut.push({
+          index: idx,
+          stream_index: s.index !== undefined ? s.index : idx,
+          codec: scodec,
+          language: tags.language || tags.LANGUAGE || '',
+          title: tags.title || tags.TITLE || '',
+          forced: Boolean(disp.forced),
+          default: Boolean(disp.default),
+        });
+      });
+
       const parseDur = (val) => {
         if (!val) return 0;
         const n = parseFloat(val);
@@ -669,6 +770,7 @@ function probeMediaItem(item) {
         audio_codec: audioCodec,
         audio_channels: audioChannels,
         audio_streams: audioTracksOut,
+        subtitle_streams: subtitleTracksOut,
         duration: maxDur,
         needs_audio_transcode: needsAudioTranscode,
         needs_video_transcode: needsVideoTranscode,
@@ -676,6 +778,39 @@ function probeMediaItem(item) {
         recommended_mode: recommendedMode,
       });
     });
+  });
+}
+
+function streamSubtitleResponse(req, res, item) {
+  const blobPath = resolveItemBlobPath(item);
+  if (!blobPath) {
+    res.writeHead(200, { 'Content-Type': 'text/vtt; charset=utf-8', 'Cache-Control': 'no-cache' });
+    return res.end('WEBVTT\n\n');
+  }
+  const track = Math.max(0, parseInt(req.query.track || '0', 10) || 0);
+  const startTime = Math.max(0, parseFloat(req.query.ss || '0') || 0);
+  const args = ['-hide_banner', '-loglevel', 'error'];
+  if (startTime > 0) {
+    args.push('-ss', String(startTime));
+  }
+  args.push('-i', blobPath, '-map', `0:s:${track}`, '-c:s', 'webvtt', '-f', 'webvtt', 'pipe:1');
+  const ff = spawn('ffmpeg', args);
+  let out = '';
+  ff.stdout.on('data', (d) => { out += d.toString('utf-8'); });
+  ff.on('error', () => {
+    if (!res.headersSent) {
+      res.writeHead(200, { 'Content-Type': 'text/vtt; charset=utf-8', 'Cache-Control': 'no-cache' });
+      res.end('WEBVTT\n\n');
+    }
+  });
+  ff.on('close', () => {
+    if (!res.headersSent) {
+      res.writeHead(200, { 'Content-Type': 'text/vtt; charset=utf-8', 'Cache-Control': 'no-cache' });
+      res.end(out && out.includes('WEBVTT') ? out : 'WEBVTT\n\n');
+    }
+  });
+  req.on('close', () => {
+    try { ff.kill('SIGKILL'); } catch (_) {}
   });
 }
 
@@ -1118,6 +1253,15 @@ app.get('/api/smb/probe/:share_id', requireAuth, async (req, res) => {
   if (!item) return res.status(404).json({ error: 'File not found' });
   const info = await probeMediaItem(item);
   return res.json(info);
+});
+
+app.get('/api/smb/subtitles/:share_id', requireAuth, (req, res) => {
+  const { share_id } = req.params;
+  const filePath = req.query.path || '';
+  const entries = ensureShareFS(share_id);
+  const item = entries[filePath];
+  if (!item) return res.status(404).json({ error: 'File not found' });
+  return streamSubtitleResponse(req, res, item);
 });
 
 app.get('/api/smb/download/:share_id', requireAuth, (req, res) => {
@@ -1725,6 +1869,12 @@ app.get('/api/gdrive/probe/:file_id', requireAuth, async (req, res) => {
   return res.json(info);
 });
 
+app.get('/api/gdrive/subtitles/:file_id', requireAuth, (req, res) => {
+  const f = gdriveFSData[req.params.file_id];
+  if (!f) return res.status(404).json({ error: 'File not found' });
+  return streamSubtitleResponse(req, res, f);
+});
+
 app.get('/api/gdrive/download/:file_id', requireAuth, (req, res) => {
   const f = gdriveFSData[req.params.file_id];
   return streamFileResponse(req, res, f);
@@ -1886,7 +2036,537 @@ app.post('/api/gdrive/mkdir', requireAuth, (req, res) => {
   return res.json({ id });
 });
 
-// ── Cross-Drive Transfer (SMB <-> Google Drive & SMB <-> SMB & GDrive <-> GDrive) ──
+// ── Microsoft OneDrive Helpers & Routes (Multi-Account) ─────────────────────
+function getOneDriveConfig() {
+  const defaults = {
+    client_id: process.env.ONEDRIVE_CLIENT_ID || '',
+    client_secret: process.env.ONEDRIVE_CLIENT_SECRET || '',
+    redirect_uri: process.env.ONEDRIVE_REDIRECT_URI || 'http://localhost:3000/api/onedrive/callback',
+    tenant_id: process.env.ONEDRIVE_TENANT_ID || 'common',
+  };
+  const stored = loadJson(ONEDRIVE_CONFIG_FILE, {});
+  return {
+    client_id: stored.client_id || defaults.client_id,
+    client_secret: stored.client_secret || defaults.client_secret,
+    redirect_uri: stored.redirect_uri || defaults.redirect_uri,
+    tenant_id: stored.tenant_id || defaults.tenant_id || 'common',
+  };
+}
+
+function isOneDriveConfigured() {
+  const cfg = getOneDriveConfig();
+  return Boolean(cfg.client_id && cfg.client_secret && cfg.redirect_uri);
+}
+
+function ensureOneDriveSmbProxyFields(accounts) {
+  const used = new Set();
+  for (const gd of loadGDriveAccountsRaw()) {
+    if (gd.smb_share_name) used.add(String(gd.smb_share_name).toLowerCase());
+  }
+  let changed = false;
+  accounts.forEach((a, idx) => {
+    if (typeof a.smb_enabled !== 'boolean') {
+      a.smb_enabled = true;
+      changed = true;
+    }
+    const rawShare = String(a.smb_share_name || '').trim();
+    if (!rawShare) {
+      const defaultBase =
+        idx === 0 || a.id === 'default'
+          ? 'OneDrive'
+          : a.custom_name || a.name || `OneDrive_${idx + 1}`;
+      let candidate = sanitizeSmbShareName(defaultBase, `OneDrive_${idx + 1}`);
+      const baseCand = candidate;
+      let suffix = 2;
+      while (used.has(candidate.toLowerCase())) {
+        candidate = `${baseCand.slice(0, 28)}_${suffix}`;
+        suffix++;
+      }
+      a.smb_share_name = candidate;
+      changed = true;
+    } else {
+      let sanitized = sanitizeSmbShareName(rawShare, `OneDrive_${idx + 1}`);
+      if (used.has(sanitized.toLowerCase())) {
+        sanitized = `${sanitized.slice(0, 28)}_${idx + 1}`;
+      }
+      if (sanitized !== rawShare) {
+        a.smb_share_name = sanitized;
+        changed = true;
+      }
+    }
+    used.add(a.smb_share_name.toLowerCase());
+  });
+  return changed;
+}
+
+function loadOneDriveAccountsRaw() {
+  const list = loadJson(ONEDRIVE_ACCOUNTS_FILE, null);
+  if (Array.isArray(list)) {
+    if (ensureOneDriveSmbProxyFields(list)) {
+      saveJson(ONEDRIVE_ACCOUNTS_FILE, list);
+    }
+    return list;
+  }
+  return [];
+}
+
+function saveOneDriveAccountsRaw(accounts) {
+  ensureOneDriveSmbProxyFields(accounts);
+  saveJson(ONEDRIVE_ACCOUNTS_FILE, accounts);
+}
+
+function listOneDriveAccounts() {
+  return loadOneDriveAccountsRaw().map((a) => ({
+    id: a.id,
+    name: a.custom_name || a.name || 'OneDrive',
+    custom_name: a.custom_name || '',
+    original_name: a.original_name || a.name || 'OneDrive',
+    email: a.email || '',
+    drive_id: a.drive_id || 'od-drive-default',
+    drive_type: a.drive_type || 'personal',
+    smb_enabled: Boolean(a.smb_enabled ?? true),
+    smb_share_name: a.smb_share_name || 'OneDrive',
+  }));
+}
+
+function resolveOneDriveAccountId(rawId) {
+  const accounts = loadOneDriveAccountsRaw();
+  if (!accounts.length) return 'default';
+  if (!rawId || rawId === 'root' || rawId === 'default') {
+    const def = accounts.find((a) => a.id === 'default');
+    return def ? def.id : accounts[0].id;
+  }
+  const found = accounts.find((a) => a.id === rawId);
+  return found ? found.id : accounts[0].id;
+}
+
+function isOneDriveAuthenticated() {
+  return loadOneDriveAccountsRaw().length > 0;
+}
+
+function ensureOneDriveAccountSeeded(accountId) {
+  const accId = resolveOneDriveAccountId(accountId);
+  const hasAny = Object.values(onedriveFSData).some((f) => (f.accountId || 'default') === accId);
+  if (hasAny) return;
+  const now = new Date().toISOString();
+  const suffix = accId === 'default' ? '' : `_${accId}`;
+  onedriveFSData[`od-folder-docs${suffix}`] = {
+    id: `od-folder-docs${suffix}`,
+    accountId: accId,
+    name: 'Documents',
+    type: 'folder',
+    size: 0,
+    modified: now,
+    mimeType: 'application/vnd.onedrive.folder',
+    parent: 'root',
+  };
+  onedriveFSData[`od-folder-media${suffix}`] = {
+    id: `od-folder-media${suffix}`,
+    accountId: accId,
+    name: 'Media',
+    type: 'folder',
+    size: 0,
+    modified: now,
+    mimeType: 'application/vnd.onedrive.folder',
+    parent: 'root',
+  };
+  const readmePath = path.join(BLOBS_DIR, 'onedrive_welcome.txt');
+  if (fs.existsSync(readmePath)) {
+    onedriveFSData[`od-file-readme${suffix}`] = {
+      id: `od-file-readme${suffix}`,
+      accountId: accId,
+      name: 'Welcome.txt',
+      type: 'file',
+      size: fs.statSync(readmePath).size,
+      modified: now,
+      mimeType: 'text/plain',
+      parent: 'root',
+      blobPath: readmePath,
+    };
+  }
+  if (fs.existsSync(SAMPLE_WAV_PATH)) {
+    onedriveFSData[`od-file-sample-audio${suffix}`] = {
+      id: `od-file-sample-audio${suffix}`,
+      accountId: accId,
+      name: 'Sample_Audio.wav',
+      type: 'file',
+      size: fs.statSync(SAMPLE_WAV_PATH).size,
+      modified: now,
+      mimeType: 'audio/wav',
+      parent: 'root',
+      blobPath: SAMPLE_WAV_PATH,
+    };
+  }
+  if (fs.existsSync(SAMPLE_MP4_PATH) && fs.statSync(SAMPLE_MP4_PATH).size > 0) {
+    onedriveFSData[`od-file-sample-video${suffix}`] = {
+      id: `od-file-sample-video${suffix}`,
+      accountId: accId,
+      name: 'Sample_Video.mp4',
+      type: 'file',
+      size: fs.statSync(SAMPLE_MP4_PATH).size,
+      modified: now,
+      mimeType: 'video/mp4',
+      parent: 'root',
+      blobPath: SAMPLE_MP4_PATH,
+    };
+  }
+  saveOneDriveFS();
+}
+
+function ensureOneDriveFolderPath(baseFolderId, parts, accountId = 'default') {
+  const accId = resolveOneDriveAccountId(accountId);
+  let currId = baseFolderId || 'root';
+  for (const part of parts) {
+    if (!part) continue;
+    const existing = Object.values(onedriveFSData).find(
+      (f) => (f.accountId || 'default') === accId && f.parent === currId && f.type === 'folder' && f.name === part
+    );
+    if (existing) {
+      currId = existing.id;
+    } else {
+      const newId = 'od-folder-' + crypto.randomBytes(6).toString('hex');
+      onedriveFSData[newId] = {
+        id: newId,
+        accountId: accId,
+        name: part,
+        type: 'folder',
+        size: 0,
+        modified: new Date().toISOString(),
+        mimeType: 'application/vnd.onedrive.folder',
+        parent: currId,
+      };
+      currId = newId;
+    }
+  }
+  return currId;
+}
+
+app.get('/api/onedrive/status', requireAuth, (req, res) => {
+  return res.json({
+    configured: isOneDriveConfigured(),
+    authenticated: isOneDriveAuthenticated(),
+    accounts: listOneDriveAccounts(),
+  });
+});
+
+app.get('/api/onedrive/accounts', requireAuth, (req, res) => {
+  return res.json(listOneDriveAccounts());
+});
+
+app.post('/api/onedrive/accounts/:account_id/rename', requireAuth, (req, res) => {
+  const { account_id } = req.params;
+  const b = req.body || {};
+  const newName = String(b.name || b.custom_name || '').trim();
+  if (!newName) {
+    return res.status(400).json({ error: 'Custom name cannot be empty' });
+  }
+  const accounts = loadOneDriveAccountsRaw();
+  const target = accounts.find(
+    (a) => a.id === account_id || ((account_id === 'root' || account_id === 'default') && a === accounts[0])
+  );
+  if (!target) {
+    return res.status(404).json({ error: `OneDrive account '${account_id}' not found` });
+  }
+  if (!target.original_name) target.original_name = target.name || 'OneDrive';
+  target.name = newName;
+  target.custom_name = newName;
+  saveOneDriveAccountsRaw(accounts);
+  return res.json({
+    id: target.id,
+    name: target.name,
+    custom_name: target.custom_name,
+    email: target.email || '',
+  });
+});
+
+app.delete('/api/onedrive/accounts/:account_id', requireAuth, (req, res) => {
+  const { account_id } = req.params;
+  const accounts = loadOneDriveAccountsRaw().filter((a) => a.id !== account_id);
+  saveOneDriveAccountsRaw(accounts);
+  return res.json({ ok: true });
+});
+
+app.get('/api/onedrive/config', requireAuth, (req, res) => {
+  return res.json(getOneDriveConfig());
+});
+
+app.post('/api/onedrive/config', requireAuth, (req, res) => {
+  const b = req.body || {};
+  const cfg = {
+    client_id: String(b.client_id || '').trim(),
+    client_secret: String(b.client_secret || '').trim(),
+    redirect_uri: String(b.redirect_uri || '').trim() || 'http://localhost:3000/api/onedrive/callback',
+    tenant_id: String(b.tenant_id || 'common').trim() || 'common',
+  };
+  saveJson(ONEDRIVE_CONFIG_FILE, cfg);
+  return res.json({ ok: true, configured: isOneDriveConfigured() });
+});
+
+app.get('/api/onedrive/auth', requireAuth, (req, res) => {
+  if (!isOneDriveConfigured()) {
+    return res.status(400).json({ error: 'Microsoft OneDrive OAuth not configured' });
+  }
+  const name = encodeURIComponent(String(req.query.name || '').trim());
+  const accountId = encodeURIComponent(String(req.query.account_id || '').trim());
+  return res.json({
+    url: `/api/onedrive/callback?code=preview_od_oauth_code&name=${name}&account_id=${accountId}`,
+  });
+});
+
+app.get('/api/onedrive/callback', (req, res) => {
+  const code = req.query.code;
+  if (!code) {
+    return res.status(400).send('Missing code');
+  }
+  const cfg = getOneDriveConfig();
+  const customName = String(req.query.name || '').trim();
+  const accountId = String(req.query.account_id || '').trim();
+  const accounts = loadOneDriveAccountsRaw();
+  const creds = {
+    access_token: 'onedrive_access_' + crypto.randomBytes(8).toString('hex'),
+    refresh_token: 'onedrive_refresh_' + crypto.randomBytes(8).toString('hex'),
+    token_type: 'Bearer',
+    client_id: cfg.client_id,
+    client_secret: cfg.client_secret,
+    tenant_id: cfg.tenant_id || 'common',
+  };
+
+  let target = accountId ? accounts.find((a) => a.id === accountId) : null;
+  if (target) {
+    target.creds = creds;
+    if (customName) {
+      target.name = customName;
+      target.custom_name = customName;
+    }
+  } else {
+    const newId = accounts.length === 0 ? 'default' : `onedrive_${crypto.randomBytes(3).toString('hex')}`;
+    const idx = accounts.length + 1;
+    const defaultLabel = idx === 1 ? 'OneDrive' : `OneDrive ${idx}`;
+    const dispName = customName || defaultLabel;
+    accounts.push({
+      id: newId,
+      name: dispName,
+      custom_name: customName,
+      original_name: defaultLabel,
+      email: idx === 1 ? 'user@outlook.com' : `onedrive${idx}@outlook.com`,
+      drive_id: `od-drive-${newId}`,
+      drive_type: 'personal',
+      creds,
+    });
+    ensureOneDriveAccountSeeded(newId);
+  }
+  saveOneDriveAccountsRaw(accounts);
+  return res.redirect('/#onedrive-connected');
+});
+
+app.delete('/api/onedrive/revoke', requireAuth, (req, res) => {
+  const accountId = String(req.query.account_id || '').trim();
+  if (accountId) {
+    const accounts = loadOneDriveAccountsRaw().filter((a) => a.id !== accountId);
+    saveOneDriveAccountsRaw(accounts);
+  } else {
+    saveOneDriveAccountsRaw([]);
+  }
+  return res.json({ ok: true });
+});
+
+app.get('/api/onedrive/files', requireAuth, (req, res) => {
+  const folderId = req.query.folder || 'root';
+  const accId = resolveOneDriveAccountId(req.query.account_id);
+  ensureOneDriveAccountSeeded(accId);
+
+  const out = [];
+  for (const f of Object.values(onedriveFSData)) {
+    const fAcc = f.accountId || 'default';
+    if (fAcc === accId && f.parent === folderId) {
+      out.push({
+        id: f.id,
+        name: f.name,
+        type: f.type,
+        size: f.size || 0,
+        modified: f.modified,
+        mimeType: f.mimeType,
+      });
+    }
+  }
+  return res.json(out);
+});
+
+app.get('/api/onedrive/probe/:file_id', requireAuth, async (req, res) => {
+  const f = onedriveFSData[req.params.file_id];
+  if (!f) return res.status(404).json({ error: 'File not found' });
+  const info = await probeMediaItem(f);
+  return res.json(info);
+});
+
+app.get('/api/onedrive/subtitles/:file_id', requireAuth, (req, res) => {
+  const f = onedriveFSData[req.params.file_id];
+  if (!f) return res.status(404).json({ error: 'File not found' });
+  return streamSubtitleResponse(req, res, f);
+});
+
+app.get('/api/onedrive/download/:file_id', requireAuth, (req, res) => {
+  const f = onedriveFSData[req.params.file_id];
+  return streamFileResponse(req, res, f);
+});
+
+app.post('/api/onedrive/upload', requireAuth, upload.single('file'), (req, res) => {
+  const folderId = req.query.folder || 'root';
+  const accId = resolveOneDriveAccountId(req.query.account_id);
+  const relPath = String(req.body?.relative_path || req.query?.relative_path || '').trim().replace(/^\/+/, '');
+  const f = req.file;
+  if (!f) {
+    return res.status(400).json({ error: 'No file provided' });
+  }
+  let targetParent = folderId;
+  let actualName = f.originalname;
+  if (relPath) {
+    const parts = relPath.split('/').filter(Boolean);
+    if (parts.length > 1) {
+      targetParent = ensureOneDriveFolderPath(folderId, parts.slice(0, -1), accId);
+      actualName = parts[parts.length - 1];
+    } else if (parts.length === 1) {
+      actualName = parts[0];
+    }
+  }
+  const id = 'od-file-' + crypto.randomBytes(6).toString('hex');
+  onedriveFSData[id] = {
+    id,
+    accountId: accId,
+    name: actualName,
+    type: 'file',
+    size: f.size,
+    modified: new Date().toISOString(),
+    mimeType: getMimeType(actualName, f.mimetype),
+    parent: targetParent,
+    blobPath: f.path,
+  };
+  saveOneDriveFS();
+  return res.json({ ok: true });
+});
+
+app.put('/api/onedrive/content/:file_id', requireAuth, (req, res) => {
+  const { file_id } = req.params;
+  const b = req.body || {};
+  if (b.content === undefined || b.content === null) {
+    return res.status(400).json({ error: 'content is required' });
+  }
+  const item = onedriveFSData[file_id];
+  if (!item) {
+    return res.status(404).json({ error: 'File not found' });
+  }
+  const buf = Buffer.from(String(b.content), 'utf-8');
+  const blobPath =
+    item.blobPath && !item.blobPath.includes('sample_')
+      ? item.blobPath
+      : path.join(BLOBS_DIR, `onedrive_edit_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.txt`);
+  fs.writeFileSync(blobPath, buf);
+  item.blobPath = blobPath;
+  item.size = buf.length;
+  item.modified = new Date().toISOString();
+  saveOneDriveFS();
+  return res.json({ ok: true, size: buf.length, file: item });
+});
+
+app.post('/api/onedrive/rename/:file_id', requireAuth, (req, res) => {
+  const { file_id } = req.params;
+  const b = req.body || {};
+  const newName = String(b.name || b.new_name || '').trim();
+  if (!newName) {
+    return res.status(400).json({ error: 'New name is required' });
+  }
+  const item = onedriveFSData[file_id];
+  if (!item) {
+    return res.status(404).json({ error: 'File not found' });
+  }
+  item.name = newName;
+  item.modified = new Date().toISOString();
+  saveOneDriveFS();
+  return res.json({ ok: true });
+});
+
+app.post('/api/onedrive/zip', requireAuth, (req, res) => {
+  const b = req.body || {};
+  const ids = Array.isArray(b.ids) ? b.ids : [];
+  if (!ids.length) {
+    return res.status(400).json({ error: 'No file IDs provided' });
+  }
+  const zipItems = [];
+
+  function addOneDriveItemToZip(fid, arcPrefix) {
+    const item = onedriveFSData[fid];
+    if (!item) return;
+    const arcPath = arcPrefix ? `${arcPrefix}/${item.name}` : item.name;
+    if (item.type === 'folder') {
+      const children = Object.values(onedriveFSData).filter((c) => c.parent === fid);
+      if (children.length === 0) {
+        zipItems.push({ arcPath, isDir: true });
+      } else {
+        for (const ch of children) {
+          addOneDriveItemToZip(ch.id, arcPath);
+        }
+      }
+    } else {
+      zipItems.push({
+        arcPath,
+        data: getItemBuffer(item),
+      });
+    }
+  }
+
+  for (const id of ids) {
+    addOneDriveItemToZip(id, '');
+  }
+
+  const zipBuf = buildZipBuffer(zipItems);
+  const archiveName = b.name || 'OneDrive_Download.zip';
+  res.writeHead(200, {
+    'Content-Type': 'application/zip',
+    'Content-Length': String(zipBuf.length),
+    'Content-Disposition': makeDispositionHeader(archiveName, true),
+    'Cache-Control': 'no-cache',
+  });
+  return res.end(zipBuf);
+});
+
+app.delete('/api/onedrive/delete/:file_id', requireAuth, (req, res) => {
+  const { file_id } = req.params;
+  function deleteRecursive(fid) {
+    const item = onedriveFSData[fid];
+    if (!item) return;
+    if (item.type === 'folder') {
+      for (const ch of Object.values(onedriveFSData)) {
+        if (ch.parent === fid) deleteRecursive(ch.id);
+      }
+    }
+    delete onedriveFSData[fid];
+  }
+  deleteRecursive(file_id);
+  saveOneDriveFS();
+  return res.json({ ok: true });
+});
+
+app.post('/api/onedrive/mkdir', requireAuth, (req, res) => {
+  const b = req.body || {};
+  const accId = resolveOneDriveAccountId(req.query.account_id || b.account_id);
+  const parent = b.parent || 'root';
+  const name = b.name || 'New Folder';
+  const id = 'od-folder-' + crypto.randomBytes(6).toString('hex');
+  onedriveFSData[id] = {
+    id,
+    accountId: accId,
+    name,
+    type: 'folder',
+    size: 0,
+    modified: new Date().toISOString(),
+    mimeType: 'application/vnd.onedrive.folder',
+    parent,
+  };
+  saveOneDriveFS();
+  return res.json({ id });
+});
+
+// ── Cross-Drive Transfer (SMB <-> Google Drive <-> OneDrive) ─────────────────
 function copyBlobFile(srcItem, nameHint) {
   const buf = getItemBuffer(srcItem);
   const ext = path.extname(nameHint || srcItem?.name || '') || '';
@@ -1895,129 +2575,109 @@ function copyBlobFile(srcItem, nameHint) {
   return { blobPath: newBlobPath, size: buf.length };
 }
 
-function copySmbItemToGDrive(srcShare, smbPath, destFolderId, destAccountId = 'default') {
-  const accId = resolveGDriveAccountId(destAccountId);
-  const entries = ensureShareFS(srcShare);
-  const norm = smbPath.replace(/\/+$/, '');
-  const item = entries[norm];
-  if (!item) return;
-  if (item.type === 'folder') {
-    const newFolderId = ensureGDriveFolderPath(destFolderId, [item.name], accId);
-    const children = Object.values(entries).filter((c) => path.posix.dirname(c.path) === norm);
-    for (const ch of children) {
-      copySmbItemToGDrive(srcShare, ch.path, newFolderId, accId);
+function readSourceNode(srcType, srcDrive, itemRef) {
+  if (srcType === 'smb') {
+    const entries = ensureShareFS(srcDrive);
+    const norm = sanitizeSmbPath(itemRef.path || '', false);
+    const item = entries[norm];
+    if (!item) return null;
+    if (item.type === 'folder') {
+      const children = Object.values(entries)
+        .filter((c) => path.posix.dirname(c.path) === norm)
+        .map((ch) => readSourceNode('smb', srcDrive, { path: ch.path }))
+        .filter(Boolean);
+      return { name: item.name, type: 'folder', children };
     }
-  } else {
-    const { blobPath, size } = copyBlobFile(item, item.name);
-    const id = 'file-' + crypto.randomBytes(6).toString('hex');
-    gdriveFSData[id] = {
-      id,
-      accountId: accId,
-      name: item.name,
-      type: 'file',
-      size,
-      modified: new Date().toISOString(),
-      mimeType: getMimeType(item.name, item.mimeType),
-      parent: destFolderId || 'root',
-      blobPath,
-    };
+    return { name: item.name, type: 'file', srcItem: item };
   }
+  const store = srcType === 'onedrive' ? onedriveFSData : gdriveFSData;
+  const fid = itemRef.id;
+  const item = store[fid];
+  if (!item) return null;
+  if (item.type === 'folder') {
+    const children = Object.values(store)
+      .filter((c) => c.parent === fid)
+      .map((ch) => readSourceNode(srcType, srcDrive, { id: ch.id }))
+      .filter(Boolean);
+    return { name: item.name, type: 'folder', children };
+  }
+  return { name: item.name, type: 'file', srcItem: item };
 }
 
-function copyGDriveItemToSmb(fileId, destShare, destSmbDir) {
-  const item = gdriveFSData[fileId];
-  if (!item) return;
-  const entries = ensureShareFS(destShare);
-  const baseDir = (destSmbDir || '/').replace(/\/+$/, '');
-  const targetPath = `${baseDir}/${item.name}`;
-  ensureSmbParentDirs(entries, targetPath);
-
-  if (item.type === 'folder') {
-    entries[targetPath] = {
-      name: item.name,
-      type: 'folder',
-      size: 0,
-      modified: Math.floor(Date.now() / 1000),
-      path: targetPath,
-    };
-    const children = Object.values(gdriveFSData).filter((c) => c.parent === fileId);
-    for (const ch of children) {
-      copyGDriveItemToSmb(ch.id, destShare, targetPath);
+function writeDestNode(node, destType, destDrive, destFolder) {
+  if (!node) return;
+  if (destType === 'smb') {
+    const entries = ensureShareFS(destDrive);
+    const baseDir = (destFolder || '/').replace(/\/+$/, '');
+    const targetPath = `${baseDir}/${node.name}`;
+    ensureSmbParentDirs(entries, targetPath);
+    if (node.type === 'folder') {
+      entries[targetPath] = {
+        name: node.name,
+        type: 'folder',
+        size: 0,
+        modified: Math.floor(Date.now() / 1000),
+        path: targetPath,
+      };
+      for (const ch of node.children || []) {
+        writeDestNode(ch, 'smb', destDrive, targetPath);
+      }
+    } else {
+      const { blobPath, size } = copyBlobFile(node.srcItem, node.name);
+      entries[targetPath] = {
+        name: node.name,
+        type: 'file',
+        size,
+        modified: Math.floor(Date.now() / 1000),
+        path: targetPath,
+        blobPath,
+        mimeType: getMimeType(node.name, node.srcItem?.mimeType),
+      };
     }
-  } else {
-    const { blobPath, size } = copyBlobFile(item, item.name);
-    entries[targetPath] = {
-      name: item.name,
-      type: 'file',
-      size,
-      modified: Math.floor(Date.now() / 1000),
-      path: targetPath,
-      blobPath,
-      mimeType: getMimeType(item.name, item.mimeType),
-    };
-  }
-}
-
-function copySmbItemToSmb(srcShare, smbPath, destShare, destSmbDir) {
-  const srcEntries = ensureShareFS(srcShare);
-  const destEntries = ensureShareFS(destShare);
-  const norm = smbPath.replace(/\/+$/, '');
-  const item = srcEntries[norm];
-  if (!item) return;
-  const baseDir = (destSmbDir || '/').replace(/\/+$/, '');
-  const targetPath = `${baseDir}/${item.name}`;
-  ensureSmbParentDirs(destEntries, targetPath);
-
-  if (item.type === 'folder') {
-    destEntries[targetPath] = {
-      name: item.name,
-      type: 'folder',
-      size: 0,
-      modified: Math.floor(Date.now() / 1000),
-      path: targetPath,
-    };
-    const children = Object.values(srcEntries).filter((c) => path.posix.dirname(c.path) === norm);
-    for (const ch of children) {
-      copySmbItemToSmb(srcShare, ch.path, destShare, targetPath);
+  } else if (destType === 'gdrive') {
+    const accId = resolveGDriveAccountId(destDrive);
+    if (node.type === 'folder') {
+      const newFolderId = ensureGDriveFolderPath(destFolder || 'root', [node.name], accId);
+      for (const ch of node.children || []) {
+        writeDestNode(ch, 'gdrive', accId, newFolderId);
+      }
+    } else {
+      const { blobPath, size } = copyBlobFile(node.srcItem, node.name);
+      const id = 'file-' + crypto.randomBytes(6).toString('hex');
+      gdriveFSData[id] = {
+        id,
+        accountId: accId,
+        name: node.name,
+        type: 'file',
+        size,
+        modified: new Date().toISOString(),
+        mimeType: getMimeType(node.name, node.srcItem?.mimeType),
+        parent: destFolder || 'root',
+        blobPath,
+      };
     }
-  } else {
-    const { blobPath, size } = copyBlobFile(item, item.name);
-    destEntries[targetPath] = {
-      name: item.name,
-      type: 'file',
-      size,
-      modified: Math.floor(Date.now() / 1000),
-      path: targetPath,
-      blobPath,
-      mimeType: getMimeType(item.name, item.mimeType),
-    };
-  }
-}
-
-function copyGDriveItemToGDrive(fileId, destFolderId, destAccountId = 'default') {
-  const accId = resolveGDriveAccountId(destAccountId);
-  const item = gdriveFSData[fileId];
-  if (!item) return;
-  if (item.type === 'folder') {
-    const newFolderId = ensureGDriveFolderPath(destFolderId, [item.name], accId);
-    const children = Object.values(gdriveFSData).filter((c) => c.parent === fileId);
-    for (const ch of children) {
-      copyGDriveItemToGDrive(ch.id, newFolderId, accId);
+  } else if (destType === 'onedrive') {
+    const accId = resolveOneDriveAccountId(destDrive);
+    if (node.type === 'folder') {
+      const newFolderId = ensureOneDriveFolderPath(destFolder || 'root', [node.name], accId);
+      for (const ch of node.children || []) {
+        writeDestNode(ch, 'onedrive', accId, newFolderId);
+      }
+    } else {
+      const { blobPath, size } = copyBlobFile(node.srcItem, node.name);
+      const id = 'od-file-' + crypto.randomBytes(6).toString('hex');
+      onedriveFSData[id] = {
+        id,
+        accountId: accId,
+        name: node.name,
+        type: 'file',
+        size,
+        modified: new Date().toISOString(),
+        mimeType: getMimeType(node.name, node.srcItem?.mimeType),
+        parent: destFolder || 'root',
+        blobPath,
+      };
     }
-  } else {
-    const { blobPath, size } = copyBlobFile(item, item.name);
-    const id = 'file-' + crypto.randomBytes(6).toString('hex');
-    gdriveFSData[id] = {
-      id,
-      accountId: accId,
-      name: item.name,
-      type: 'file',
-      size,
-      modified: new Date().toISOString(),
-      mimeType: getMimeType(item.name, item.mimeType),
-      parent: destFolderId || 'root',
-      blobPath,
-    };
   }
 }
 
@@ -2040,6 +2700,17 @@ function deleteGDriveRecursive(fid) {
     }
   }
   delete gdriveFSData[fid];
+}
+
+function deleteOneDriveRecursive(fid) {
+  const item = onedriveFSData[fid];
+  if (!item) return;
+  if (item.type === 'folder') {
+    for (const ch of Object.values(onedriveFSData)) {
+      if (ch.parent === fid) deleteOneDriveRecursive(ch.id);
+    }
+  }
+  delete onedriveFSData[fid];
 }
 
 function moveSmbPathSameShare(shareId, oldPath, destDir) {
@@ -2092,37 +2763,42 @@ app.post('/api/transfer', requireAuth, (req, res) => {
   if (!items.length) {
     return res.status(400).json({ error: 'No items selected for transfer' });
   }
+  if (!['smb', 'gdrive', 'onedrive'].includes(srcType) || !['smb', 'gdrive', 'onedrive'].includes(destType)) {
+    return res.status(400).json({ error: 'Invalid source or destination type' });
+  }
 
   try {
     let count = 0;
     for (const it of items) {
       if (isMove && srcType === 'smb' && destType === 'smb' && srcDrive === destDrive) {
         moveSmbPathSameShare(srcDrive, it.path, destFolder);
-      } else if (isMove && srcType === 'gdrive' && destType === 'gdrive' && srcDrive === destDrive) {
+      } else if (isMove && srcType === 'gdrive' && destType === 'gdrive' && resolveGDriveAccountId(srcDrive) === resolveGDriveAccountId(destDrive)) {
         const gdItem = gdriveFSData[it.id];
         if (!gdItem) throw new Error('Source file not found');
         if (it.id === destFolder) throw new Error('Cannot move a folder into itself');
         gdItem.parent = destFolder || 'root';
         gdItem.modified = new Date().toISOString();
-      } else if (srcType === 'smb' && destType === 'gdrive') {
-        copySmbItemToGDrive(srcDrive, it.path, destFolder, destDrive);
-        if (isMove) deleteSmbPathRecursive(srcDrive, it.path);
-      } else if (srcType === 'gdrive' && destType === 'smb') {
-        copyGDriveItemToSmb(it.id, destDrive, destFolder);
-        if (isMove) deleteGDriveRecursive(it.id);
-      } else if (srcType === 'smb' && destType === 'smb') {
-        copySmbItemToSmb(srcDrive, it.path, destDrive, destFolder);
-        if (isMove) deleteSmbPathRecursive(srcDrive, it.path);
-      } else if (srcType === 'gdrive' && destType === 'gdrive') {
-        copyGDriveItemToGDrive(it.id, destFolder, destDrive);
-        if (isMove) deleteGDriveRecursive(it.id);
+      } else if (isMove && srcType === 'onedrive' && destType === 'onedrive' && resolveOneDriveAccountId(srcDrive) === resolveOneDriveAccountId(destDrive)) {
+        const odItem = onedriveFSData[it.id];
+        if (!odItem) throw new Error('Source file not found');
+        if (it.id === destFolder) throw new Error('Cannot move a folder into itself');
+        odItem.parent = destFolder || 'root';
+        odItem.modified = new Date().toISOString();
       } else {
-        return res.status(400).json({ error: 'Invalid source or destination type' });
+        const node = readSourceNode(srcType, srcDrive, it);
+        if (!node) throw new Error('Source item not found');
+        writeDestNode(node, destType, destDrive, destFolder);
+        if (isMove) {
+          if (srcType === 'smb') deleteSmbPathRecursive(srcDrive, it.path);
+          else if (srcType === 'gdrive') deleteGDriveRecursive(it.id);
+          else if (srcType === 'onedrive') deleteOneDriveRecursive(it.id);
+        }
       }
       count++;
     }
     saveSmbFS();
     saveGDriveFS();
+    saveOneDriveFS();
     return res.json({
       ok: true,
       copied: count,
@@ -2139,11 +2815,15 @@ function getSmbProxyStatus() {
   const d = loadJson(SMB_PROXY_FILE, null);
   const username = d && d.username ? d.username : 'sagedrive';
   const configured = Boolean(d);
-  const accounts = loadGDriveAccountsRaw();
-  const shares = accounts.map((a) => {
+  const gdAccounts = loadGDriveAccountsRaw();
+  const odAccounts = loadOneDriveAccountsRaw();
+  const shares = [];
+
+  for (const a of gdAccounts) {
     const rcId = String(a.id || 'default').replace(/[^A-Za-z0-9_]/g, '_');
     const enabled = Boolean(a.smb_enabled ?? true);
-    return {
+    shares.push({
+      provider: 'gdrive',
       account_id: a.id,
       account_name: a.custom_name || a.name || 'Google Drive',
       email: a.email || '',
@@ -2151,8 +2831,24 @@ function getSmbProxyStatus() {
       smb_share_name: a.smb_share_name || 'GoogleDrive',
       mount_path: `/mnt/gdrive_mounts/${rcId}`,
       mounted: enabled,
-    };
-  });
+    });
+  }
+
+  for (const a of odAccounts) {
+    const rcId = String(a.id || 'default').replace(/[^A-Za-z0-9_]/g, '_');
+    const enabled = Boolean(a.smb_enabled ?? true);
+    shares.push({
+      provider: 'onedrive',
+      account_id: a.id,
+      account_name: a.custom_name || a.name || 'OneDrive',
+      email: a.email || '',
+      smb_enabled: enabled,
+      smb_share_name: a.smb_share_name || 'OneDrive',
+      mount_path: `/mnt/gdrive_mounts/od_${rcId}`,
+      mounted: enabled,
+    });
+  }
+
   return { username, configured, shares };
 }
 
@@ -2167,13 +2863,35 @@ app.get('/api/smb/proxy-shares', requireAuth, (req, res) => {
 app.post('/api/smb/proxy-shares/:account_id', requireAuth, (req, res) => {
   const { account_id } = req.params;
   const b = req.body || {};
-  const accounts = loadGDriveAccountsRaw();
-  const target = accounts.find(
-    (a) => a.id === account_id || ((account_id === 'root' || account_id === 'default') && a === accounts[0])
-  );
-  if (!target) {
-    return res.status(404).json({ error: `Google Drive account '${account_id}' not found` });
+  const provider = String(b.provider || req.query.provider || '').trim().toLowerCase();
+  const gdAccounts = loadGDriveAccountsRaw();
+  const odAccounts = loadOneDriveAccountsRaw();
+
+  let targetProvider = provider;
+  let target = null;
+
+  if (targetProvider === 'onedrive') {
+    target = odAccounts.find(
+      (a) => a.id === account_id || ((account_id === 'root' || account_id === 'default') && a === odAccounts[0])
+    );
+  } else if (targetProvider === 'gdrive') {
+    target = gdAccounts.find(
+      (a) => a.id === account_id || ((account_id === 'root' || account_id === 'default') && a === gdAccounts[0])
+    );
+  } else {
+    target = gdAccounts.find((a) => a.id === account_id);
+    if (target) {
+      targetProvider = 'gdrive';
+    } else {
+      target = odAccounts.find((a) => a.id === account_id);
+      if (target) targetProvider = 'onedrive';
+    }
   }
+
+  if (!target) {
+    return res.status(404).json({ error: `Cloud drive account '${account_id}' not found` });
+  }
+
   if (b.smb_share_name !== undefined) {
     const raw = String(b.smb_share_name || '').trim();
     if (!raw) {
@@ -2183,20 +2901,30 @@ app.post('/api/smb/proxy-shares/:account_id', requireAuth, (req, res) => {
     if (!cleaned || RESERVED_SMB_NAMES.has(cleaned.toLowerCase())) {
       return res.status(400).json({ error: `Invalid or reserved SMB share name: '${raw}'` });
     }
-    const conflict = accounts.find(
-      (other) => other.id !== target.id && String(other.smb_share_name || '').toLowerCase() === cleaned.toLowerCase()
+    const allOtherShares = [
+      ...gdAccounts.filter((a) => !(targetProvider === 'gdrive' && a.id === target.id)),
+      ...odAccounts.filter((a) => !(targetProvider === 'onedrive' && a.id === target.id)),
+    ];
+    const conflict = allOtherShares.find(
+      (other) => String(other.smb_share_name || '').toLowerCase() === cleaned.toLowerCase()
     );
     if (conflict) {
-      return res.status(400).json({ error: `SMB share name '${cleaned}' is already used by another Google Drive` });
+      return res.status(400).json({ error: `SMB share name '${cleaned}' is already used by another cloud drive` });
     }
     target.smb_share_name = cleaned;
   }
   if (b.smb_enabled !== undefined) {
     target.smb_enabled = Boolean(b.smb_enabled);
   }
-  saveGDriveAccountsRaw(accounts);
+
+  if (targetProvider === 'onedrive') {
+    saveOneDriveAccountsRaw(odAccounts);
+  } else {
+    saveGDriveAccountsRaw(gdAccounts);
+  }
+
   const status = getSmbProxyStatus();
-  const updatedShare = status.shares.find((s) => s.account_id === target.id);
+  const updatedShare = status.shares.find((s) => s.provider === targetProvider && s.account_id === target.id);
   return res.json({
     ok: true,
     share: updatedShare,

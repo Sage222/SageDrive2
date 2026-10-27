@@ -1,6 +1,6 @@
 {
-  "summary":  "Implementation plan for path traversal guard and cookie hardening, in-browser text/config file editor, Move files/folders context menu action, zero-RAM streaming uploads, and Docker/Rclone memory tuning.",
-  "updatedAt":  "2026-10-25T02:24:53.144707452Z",
+  "summary":  "Implementation plan for adding Microsoft OneDrive multi-account integration (with SMB Proxy support), embedded MKV/MP4 subtitle extraction and playback, and Audio + Subtitle track selectors in the Fullscreen HUD.",
+  "updatedAt":  "2026-10-26T23:15:40.160395052Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

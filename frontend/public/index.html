@@ -4,9 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SageDrive</title>
-  <meta name="description" content="Self-hosted browser-based file manager providing unified access to SMB/NAS shares and Google Drive from a single interface." />
+  <meta name="description" content="Self-hosted browser-based file manager providing unified access to SMB/NAS shares, Google Drive, and Microsoft OneDrive from a single interface." />
   <meta property="og:title" content="SageDrive" />
-  <meta property="og:description" content="Self-hosted browser-based file manager providing unified access to SMB/NAS shares and Google Drive from a single interface." />
+  <meta property="og:description" content="Self-hosted browser-based file manager providing unified access to SMB/NAS shares, Google Drive, and Microsoft OneDrive from a single interface." />
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' fill='none'%3E%3Crect width='64' height='64' rx='16' fill='%2301696f'/%3E%3Crect x='4' y='4' width='56' height='56' rx='13' stroke='%234f98a3' stroke-opacity='0.35' stroke-width='2'/%3E%3Cpath d='M14 45L25.5 19L32.5 35L39.5 23.5L51 45' stroke='%23ffffff' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='49' cy='19' r='4.5' fill='%237fd8e6'/%3E%3C/svg%3E" />
   <link rel="alternate icon" href="/favicon.svg" />
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -320,6 +320,13 @@
               border-radius:calc(var(--radius-sm) - 1px);color:rgba(255,255,255,.78);cursor:pointer}
     .hud-pill:hover{color:#fff}
     .hud-pill.active{background:var(--color-primary);color:#fff;font-weight:600}
+    .hud-select{background:rgba(0,0,0,.62);color:#fff;border:1px solid rgba(255,255,255,.22);
+                border-radius:var(--radius-sm);font-family:var(--font-mono);font-size:11px;
+                padding:2px 6px;height:24px;cursor:pointer;outline:none;max-width:170px}
+    .hud-select:hover{border-color:rgba(255,255,255,.4)}
+    .hud-select option{background:#1c1b19;color:#fff}
+    video::cue{background:rgba(0,0,0,.78);color:#fff;font-family:var(--font-body);
+               font-size:clamp(.95rem,1.8vw,1.35rem);text-shadow:0 1px 3px rgba(0,0,0,.9)}
 
     .toolbar{display:flex;align-items:center;gap:var(--space-2);
              margin-bottom:var(--space-5);flex-wrap:wrap}
@@ -621,6 +628,9 @@ let _shares    = [];
 let _gdStatus  = {configured:false, authenticated:false, accounts:[]};
 let _gdAccounts = [];
 let _gdConfig  = {client_id:'', client_secret:'', redirect_uri:''};
+let _odStatus  = {configured:false, authenticated:false, accounts:[]};
+let _odAccounts = [];
+let _odConfig  = {client_id:'', client_secret:'', redirect_uri:'', tenant_id:'common'};
 let smbProxyCreds = {username:'sagedrive', configured:false, shares:[]};
 let _settingsTab = 'gdrive';
 let _oauthFormExpanded = false;
@@ -770,6 +780,7 @@ async function initApp() {
 
   await refreshShares();
   await refreshGDStatus();
+  await refreshODStatus();
   renderSidebar();
   setView('welcome');
   lucide.createIcons();
@@ -787,10 +798,10 @@ function renderSidebar() {
       html += `<div class="sidebar-item ${isAct ? 'active' : ''}"
                     onclick="openGDrive('${escAttr(acc.id)}','${escAttr(acc.name)}')"
                     oncontextmenu="openDriveContextMenu(event,'gdrive','${accJson}')"
-                    title="${escHtml(acc.name)}${escHtml(subHint)} • Right-click to set custom name">
+                    title="${escHtml(acc.name)}${escHtml(subHint)}">
         <svg data-lucide="hard-drive"></svg>
         <span class="sidebar-item-label">${escHtml(acc.name)}</span>
-        <button class="sidebar-item-more" onclick="event.stopPropagation();openDriveContextMenu(event,'gdrive','${accJson}')" title="Drive options / Set custom name">
+        <button class="sidebar-item-more" onclick="event.stopPropagation();openDriveContextMenu(event,'gdrive','${accJson}')" title="Drive options">
           <svg data-lucide="more-vertical" width="14" height="14"></svg>
         </button>
       </div>`;
@@ -806,22 +817,49 @@ function renderSidebar() {
     </div>`;
   }
 
+  if (_odAccounts.length > 0) {
+    for (const acc of _odAccounts) {
+      const isAct = _activeDrive?.type === 'onedrive' && _activeDrive?.id === acc.id && _view === 'files';
+      const accJson = encodeFileArg(acc);
+      const subHint = acc.email ? ` (${acc.email})` : '';
+      html += `<div class="sidebar-item ${isAct ? 'active' : ''}"
+                    onclick="openOneDrive('${escAttr(acc.id)}','${escAttr(acc.name)}')"
+                    oncontextmenu="openDriveContextMenu(event,'onedrive','${accJson}')"
+                    title="${escHtml(acc.name)}${escHtml(subHint)}">
+        <svg data-lucide="cloud"></svg>
+        <span class="sidebar-item-label">${escHtml(acc.name)}</span>
+        <button class="sidebar-item-more" onclick="event.stopPropagation();openDriveContextMenu(event,'onedrive','${accJson}')" title="OneDrive options">
+          <svg data-lucide="more-vertical" width="14" height="14"></svg>
+        </button>
+      </div>`;
+    }
+  } else {
+    html += `<div class="sidebar-item"
+                  onclick="openOneDrive()"
+                  oncontextmenu="openDriveContextMenu(event,'onedrive_off','')"
+                  title="Connect Microsoft OneDrive in Settings">
+      <svg data-lucide="cloud-off"></svg>
+      <span class="sidebar-item-label">OneDrive</span>
+      <span class="badge badge-error" style="margin-left:auto;font-size:10px">off</span>
+    </div>`;
+  }
+
   for (const s of _shares) {
     const isAct = _activeDrive?.type === 'smb' && _activeDrive?.id === s.id && _view === 'files';
     const sJson = encodeFileArg(s);
     html += `<div class="sidebar-item ${isAct ? 'active' : ''}"
                   onclick="openShare('${escAttr(s.id)}','${escAttr(s.name)}')"
                   oncontextmenu="openDriveContextMenu(event,'smb','${sJson}')"
-                  title="${escHtml(s.name)} (${escHtml(s.host)} › ${escHtml(s.share)}) • Right-click to set custom name">
+                  title="${escHtml(s.name)} (${escHtml(s.host)} › ${escHtml(s.share)})">
       <svg data-lucide="server"></svg>
       <span class="sidebar-item-label">${escHtml(s.name)}</span>
-      <button class="sidebar-item-more" onclick="event.stopPropagation();openDriveContextMenu(event,'smb','${sJson}')" title="Share options / Set custom name">
+      <button class="sidebar-item-more" onclick="event.stopPropagation();openDriveContextMenu(event,'smb','${sJson}')" title="Share options">
         <svg data-lucide="more-vertical" width="14" height="14"></svg>
       </button>
     </div>`;
   }
 
-  if (!_shares.length && !_gdAccounts.length) {
+  if (!_shares.length && !_gdAccounts.length && !_odAccounts.length) {
     html += `<div style="padding:var(--space-3);font-size:var(--text-xs);color:var(--color-text-faint)">
       No drives — add one in Settings
     </div>`;
@@ -933,6 +971,43 @@ function gDriveBreadcrumbs() {
     id: seg.id,
     index: i
   }));
+}
+
+function openOneDrive(accountId = null, accountName = null) {
+  if (!_odStatus.authenticated || !_odAccounts.length) {
+    toast('Connect a Microsoft OneDrive account in Settings first', 'error');
+    setView('settings', _odStatus.configured ? 'onedrive' : 'od_oauth');
+    return;
+  }
+  _view = 'files';
+  const acc = (accountId && _odAccounts.find(a => a.id === accountId)) || _odAccounts[0];
+  const dispName = acc ? acc.name : (accountName || 'OneDrive');
+  const resolvedId = acc ? acc.id : (accountId || 'default');
+  _activeDrive = {type:'onedrive', id: resolvedId, name: dispName, email: acc?.email || ''};
+  _folderId = 'root';
+  _pathStack = [{id:'root', name: dispName}];
+  closeMobileSidebar();
+  document.querySelectorAll('.sidebar-item[data-view]').forEach(el => el.classList.remove('active'));
+  renderSidebar();
+  loadOneDriveFiles();
+}
+
+async function loadOneDriveFiles() {
+  setBreadcrumb(gDriveBreadcrumbs());
+  setTopbarActions(fileToolbar('onedrive'));
+  showLoading();
+  try {
+    const accId = _activeDrive?.id || 'default';
+    const files = await apiJSON(`/api/onedrive/files?folder=${encodeURIComponent(_folderId)}&account_id=${encodeURIComponent(accId)}`);
+    renderFileView(files, 'onedrive');
+  } catch(e) { showError(e.message); }
+}
+
+function reloadActiveDriveFiles() {
+  if (!_activeDrive) return;
+  if (_activeDrive.type === 'smb') loadSMBFiles();
+  else if (_activeDrive.type === 'onedrive') loadOneDriveFiles();
+  else loadGDriveFiles();
 }
 
 function itemKey(f, type) {
@@ -1300,18 +1375,37 @@ function mediaApiUrl(f, type) {
       + '?path=' + encodeURIComponent(f.path) + '&token=' + t;
   }
   var accId = encodeURIComponent(_activeDrive?.id || 'default');
-  return '/api/gdrive/download/' + f.id + '?account_id=' + accId + '&token=' + t;
+  if (type === 'onedrive') {
+    return '/api/onedrive/download/' + encodeURIComponent(f.id) + '?account_id=' + accId + '&token=' + t;
+  }
+  return '/api/gdrive/download/' + encodeURIComponent(f.id) + '?account_id=' + accId + '&token=' + t;
 }
 function mediaProbeUrl(f, type) {
   if (type === 'smb') {
     return '/api/smb/probe/' + _activeDrive.id + '?path=' + encodeURIComponent(f.path);
   }
   var accId = encodeURIComponent(_activeDrive?.id || 'default');
-  return '/api/gdrive/probe/' + f.id + '?account_id=' + accId;
+  if (type === 'onedrive') {
+    return '/api/onedrive/probe/' + encodeURIComponent(f.id) + '?account_id=' + accId;
+  }
+  return '/api/gdrive/probe/' + encodeURIComponent(f.id) + '?account_id=' + accId;
+}
+function mediaSubtitleUrl(f, type, trackIdx, startSec) {
+  var trk = Math.max(0, parseInt(trackIdx, 10) || 0);
+  var ss = Math.max(0, Number(startSec) || 0).toFixed(2);
+  if (type === 'smb') {
+    return '/api/smb/subtitles/' + _activeDrive.id + '?path=' + encodeURIComponent(f.path) + '&track=' + trk + '&ss=' + ss;
+  }
+  var accId = encodeURIComponent(_activeDrive?.id || 'default');
+  if (type === 'onedrive') {
+    return '/api/onedrive/subtitles/' + encodeURIComponent(f.id) + '?account_id=' + accId + '&track=' + trk + '&ss=' + ss;
+  }
+  return '/api/gdrive/subtitles/' + encodeURIComponent(f.id) + '?account_id=' + accId + '&track=' + trk + '&ss=' + ss;
 }
 
 let _activeMediaAbort = null;
 let _activeMediaBlobUrl = null;
+let _activeSubBlobUrl = null;
 let _activeMediaState = null;
 let _hudIdleTimer = null;
 
@@ -1342,6 +1436,7 @@ function cleanupActiveMedia() {
       player.ontimeupdate = null;
       player.onseeking = null;
       player.pause();
+      player.querySelectorAll('track').forEach(t => t.remove());
       player.removeAttribute('src');
       player.load();
     } catch(_) {}
@@ -1349,6 +1444,10 @@ function cleanupActiveMedia() {
   if (_activeMediaBlobUrl) {
     try { URL.revokeObjectURL(_activeMediaBlobUrl); } catch(_) {}
     _activeMediaBlobUrl = null;
+  }
+  if (_activeSubBlobUrl) {
+    try { URL.revokeObjectURL(_activeSubBlobUrl); } catch(_) {}
+    _activeSubBlobUrl = null;
   }
 }
 
@@ -1648,11 +1747,28 @@ function changeMediaAudioTrack(trackIdxStr) {
   if (!_activeMediaState) return;
   const idx = parseInt(trackIdxStr, 10) || 0;
   _activeMediaState.audioTrack = idx;
+  const sel1 = document.getElementById('media-audio-track-select');
+  const sel2 = document.getElementById('hud-audio-track-select');
+  if (sel1 && sel1.value !== String(idx)) sel1.value = String(idx);
+  if (sel2 && sel2.value !== String(idx)) sel2.value = String(idx);
   const curPos = getMediaCurrentTime();
   const targetMode = (_activeMediaState.mode === 'direct')
     ? (_activeMediaState.canRemux ? 'remux' : 'full')
     : _activeMediaState.mode;
   _activeMediaState.switchMode(targetMode, true, curPos);
+}
+
+function changeMediaSubtitleTrack(trackIdxStr) {
+  if (!_activeMediaState) return;
+  const idx = parseInt(trackIdxStr, 10);
+  _activeMediaState.subtitleTrack = Number.isNaN(idx) ? -1 : idx;
+  const sel1 = document.getElementById('media-subtitle-track-select');
+  const sel2 = document.getElementById('hud-subtitle-track-select');
+  if (sel1 && sel1.value !== String(_activeMediaState.subtitleTrack)) sel1.value = String(_activeMediaState.subtitleTrack);
+  if (sel2 && sel2.value !== String(_activeMediaState.subtitleTrack)) sel2.value = String(_activeMediaState.subtitleTrack);
+  if (_activeMediaState.refreshSubtitles) {
+    _activeMediaState.refreshSubtitles();
+  }
 }
 
 function forceMediaCompatMode() {
@@ -1703,7 +1819,7 @@ function openMedia(fJson, type) {
 
   var mediaEl = isVid
     ? '<div id="video-stage-container" class="video-stage">'
-        + '<video id="active-media-player" autoplay playsinline preload="auto" '
+        + '<video id="active-media-player" autoplay playsinline preload="auto" crossorigin="anonymous" '
         +   'style="transform:scale(' + _videoZoom + ')" '
         +   'onclick="toggleMediaPlayPause()" ondblclick="toggleVideoFullscreen()">'
         +   'Your browser cannot play this video.</video>'
@@ -1737,6 +1853,8 @@ function openMedia(fJson, type) {
         +       '</button>'
         +     '</div>'
         +     '<div class="video-hud-right">'
+        +       '<select id="hud-audio-track-select" class="hud-select" style="display:none" onchange="event.stopPropagation();changeMediaAudioTrack(this.value)" title="Audio Track"></select>'
+        +       '<select id="hud-subtitle-track-select" class="hud-select" style="display:none" onchange="event.stopPropagation();changeMediaSubtitleTrack(this.value)" title="Embedded Subtitles (CC)"></select>'
         +       '<span style="font-size:10px;color:rgba(255,255,255,.7);font-family:var(--font-mono)">Zoom</span>'
         +       '<div class="hud-pill-group">' + hudZoomBtns + '</div>'
         +       '<span style="font-size:10px;color:rgba(255,255,255,.7);font-family:var(--font-mono)">Speed</span>'
@@ -1776,7 +1894,7 @@ function openMedia(fJson, type) {
     +   '<svg data-lucide="x" width="18" height="18"></svg></button></div>'
     + '<div class="modal-body" style="padding-top:var(--space-3);gap:var(--space-3)">'
     + '<div id="media-stream-status" style="display:flex;flex-direction:column;gap:var(--space-2);padding:var(--space-2) 0">'
-    +   '<div class="dl-toast-meta"><span id="media-stream-text">Inspecting audio &amp; video streams…</span><span id="media-stream-pct"></span></div>'
+    +   '<div class="dl-toast-meta"><span id="media-stream-text">Inspecting audio, video &amp; subtitle streams…</span><span id="media-stream-pct"></span></div>'
     +   '<div class="progress-track"><div id="media-stream-fill" class="progress-fill indeterminate"></div></div>'
     + '</div>'
     + mediaEl
@@ -1822,6 +1940,7 @@ function openMedia(fJson, type) {
     +   '</div>'
     +   '<div style="display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap">'
     +     '<select id="media-audio-track-select" class="form-input" style="display:none;width:auto;padding:2px 8px;font-size:var(--text-xs);height:26px" onchange="changeMediaAudioTrack(this.value)" title="Audio track"></select>'
+    +     '<select id="media-subtitle-track-select" class="form-input" style="display:none;width:auto;padding:2px 8px;font-size:var(--text-xs);height:26px" onchange="changeMediaSubtitleTrack(this.value)" title="Embedded Subtitles (CC)"></select>'
     +     (isVid
             ? '<span style="font-size:var(--text-xs);color:var(--color-text-muted)">Zoom</span>'
               + '<div class="zoom-group">' + zoomBtns + '</div>'
@@ -1859,6 +1978,9 @@ function openMedia(fJson, type) {
   const compatBtn = document.getElementById('media-compat-btn');
   const compatLabel = document.getElementById('media-compat-label');
   const trackSelect = document.getElementById('media-audio-track-select');
+  const hudTrackSelect = document.getElementById('hud-audio-track-select');
+  const subSelect = document.getElementById('media-subtitle-track-select');
+  const hudSubSelect = document.getElementById('hud-subtitle-track-select');
   const timelineBar = document.getElementById('media-timeline-bar');
   const timelineSlider = document.getElementById('media-timeline-slider');
   const stageSlider = document.getElementById('stage-timeline-slider');
@@ -1896,6 +2018,8 @@ function openMedia(fJson, type) {
     isVid,
     mode: 'direct',
     audioTrack: 0,
+    subtitleTrack: -1,
+    subReqId: 0,
     canRemux: true,
     probeInfo: null,
     totalDuration: 0,
@@ -1908,8 +2032,54 @@ function openMedia(fJson, type) {
     silentCheckDone: false,
     switchMode: null,
     seekTo: null,
+    refreshSubtitles: null,
   };
   _activeMediaState = state;
+
+  async function refreshSubtitles() {
+    if (_activeMediaState !== state || !player || !isVid) return;
+    const reqId = ++state.subReqId;
+    try {
+      player.querySelectorAll('track').forEach(t => t.remove());
+      if (player.textTracks) {
+        for (let i = 0; i < player.textTracks.length; i++) {
+          player.textTracks[i].mode = 'disabled';
+        }
+      }
+    } catch (_) {}
+    if (_activeSubBlobUrl) {
+      try { URL.revokeObjectURL(_activeSubBlobUrl); } catch (_) {}
+      _activeSubBlobUrl = null;
+    }
+    if (state.subtitleTrack < 0) return;
+
+    const subUrl = mediaSubtitleUrl(state.f, state.type, state.subtitleTrack, state.seekOffset || 0);
+    try {
+      const r = await apiFetch(subUrl);
+      if (!r.ok || _activeMediaState !== state || state.subReqId !== reqId) return;
+      const vttText = await r.text();
+      if (_activeMediaState !== state || state.subReqId !== reqId) return;
+      const blob = new Blob([vttText], { type: 'text/vtt' });
+      _activeSubBlobUrl = URL.createObjectURL(blob);
+      const trackEl = document.createElement('track');
+      trackEl.kind = 'subtitles';
+      trackEl.label = 'Subtitles';
+      trackEl.srclang = 'en';
+      trackEl.src = _activeSubBlobUrl;
+      trackEl.default = true;
+      player.appendChild(trackEl);
+      const enableTrack = () => {
+        try {
+          if (player.textTracks && player.textTracks.length > 0) {
+            player.textTracks[player.textTracks.length - 1].mode = 'showing';
+          }
+        } catch (_) {}
+      };
+      trackEl.addEventListener('load', enableTrack);
+      setTimeout(enableTrack, 50);
+    } catch (_) {}
+  }
+  state.refreshSubtitles = refreshSubtitles;
 
   function syncTimelineUi() {
     const pDur = (player && Number.isFinite(player.duration) && player.duration > 0 && player.duration < 86400 * 7)
@@ -2020,6 +2190,9 @@ function openMedia(fJson, type) {
       };
       player.addEventListener('loadedmetadata', setDirectTime);
     }
+    if (isVid && state.subtitleTrack >= 0) {
+      refreshSubtitles();
+    }
     player.play().catch(() => {});
   }
   state.switchMode = switchMode;
@@ -2060,13 +2233,11 @@ function openMedia(fJson, type) {
         syncTimelineUi();
         return;
       }
-      // If direct stream does not support byte-range seeking to target, switch to remux/full at target
       const fallbackMode = state.isVid ? (state.canRemux ? 'remux' : 'full') : 'audio';
       switchMode(fallbackMode, true, clamped);
       return;
     }
 
-    // In remux / full / audio transcode mode, always perform a server-side ?ss= seek
     switchMode(state.mode, true, clamped);
   }
   state.seekTo = seekTo;
@@ -2125,7 +2296,6 @@ function openMedia(fJson, type) {
     }
   };
 
-  // Update timeline UI and detect if browser plays video track but silently drops unsupported audio
   player.ontimeupdate = () => {
     if (_activeMediaState !== state) return;
     syncTimelineUi();
@@ -2177,7 +2347,6 @@ function openMedia(fJson, type) {
     }
   };
 
-  // Probe stream codecs & full duration first so EAC3/AC3/DTS/surround audio plays with AAC and full duration from frame 0
   (async () => {
     const ext = _fileExt(f);
     let probe = null;
@@ -2198,15 +2367,45 @@ function openMedia(fJson, type) {
       syncTimelineUi();
     }
 
-    if (probe && Array.isArray(probe.audio_streams) && probe.audio_streams.length > 1 && trackSelect) {
-      trackSelect.innerHTML = probe.audio_streams.map((t, i) => {
+    if (probe && Array.isArray(probe.audio_streams) && probe.audio_streams.length > 0) {
+      const audioOptionsHtml = probe.audio_streams.map((t, i) => {
         const lang = t.language ? t.language.toUpperCase() : `Track ${i + 1}`;
         const codec = (t.codec || '').toUpperCase();
         const ch = t.channels ? `${t.channels}ch` : '';
         const title = t.title ? ` (${t.title})` : '';
-        return `<option value="${i}">${escHtml(`${lang} • ${codec} ${ch}${title}`.trim())}</option>`;
+        return `<option value="${i}">${escHtml(`Audio: ${lang} • ${codec} ${ch}${title}`.trim())}</option>`;
       }).join('');
-      trackSelect.style.display = 'inline-block';
+      if (trackSelect && probe.audio_streams.length > 1) {
+        trackSelect.innerHTML = audioOptionsHtml;
+        trackSelect.style.display = 'inline-block';
+      }
+      if (hudTrackSelect && probe.audio_streams.length > 1) {
+        hudTrackSelect.innerHTML = audioOptionsHtml;
+        hudTrackSelect.style.display = 'inline-block';
+      }
+    }
+
+    if (isVid && probe && Array.isArray(probe.subtitle_streams) && probe.subtitle_streams.length > 0) {
+      const defaultSubIdx = probe.subtitle_streams.findIndex(s => s.forced || s.default);
+      if (defaultSubIdx >= 0) {
+        state.subtitleTrack = defaultSubIdx;
+      }
+      const subOptionsHtml = `<option value="-1" ${state.subtitleTrack === -1 ? 'selected' : ''}>CC: Off</option>`
+        + probe.subtitle_streams.map((s, i) => {
+          const lang = s.language ? s.language.toUpperCase() : `Track ${i + 1}`;
+          const title = s.title ? ` (${s.title})` : '';
+          const flags = s.forced ? ' [Forced]' : (s.default ? ' [Default]' : '');
+          const selAttr = state.subtitleTrack === i ? 'selected' : '';
+          return `<option value="${i}" ${selAttr}>${escHtml(`CC: ${lang}${title}${flags}`.trim())}</option>`;
+        }).join('');
+      if (subSelect) {
+        subSelect.innerHTML = subOptionsHtml;
+        subSelect.style.display = 'inline-block';
+      }
+      if (hudSubSelect) {
+        hudSubSelect.innerHTML = subOptionsHtml;
+        hudSubSelect.style.display = 'inline-block';
+      }
     }
 
     if (isVid) {
@@ -2483,6 +2682,12 @@ async function saveEditedTextFile(fJson, type) {
         method: 'PUT',
         json: { path: targetPath, content: newContent }
       });
+    } else if (type === 'onedrive') {
+      const accId = _activeDrive?.id || 'default';
+      res = await apiJSON(`/api/onedrive/content/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}`, {
+        method: 'PUT',
+        json: { content: newContent, account_id: accId }
+      });
     } else {
       const accId = _activeDrive?.id || 'default';
       res = await apiJSON(`/api/gdrive/content/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}`, {
@@ -2496,8 +2701,7 @@ async function saveEditedTextFile(fJson, type) {
     updateEditorStats();
     toast(`Saved "${f.name}" (${fmtSize(res.size ?? new Blob([newContent]).size)})`, 'success');
     if (_view === 'files') {
-      if (type === 'smb') loadSMBFiles();
-      else loadGDriveFiles();
+      reloadActiveDriveFiles();
     }
   } catch (e) {
     toast('Failed saving file: ' + e.message, 'error');
@@ -2667,6 +2871,10 @@ function fileClick(fJson, type, ev) {
   if (type==='smb') {
     _path = f.path || (_path.replace(/\/$/,'') + '/' + f.name);
     loadSMBFiles();
+  } else if (type==='onedrive') {
+    _pathStack.push({id:f.id, name:f.name});
+    _folderId = f.id;
+    loadOneDriveFiles();
   } else {
     _pathStack.push({id:f.id, name:f.name});
     _folderId = f.id;
@@ -2685,6 +2893,13 @@ function dlFile(fJson, type) {
         0,
         { method: 'POST', json: { paths: [f.path || f.name], name: `${f.name}.zip` } }
       );
+    } else if (type === 'onedrive') {
+      authedDownload(
+        `/api/onedrive/zip?account_id=${encodeURIComponent(accId)}`,
+        `${f.name}.zip`,
+        0,
+        { method: 'POST', json: { ids: [f.id], name: `${f.name}.zip`, account_id: accId } }
+      );
     } else {
       authedDownload(
         `/api/gdrive/zip?account_id=${encodeURIComponent(accId)}`,
@@ -2697,8 +2912,10 @@ function dlFile(fJson, type) {
   }
   if (type==='smb') {
     authedDownload(`/api/smb/download/${_activeDrive.id}?path=${encodeURIComponent(f.path)}&dl=1`, f.name, f.size);
+  } else if (type==='onedrive') {
+    authedDownload(`/api/onedrive/download/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}&dl=1`, f.name, f.size);
   } else {
-    authedDownload(`/api/gdrive/download/${f.id}?account_id=${encodeURIComponent(accId)}&dl=1`, f.name, f.size);
+    authedDownload(`/api/gdrive/download/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}&dl=1`, f.name, f.size);
   }
 }
 
@@ -2974,12 +3191,40 @@ function openDriveContextMenu(e, driveType, dJson) {
     menu.style.top = Math.max(8, Math.min(e.clientY, window.innerHeight - rect.height - 12)) + 'px';
     return;
   }
+  if (driveType === 'onedrive_off') {
+    menu.innerHTML = `
+      <button class="ctx-item" onclick="closeContextMenu();setView('settings','onedrive')">
+        <svg data-lucide="link"></svg> Connect Microsoft OneDrive…
+      </button>
+    `;
+    menu.style.display = 'flex';
+    lucide.createIcons();
+    const rect = menu.getBoundingClientRect();
+    menu.style.left = Math.max(8, Math.min(e.clientX, window.innerWidth - rect.width - 12)) + 'px';
+    menu.style.top = Math.max(8, Math.min(e.clientY, window.innerHeight - rect.height - 12)) + 'px';
+    return;
+  }
 
   const d = parseFileArg(dJson);
   const isSmb = driveType === 'smb';
+  const isOd = driveType === 'onedrive';
   let html = '';
 
-  html += `<button class="ctx-item" onclick="closeContextMenu();${isSmb ? `openShare('${escAttr(d.id)}','${escAttr(d.name)}')` : `openGDrive('${escAttr(d.id)}','${escAttr(d.name)}')`}">
+  const openCall = isSmb
+    ? `openShare('${escAttr(d.id)}','${escAttr(d.name)}')`
+    : (isOd ? `openOneDrive('${escAttr(d.id)}','${escAttr(d.name)}')` : `openGDrive('${escAttr(d.id)}','${escAttr(d.name)}')`);
+  const addCall = isSmb
+    ? 'showAddShareModal()'
+    : (isOd ? 'showAddOneDriveModal()' : 'showAddGDriveModal()');
+  const addLabel = isSmb
+    ? 'Add Another SMB Share…'
+    : (isOd ? 'Add Another OneDrive…' : 'Add Another Google Drive…');
+  const settingsTab = isSmb ? 'smb' : (isOd ? 'onedrive' : 'gdrive');
+  const removeCall = isSmb
+    ? `deleteShare('${escAttr(d.id)}')`
+    : (isOd ? `disconnectOneDrive('${escAttr(d.id)}','${escAttr(d.name)}')` : `disconnectGDrive('${escAttr(d.id)}','${escAttr(d.name)}')`);
+
+  html += `<button class="ctx-item" onclick="closeContextMenu();${openCall}">
     <svg data-lucide="folder-open"></svg> Open ${escHtml(d.name)}
   </button>`;
 
@@ -2987,16 +3232,16 @@ function openDriveContextMenu(e, driveType, dJson) {
     <svg data-lucide="edit-3"></svg> Set Custom Name…
   </button>`;
 
-  html += `<button class="ctx-item" onclick="closeContextMenu();${isSmb ? 'showAddShareModal()' : 'showAddGDriveModal()'}">
-    <svg data-lucide="plus-circle"></svg> ${isSmb ? 'Add Another SMB Share…' : 'Add Another Google Drive…'}
+  html += `<button class="ctx-item" onclick="closeContextMenu();${addCall}">
+    <svg data-lucide="plus-circle"></svg> ${addLabel}
   </button>`;
 
-  html += `<button class="ctx-item" onclick="closeContextMenu();setView('settings','${isSmb ? 'smb' : 'gdrive'}')">
+  html += `<button class="ctx-item" onclick="closeContextMenu();setView('settings','${settingsTab}')">
     <svg data-lucide="settings"></svg> Manage in Settings
   </button>`;
 
   html += `<div class="ctx-divider"></div>`;
-  html += `<button class="ctx-item danger" onclick="closeContextMenu();${isSmb ? `deleteShare('${escAttr(d.id)}')` : `disconnectGDrive('${escAttr(d.id)}','${escAttr(d.name)}')`}">
+  html += `<button class="ctx-item danger" onclick="closeContextMenu();${removeCall}">
     <svg data-lucide="${isSmb ? 'trash-2' : 'unlink'}"></svg> ${isSmb ? 'Remove Share' : 'Disconnect Drive'}
   </button>`;
 
@@ -3014,9 +3259,12 @@ function openDriveContextMenu(e, driveType, dJson) {
 function showDriveCustomNameModal(driveType, dJson) {
   const d = parseFileArg(dJson);
   const isSmb = driveType === 'smb';
+  const isOd = driveType === 'onedrive';
+  const typeTitle = isSmb ? 'SMB / NAS Share' : (isOd ? 'Microsoft OneDrive' : 'Google Drive');
+  const typeIcon = isSmb ? 'server' : (isOd ? 'cloud' : 'hard-drive');
   const subInfo = isSmb
     ? `${d.host}:${d.port || 445} › ${d.share}`
-    : (d.email || d.original_name || 'Google Drive Account');
+    : (d.email || d.original_name || typeTitle);
 
   showModal(`
     <div class="modal-header">
@@ -3027,10 +3275,10 @@ function showDriveCustomNameModal(driveType, dJson) {
     <div class="modal-body">
       <div style="display:flex;align-items:center;gap:var(--space-3);padding:var(--space-3);background:var(--color-surface-offset);border-radius:var(--radius-md);border:1px solid var(--color-border)">
         <div class="share-icon-box">
-          <svg data-lucide="${isSmb ? 'server' : 'hard-drive'}" width="18" height="18"></svg>
+          <svg data-lucide="${typeIcon}" width="18" height="18"></svg>
         </div>
         <div style="min-width:0;flex:1">
-          <div style="font-size:var(--text-xs);color:var(--color-text-muted)">${isSmb ? 'SMB / NAS Share' : 'Google Drive'}</div>
+          <div style="font-size:var(--text-xs);color:var(--color-text-muted)">${typeTitle}</div>
           <div style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--color-text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(subInfo)}</div>
         </div>
       </div>
@@ -3076,6 +3324,17 @@ async function doSaveDriveCustomName(driveType, driveId) {
         _activeDrive.name = newName;
         if (_view === 'files') setBreadcrumb(smbBreadcrumbs());
       }
+    } else if (driveType === 'onedrive') {
+      await apiJSON(`/api/onedrive/accounts/${encodeURIComponent(driveId)}/rename`, {
+        method: 'POST',
+        json: { name: newName }
+      });
+      await refreshODStatus();
+      if (_activeDrive?.type === 'onedrive' && _activeDrive?.id === driveId) {
+        _activeDrive.name = newName;
+        if (_pathStack.length > 0) _pathStack[0].name = newName;
+        if (_view === 'files') setBreadcrumb(gDriveBreadcrumbs());
+      }
     } else {
       await apiJSON(`/api/gdrive/accounts/${encodeURIComponent(driveId)}/rename`, {
         method: 'POST',
@@ -3113,9 +3372,18 @@ async function doRename(fJson, type) {
       closeModal();
       toast(`Renamed to "${newName}"`, 'success');
       loadSMBFiles();
+    } else if (type === 'onedrive') {
+      const accId = _activeDrive?.id || 'default';
+      await apiJSON(`/api/onedrive/rename/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}`, {
+        method: 'POST',
+        json: { name: newName, account_id: accId }
+      });
+      closeModal();
+      toast(`Renamed to "${newName}"`, 'success');
+      loadOneDriveFiles();
     } else {
       const accId = _activeDrive?.id || 'default';
-      await apiJSON(`/api/gdrive/rename/${f.id}?account_id=${encodeURIComponent(accId)}`, {
+      await apiJSON(`/api/gdrive/rename/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}`, {
         method: 'POST',
         json: { name: newName, account_id: accId }
       });
@@ -3142,6 +3410,13 @@ function downloadSelectedZip(type) {
       method: 'POST',
       json: { paths, name: archiveName }
     });
+  } else if (type === 'onedrive') {
+    const accId = _activeDrive?.id || 'default';
+    const ids = items.map(it => it.id);
+    authedDownload(`/api/onedrive/zip?account_id=${encodeURIComponent(accId)}`, archiveName, 0, {
+      method: 'POST',
+      json: { ids, name: archiveName, account_id: accId }
+    });
   } else {
     const accId = _activeDrive?.id || 'default';
     const ids = items.map(it => it.id);
@@ -3165,8 +3440,10 @@ async function deleteSelectedItems(type) {
           method: 'DELETE',
           json: { path: f.path || f.name, is_dir: f.type === 'folder' }
         });
+      } else if (type === 'onedrive') {
+        await apiJSON(`/api/onedrive/delete/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}`, { method: 'DELETE' });
       } else {
-        await apiJSON(`/api/gdrive/delete/${f.id}?account_id=${encodeURIComponent(accId)}`, { method: 'DELETE' });
+        await apiJSON(`/api/gdrive/delete/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}`, { method: 'DELETE' });
       }
       deleted++;
     } catch (e) {
@@ -3175,7 +3452,7 @@ async function deleteSelectedItems(type) {
   }
   clearSelection();
   if (deleted) toast(`Deleted ${deleted} item${deleted > 1 ? 's' : ''}`, 'success');
-  if (type === 'smb') loadSMBFiles(); else loadGDriveFiles();
+  reloadActiveDriveFiles();
 }
 
 // ── Cross-Drive / Same-Drive Copy & Move Modal ────────────────────────────────
@@ -3222,10 +3499,14 @@ async function showTransferModal(srcType, singleItemJson = null, mode = 'copy') 
 
   await refreshShares();
   await refreshGDStatus();
+  await refreshODStatus();
 
   const destOptions = [];
   for (const acc of _gdAccounts) {
     destOptions.push({ key: `gdrive:${acc.id}`, type: 'gdrive', id: acc.id, name: `Google Drive: ${acc.name}` });
+  }
+  for (const acc of _odAccounts) {
+    destOptions.push({ key: `onedrive:${acc.id}`, type: 'onedrive', id: acc.id, name: `OneDrive: ${acc.name}` });
   }
   for (const s of _shares) {
     destOptions.push({ key: `smb:${s.id}`, type: 'smb', id: s.id, name: `SMB: ${s.name}` });
@@ -3237,7 +3518,6 @@ async function showTransferModal(srcType, singleItemJson = null, mode = 'copy') 
   }
 
   const isMove = _transferMode === 'move';
-  // For Move, default to the current drive so moving to another folder on the same drive is immediate; for Copy, prefer a different drive if available
   const sameDriveOpt = destOptions.find(d => d.type === srcType && d.id === _activeDrive.id);
   const diffDriveOpt = destOptions.find(d => d.type !== srcType || d.id !== _activeDrive.id);
   const preferred = isMove
@@ -3297,9 +3577,14 @@ function onTransferDriveChange(val) {
   const idx = val.indexOf(':');
   const type = val.slice(0, idx);
   const id = val.slice(idx + 1);
-  const label = type === 'gdrive'
-    ? (_gdAccounts.find(a => a.id === id)?.name || 'Google Drive')
-    : (_shares.find(s => s.id === id)?.name || id);
+  let label = id;
+  if (type === 'gdrive') {
+    label = _gdAccounts.find(a => a.id === id)?.name || 'Google Drive';
+  } else if (type === 'onedrive') {
+    label = _odAccounts.find(a => a.id === id)?.name || 'OneDrive';
+  } else {
+    label = _shares.find(s => s.id === id)?.name || id;
+  }
   _transferDestDrive = { key: val, type, id, name: label };
   _transferDestFolder = type === 'smb' ? '/' : 'root';
   _transferDestStack = [{ id: _transferDestFolder, name: label }];
@@ -3322,6 +3607,8 @@ async function loadTransferFolders() {
     let items = [];
     if (_transferDestDrive.type === 'smb') {
       items = await apiJSON(`/api/smb/browse/${_transferDestDrive.id}?path=${encodeURIComponent(_transferDestFolder)}`);
+    } else if (_transferDestDrive.type === 'onedrive') {
+      items = await apiJSON(`/api/onedrive/files?folder=${encodeURIComponent(_transferDestFolder)}&account_id=${encodeURIComponent(_transferDestDrive.id)}`);
     } else {
       items = await apiJSON(`/api/gdrive/files?folder=${encodeURIComponent(_transferDestFolder)}&account_id=${encodeURIComponent(_transferDestDrive.id)}`);
     }
@@ -3339,7 +3626,7 @@ async function loadTransferFolders() {
     let html = '';
 
     if ((_transferDestDrive.type === 'smb' && _transferDestFolder !== '/') ||
-        (_transferDestDrive.type === 'gdrive' && _transferDestStack.length > 1)) {
+        (_transferDestDrive.type !== 'smb' && _transferDestStack.length > 1)) {
       html += `<div class="ctx-item" onclick="transferGoUp()">
         <svg data-lucide="corner-left-up"></svg> .. (Parent folder)
       </div>`;
@@ -3408,7 +3695,7 @@ async function doTransfer() {
     const count = res.moved || res.copied || _transferItems.length;
     toast(`${isMove ? 'Moved' : 'Copied'} ${count} item${count > 1 ? 's' : ''} to ${_transferDestDrive.name}`, 'success');
     if (isMove || (_transferDestDrive.type === _activeDrive.type && _transferDestDrive.id === _activeDrive.id)) {
-      if (_activeDrive.type === 'smb') loadSMBFiles(); else loadGDriveFiles();
+      reloadActiveDriveFiles();
     }
   } catch (e) {
     toast(`${isMove ? 'Move' : 'Copy'} failed: ` + e.message, 'error');
@@ -3429,9 +3716,13 @@ async function rmFile(fJson, type) {
         method:'DELETE', json:{path:f.path||f.name, is_dir:f.type==='folder'}
       });
       loadSMBFiles();
+    } else if (type==='onedrive') {
+      const accId = _activeDrive?.id || 'default';
+      await apiJSON(`/api/onedrive/delete/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}`, {method:'DELETE'});
+      loadOneDriveFiles();
     } else {
       const accId = _activeDrive?.id || 'default';
-      await apiJSON(`/api/gdrive/delete/${f.id}?account_id=${encodeURIComponent(accId)}`, {method:'DELETE'});
+      await apiJSON(`/api/gdrive/delete/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}`, {method:'DELETE'});
       loadGDriveFiles();
     }
     toast(`Deleted "${f.name}"`, 'success');
@@ -3470,8 +3761,7 @@ function fileToolbar(type) {
 
 function setViewMode(m) {
   _viewMode = m;
-  if (_activeDrive?.type==='smb') loadSMBFiles();
-  else if (_activeDrive?.type==='gdrive') loadGDriveFiles();
+  reloadActiveDriveFiles();
 }
 
 function showUploadModal(type) {
@@ -3611,7 +3901,9 @@ async function uploadFileEntries(entries, type) {
       const accId = _activeDrive?.id || 'default';
       const targetUrl = type === 'smb'
         ? `/api/smb/upload/${_activeDrive.id}?path=${encodeURIComponent(_path)}`
-        : `/api/gdrive/upload?folder=${encodeURIComponent(_folderId)}&account_id=${encodeURIComponent(accId)}`;
+        : (type === 'onedrive'
+            ? `/api/onedrive/upload?folder=${encodeURIComponent(_folderId)}&account_id=${encodeURIComponent(accId)}`
+            : `/api/gdrive/upload?folder=${encodeURIComponent(_folderId)}&account_id=${encodeURIComponent(accId)}`);
       await uploadFileWithProgress(targetUrl, file, relativePath, (loaded, total) => {
         const pct = Math.min(100, Math.round((loaded / total) * 100));
         if (fillEl) fillEl.style.width = pct + '%';
@@ -3622,7 +3914,7 @@ async function uploadFileEntries(entries, type) {
   }
   closeModal();
   if (ok) toast(`Uploaded ${ok} file${ok>1?'s':''}`, 'success');
-  if (type==='smb') loadSMBFiles(); else loadGDriveFiles();
+  reloadActiveDriveFiles();
 }
 
 function showMkdirModal(type) {
@@ -3656,6 +3948,10 @@ async function doMkdir(type) {
       const path = _path.replace(/\/$/,'') + '/' + name;
       await apiJSON(`/api/smb/mkdir/${_activeDrive.id}`, {method:'POST', json:{path}});
       loadSMBFiles();
+    } else if (type==='onedrive') {
+      const accId = _activeDrive?.id || 'default';
+      await apiJSON(`/api/onedrive/mkdir?account_id=${encodeURIComponent(accId)}`, {method:'POST', json:{parent:_folderId, name, account_id: accId}});
+      loadOneDriveFiles();
     } else {
       const accId = _activeDrive?.id || 'default';
       await apiJSON(`/api/gdrive/mkdir?account_id=${encodeURIComponent(accId)}`, {method:'POST', json:{parent:_folderId, name, account_id: accId}});
@@ -3687,33 +3983,50 @@ async function renderSettings() {
   setTopbarActions('');
   await refreshShares();
   await refreshGDStatus();
+  await refreshODStatus();
   try { smbProxyCreds = await apiJSON('/api/smb/proxy-credentials'); } catch(_) {}
 
-  const validTabs = ['gdrive', 'smb', 'oauth', 'proxy', 'system'];
+  const validTabs = ['gdrive', 'onedrive', 'smb', 'oauth', 'od_oauth', 'proxy', 'system'];
   if (!validTabs.includes(_settingsTab)) {
     _settingsTab = 'gdrive';
   }
 
-  const showGDrive = _settingsTab === 'gdrive';
-  const showSmb    = _settingsTab === 'smb';
-  const showOAuth  = _settingsTab === 'oauth';
-  const showProxy  = _settingsTab === 'proxy';
-  const showSystem = _settingsTab === 'system';
-  const oauthOpen  = true;
-  const defaultRedir = _gdConfig.redirect_uri || `${location.origin}/api/gdrive/callback`;
+  const showGDrive   = _settingsTab === 'gdrive';
+  const showOneDrive = _settingsTab === 'onedrive';
+  const showSmb      = _settingsTab === 'smb';
+  const showOAuth    = _settingsTab === 'oauth';
+  const showOdOAuth  = _settingsTab === 'od_oauth';
+  const showProxy    = _settingsTab === 'proxy';
+  const showSystem   = _settingsTab === 'system';
+  const oauthOpen    = true;
+  const defaultRedir   = _gdConfig.redirect_uri || `${location.origin}/api/gdrive/callback`;
+  const defaultOdRedir = _odConfig.redirect_uri || `${location.origin}/api/onedrive/callback`;
   const proxyHost = (location.hostname && location.hostname !== 'localhost' && !location.hostname.endsWith('.run.app'))
     ? location.hostname
     : '10.0.0.152';
+  const fallbackProxyShares = [
+    ..._gdAccounts.map(acc => ({
+      provider: 'gdrive',
+      account_id: acc.id,
+      account_name: acc.name,
+      email: acc.email || '',
+      smb_enabled: acc.smb_enabled !== false,
+      smb_share_name: acc.smb_share_name || 'GoogleDrive',
+      mounted: acc.smb_enabled !== false,
+    })),
+    ..._odAccounts.map(acc => ({
+      provider: 'onedrive',
+      account_id: acc.id,
+      account_name: acc.name,
+      email: acc.email || '',
+      smb_enabled: acc.smb_enabled !== false,
+      smb_share_name: acc.smb_share_name || 'OneDrive',
+      mounted: acc.smb_enabled !== false,
+    })),
+  ];
   const proxyShares = Array.isArray(smbProxyCreds.shares) && smbProxyCreds.shares.length
     ? smbProxyCreds.shares
-    : _gdAccounts.map(acc => ({
-        account_id: acc.id,
-        account_name: acc.name,
-        email: acc.email || '',
-        smb_enabled: acc.smb_enabled !== false,
-        smb_share_name: acc.smb_share_name || 'GoogleDrive',
-        mounted: acc.smb_enabled !== false,
-      }));
+    : fallbackProxyShares;
   const enabledProxyCount = proxyShares.filter(s => s.smb_enabled).length;
 
   document.getElementById('content-area').innerHTML = `
@@ -3723,18 +4036,24 @@ async function renderSettings() {
       <div>
         <h2 style="font-size:var(--text-lg);font-weight:700;letter-spacing:-.01em">Settings &amp; Connections</h2>
         <p style="font-size:var(--text-xs);color:var(--color-text-muted);margin-top:2px">
-          Manage Google Drive accounts, SMB shares, network credentials, and security policies.
+          Manage Google Drive &amp; OneDrive accounts, SMB shares, network credentials, and security policies.
         </p>
       </div>
       <div class="settings-tabs">
         <button class="settings-tab ${_settingsTab==='gdrive'?'active':''}" onclick="setSettingsTab('gdrive')">
           <svg data-lucide="hard-drive"></svg> Google Drives (${_gdAccounts.length})
         </button>
+        <button class="settings-tab ${_settingsTab==='onedrive'?'active':''}" onclick="setSettingsTab('onedrive')">
+          <svg data-lucide="cloud"></svg> OneDrive (${_odAccounts.length})
+        </button>
         <button class="settings-tab ${_settingsTab==='smb'?'active':''}" onclick="setSettingsTab('smb')">
           <svg data-lucide="server"></svg> SMB (${_shares.length})
         </button>
         <button class="settings-tab ${_settingsTab==='oauth'?'active':''}" onclick="setSettingsTab('oauth')">
           <svg data-lucide="key-round"></svg> Google OAuth
+        </button>
+        <button class="settings-tab ${_settingsTab==='od_oauth'?'active':''}" onclick="setSettingsTab('od_oauth')">
+          <svg data-lucide="key-round"></svg> OneDrive OAuth
         </button>
         <button class="settings-tab ${_settingsTab==='proxy'?'active':''}" onclick="setSettingsTab('proxy')">
           <svg data-lucide="network"></svg> SMB Proxy
@@ -3799,6 +4118,68 @@ async function renderSettings() {
                   ${_gdStatus.configured
                     ? 'Click "Add Google Drive" to connect one or more Google Drive accounts.'
                     : 'Configure your Google OAuth Client ID &amp; Secret in the Google OAuth tab first, then connect your drives.'}
+                </p>
+              </div>`}
+          </div>
+        </div>
+      </div>
+    ` : ''}
+
+    ${showOneDrive ? `
+      <!-- Microsoft OneDrive Accounts Card -->
+      <div class="card">
+        <div class="card-header">
+          <div style="display:flex;align-items:center;gap:var(--space-2)">
+            <svg data-lucide="cloud" width="16" height="16" style="color:var(--color-primary)"></svg>
+            <span class="card-title">Microsoft OneDrive Accounts</span>
+            <span class="badge ${_odAccounts.length ? 'badge-success' : 'badge-error'}">
+              ${_odAccounts.length ? `${_odAccounts.length} Connected` : 'None'}
+            </span>
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="showAddOneDriveModal()">
+            <svg data-lucide="plus" width="14" height="14"></svg> Add OneDrive
+          </button>
+        </div>
+        <div class="card-body" style="display:flex;flex-direction:column;gap:var(--space-3)">
+          <div class="share-list">
+            ${_odAccounts.length ? _odAccounts.map(acc => {
+              const accJson = encodeFileArg(acc);
+              return `
+              <div class="share-item">
+                <div class="share-icon-box">
+                  <svg data-lucide="cloud" width="18" height="18"></svg>
+                </div>
+                <div class="share-info">
+                  <div class="share-title-row">
+                    <span class="share-name">${escHtml(acc.name)}</span>
+                    <span class="badge badge-success" style="font-size:10px">Connected</span>
+                    ${acc.drive_type ? `<span class="badge badge-primary" style="font-size:10px">${escHtml(acc.drive_type)}</span>` : ''}
+                  </div>
+                  <div class="share-host">${escHtml(acc.email || `Account ID: ${acc.id}`)}</div>
+                </div>
+                <div class="share-actions">
+                  <button class="btn btn-secondary btn-sm" onclick="openOneDrive('${escAttr(acc.id)}','${escAttr(acc.name)}')" title="Browse OneDrive">
+                    <svg data-lucide="folder-open" width="13" height="13"></svg>
+                  </button>
+                  <button class="btn btn-secondary btn-sm" onclick="showDriveCustomNameModal('onedrive','${accJson}')" title="Set custom display name">
+                    <svg data-lucide="edit-3" width="13" height="13"></svg>
+                  </button>
+                  <button class="btn btn-secondary btn-sm" onclick="connectOneDrive('${escAttr(acc.name)}','${escAttr(acc.id)}')" title="Reconnect OAuth">
+                    <svg data-lucide="refresh-cw" width="13" height="13"></svg>
+                  </button>
+                  <button class="btn btn-danger btn-sm" onclick="disconnectOneDrive('${escAttr(acc.id)}','${escAttr(acc.name)}')" title="Disconnect account">
+                    <svg data-lucide="unlink" width="13" height="13"></svg>
+                  </button>
+                </div>
+              </div>`;
+            }).join('') : `
+              <div class="empty-state" style="padding:var(--space-6) var(--space-4)">
+                <svg data-lucide="cloud-off" width="28" height="28"></svg>
+                <h3 style="font-size:var(--text-sm)">No Microsoft OneDrive accounts connected</h3>
+                <p style="font-size:var(--text-xs);margin-bottom:0">
+                  ${_odStatus.configured
+                    ? 'Click "Add OneDrive" to connect one or more Personal or Work/School OneDrive accounts.'
+                    : 'Configure your Azure App Registration Client ID &amp; Secret in the OneDrive OAuth tab first, then connect your drives.'}
                 </p>
               </div>`}
           </div>
@@ -3911,6 +4292,57 @@ async function renderSettings() {
     </div>
     ` : ''}
 
+    ${showOdOAuth ? `
+    <!-- Microsoft OneDrive OAuth Client Configuration -->
+    <div class="card">
+      <div class="card-header">
+        <div style="display:flex;align-items:center;gap:var(--space-2)">
+          <svg data-lucide="key-round" width="16" height="16" style="color:var(--color-primary)"></svg>
+          <span class="card-title">Microsoft OneDrive (Azure App) OAuth Credentials</span>
+          <span class="badge ${_odStatus.configured ? 'badge-success' : 'badge-error'}">
+            ${_odStatus.configured ? 'Configured' : 'Setup Required'}
+          </span>
+        </div>
+      </div>
+      <div class="card-body" style="display:flex;flex-direction:column;gap:var(--space-4)">
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label">Application (Client) ID</label>
+            <input class="form-input" id="odcid" value="${escHtml(_odConfig.client_id||'')}" placeholder="00000000-0000-0000-0000-000000000000"/>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Client Secret Value</label>
+            <input class="form-input" id="odsecret" type="password" value="${escHtml(_odConfig.client_secret||'')}" placeholder="Azure Client Secret Value"/>
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label">Directory (Tenant) ID</label>
+            <input class="form-input" id="odtenant" value="${escHtml(_odConfig.tenant_id||'common')}" placeholder="common (or consumers / organizations / tenant GUID)"/>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Authorized Redirect URI (Web Platform)</label>
+            <div style="display:flex;gap:var(--space-2)">
+              <input class="form-input" id="odredir" value="${escHtml(defaultOdRedir)}" placeholder="http://your-host:8080/api/onedrive/callback"/>
+              <button class="btn btn-secondary btn-sm" type="button" onclick="copyTextToClipboard(document.getElementById('odredir').value, 'Redirect URI copied')" title="Copy Redirect URI">
+                <svg data-lucide="copy" width="14" height="14"></svg> Copy
+              </button>
+            </div>
+          </div>
+        </div>
+        <div style="display:flex;gap:var(--space-3);flex-wrap:wrap;align-items:center">
+          <button class="btn btn-primary btn-sm" onclick="saveODConfig()">
+            <svg data-lucide="save" width="14" height="14"></svg> Save OneDrive OAuth Config
+          </button>
+          ${_odStatus.configured ? `
+          <button class="btn btn-secondary btn-sm" onclick="showAddOneDriveModal()">
+            <svg data-lucide="plus" width="14" height="14"></svg> Connect New OneDrive Account
+          </button>` : ''}
+        </div>
+      </div>
+    </div>
+    ` : ''}
+
     ${showProxy ? `
     <!-- Multi-Drive SMB Proxy Card -->
     <div class="card">
@@ -3932,9 +4364,9 @@ async function renderSettings() {
         <div style="display:flex;flex-direction:column;gap:var(--space-3)">
           <div style="display:flex;align-items:center;justify-content:space-between;gap:var(--space-2);flex-wrap:wrap">
             <div>
-              <div style="font-size:var(--text-xs);font-weight:600;color:var(--color-text)">Per-Drive SMB Shares (Separate Network Share per Google Drive)</div>
+              <div style="font-size:var(--text-xs);font-weight:600;color:var(--color-text)">Per-Drive SMB Shares (Google Drive &amp; Microsoft OneDrive)</div>
               <div style="font-size:var(--text-xs);color:var(--color-text-muted);margin-top:2px">
-                Toggle the SMB Proxy on or off for each connected Google Drive and assign a custom network share name (<code style="font-family:var(--font-mono)">\\\\${escHtml(proxyHost)}\\&lt;ShareName&gt;</code>).
+                Toggle the SMB Proxy on or off for each connected Google Drive or OneDrive account and assign a custom network share name (<code style="font-family:var(--font-mono)">\\\\${escHtml(proxyHost)}\\&lt;ShareName&gt;</code>).
               </div>
             </div>
           </div>
@@ -3942,7 +4374,12 @@ async function renderSettings() {
           ${proxyShares.length ? `
           <div class="share-list">
             ${proxyShares.map((ps, idx) => {
-              const uncPath = `\\\\${proxyHost}\\${ps.smb_share_name || 'GoogleDrive'}`;
+              const prov = ps.provider || 'gdrive';
+              const provLabel = prov === 'onedrive' ? 'OneDrive' : 'Google Drive';
+              const provIcon  = prov === 'onedrive' ? 'cloud' : 'hard-drive';
+              const defaultShare = prov === 'onedrive' ? 'OneDrive' : 'GoogleDrive';
+              const inputDomId = `smb-share-name-${prov}-${ps.account_id}`;
+              const uncPath = `\\\\${proxyHost}\\${ps.smb_share_name || defaultShare}`;
               const driveLetter = String.fromCharCode(71 + (idx % 15)); // G:, H:, I:, ...
               const drivePsCmd = `net use ${driveLetter}: ${uncPath} /user:${smbProxyCreds.username || 'sagedrive'} * /persistent:yes`;
               return `
@@ -3950,11 +4387,12 @@ async function renderSettings() {
                 <div class="proxy-share-top">
                   <div style="display:flex;align-items:center;gap:var(--space-3);min-width:0">
                     <div class="share-icon-box">
-                      <svg data-lucide="hard-drive" width="18" height="18"></svg>
+                      <svg data-lucide="${provIcon}" width="18" height="18"></svg>
                     </div>
                     <div style="min-width:0">
                       <div style="display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap">
                         <span style="font-weight:600;font-size:var(--text-sm)">${escHtml(ps.account_name)}</span>
+                        <span class="badge badge-primary" style="font-size:10px">${provLabel}</span>
                         <span style="font-size:var(--text-xs);color:var(--color-text-muted)">·</span>
                         <span style="font-size:var(--text-xs);font-family:var(--font-mono);color:${ps.smb_enabled ? 'var(--color-success)' : 'var(--color-text-muted)'}">
                           ${ps.smb_enabled ? (ps.mounted ? 'Shared & Mounted' : 'Enabled') : 'SMB Disabled'}
@@ -3965,10 +4403,10 @@ async function renderSettings() {
                       </div>
                     </div>
                   </div>
-                  <label class="proxy-switch-label" title="Toggle SMB Proxy share for this Google Drive">
+                  <label class="proxy-switch-label" title="Toggle SMB Proxy share for this ${provLabel}">
                     <input type="checkbox" class="proxy-switch-input"
                            ${ps.smb_enabled ? 'checked' : ''}
-                           onchange="toggleDriveSmbProxy('${escAttr(ps.account_id)}', this.checked)" />
+                           onchange="toggleDriveSmbProxy('${escAttr(ps.account_id)}', this.checked, '${escAttr(prov)}')" />
                     <span class="proxy-switch"></span>
                     <span>${ps.smb_enabled ? 'SMB Enabled' : 'SMB Off'}</span>
                   </label>
@@ -3976,14 +4414,14 @@ async function renderSettings() {
 
                 <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:var(--space-3);align-items:end;padding-top:var(--space-2);border-top:1px solid var(--color-divider)">
                   <div class="form-group">
-                    <label class="form-label" for="smb-share-name-${escAttr(ps.account_id)}">Custom SMB Share Name</label>
+                    <label class="form-label" for="${escAttr(inputDomId)}">Custom SMB Share Name</label>
                     <div class="proxy-share-controls">
-                      <input class="form-input" id="smb-share-name-${escAttr(ps.account_id)}" type="text"
-                             value="${escHtml(ps.smb_share_name || 'GoogleDrive')}"
-                             placeholder="e.g. PersonalDrive, WorkDrive"
+                      <input class="form-input" id="${escAttr(inputDomId)}" type="text"
+                             value="${escHtml(ps.smb_share_name || defaultShare)}"
+                             placeholder="e.g. PersonalDrive, WorkOneDrive"
                              style="font-family:var(--font-mono)"
-                             onkeydown="if(event.key==='Enter'){event.preventDefault();saveDriveSmbShareName('${escAttr(ps.account_id)}')}" />
-                      <button class="btn btn-secondary btn-sm" onclick="saveDriveSmbShareName('${escAttr(ps.account_id)}')">
+                             onkeydown="if(event.key==='Enter'){event.preventDefault();saveDriveSmbShareName('${escAttr(ps.account_id)}','${escAttr(prov)}')}" />
+                      <button class="btn btn-secondary btn-sm" onclick="saveDriveSmbShareName('${escAttr(ps.account_id)}','${escAttr(prov)}')">
                         <svg data-lucide="check" width="13" height="13"></svg> Apply Name
                       </button>
                     </div>
@@ -4010,11 +4448,16 @@ async function renderSettings() {
           ` : `
           <div class="empty-state" style="padding:var(--space-6) var(--space-4);border:1px dashed var(--color-border);border-radius:var(--radius-lg)">
             <svg data-lucide="cloud-off" width="28" height="28"></svg>
-            <h3 style="font-size:var(--text-sm)">No Google Drives connected yet</h3>
-            <p style="font-size:var(--text-xs);margin-bottom:var(--space-3)">Connect one or more Google Drive accounts first to expose them as individual SMB network shares.</p>
-            <button class="btn btn-primary btn-sm" onclick="showAddGDriveModal()">
-              <svg data-lucide="plus" width="14" height="14"></svg> Connect Google Drive
-            </button>
+            <h3 style="font-size:var(--text-sm)">No Cloud Drives connected yet</h3>
+            <p style="font-size:var(--text-xs);margin-bottom:var(--space-3)">Connect one or more Google Drive or Microsoft OneDrive accounts first to expose them as individual SMB network shares.</p>
+            <div style="display:flex;gap:var(--space-2);flex-wrap:wrap;justify-content:center">
+              <button class="btn btn-primary btn-sm" onclick="showAddGDriveModal()">
+                <svg data-lucide="plus" width="14" height="14"></svg> Connect Google Drive
+              </button>
+              <button class="btn btn-secondary btn-sm" onclick="showAddOneDriveModal()">
+                <svg data-lucide="plus" width="14" height="14"></svg> Connect OneDrive
+              </button>
+            </div>
           </div>
           `}
         </div>
@@ -4024,7 +4467,7 @@ async function renderSettings() {
             <div>
               <div style="font-size:var(--text-xs);font-weight:600;color:var(--color-text)">Samba Authentication Credentials</div>
               <div style="font-size:var(--text-xs);color:var(--color-text-muted);margin-top:2px">
-                Shared username &amp; password used when connecting to any enabled Google Drive SMB share above.
+                Shared username &amp; password used when connecting to any enabled Google Drive or OneDrive SMB share above.
               </div>
             </div>
             <span class="badge ${smbProxyCreds.configured ? 'badge-success' : 'badge-primary'}">
@@ -4091,7 +4534,7 @@ async function renderSettings() {
         </div>
         <div class="card-body" style="display:flex;flex-direction:column;gap:var(--space-4)">
           <div style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.5">
-            Unified self-hosted SMB/NAS &amp; multi-Google Drive browser file manager with real-time FFmpeg surround audio remuxing and cross-drive transfers.
+            Unified self-hosted SMB/NAS, multi-Google Drive &amp; multi-OneDrive browser file manager with real-time FFmpeg surround audio remuxing, embedded MKV/MP4 subtitle extraction, and cross-drive transfers.
           </div>
           <div style="display:flex;align-items:center;justify-content:space-between;gap:var(--space-3);flex-wrap:wrap">
             <a class="btn btn-secondary btn-sm" href="https://github.com/Sage222/SageDrive2" target="_blank" rel="noopener noreferrer" style="text-decoration:none">
@@ -4119,6 +4562,16 @@ async function refreshGDStatus() {
     _gdAccounts = [];
   }
   try { _gdConfig = await apiJSON('/api/gdrive/config'); } catch(_) {}
+}
+
+async function refreshODStatus() {
+  try {
+    _odStatus = await apiJSON('/api/onedrive/status');
+    _odAccounts = Array.isArray(_odStatus.accounts) ? _odStatus.accounts : [];
+  } catch(_) {
+    _odAccounts = [];
+  }
+  try { _odConfig = await apiJSON('/api/onedrive/config'); } catch(_) {}
 }
 
 function showAddShareModal() {
@@ -4212,6 +4665,21 @@ async function saveGDConfig() {
   } catch(e) { toast('Save failed: ' + e.message, 'error'); }
 }
 
+async function saveODConfig() {
+  try {
+    const body = {
+      client_id: document.getElementById('odcid').value.trim(),
+      client_secret: document.getElementById('odsecret').value.trim(),
+      tenant_id: (document.getElementById('odtenant')?.value || 'common').trim() || 'common',
+      redirect_uri: document.getElementById('odredir').value.trim(),
+    };
+    await apiJSON('/api/onedrive/config', {method:'POST', json:body});
+    toast('Microsoft OneDrive OAuth config saved', 'success');
+    await refreshODStatus();
+    renderSettings();
+  } catch(e) { toast('Save failed: ' + e.message, 'error'); }
+}
+
 async function saveSmbProxyCreds() {
   const user = document.getElementById('smb-proxy-user').value.trim();
   const pass = document.getElementById('smb-proxy-pass').value;
@@ -4229,11 +4697,11 @@ async function saveSmbProxyCreds() {
   }
 }
 
-async function toggleDriveSmbProxy(accountId, enabled) {
+async function toggleDriveSmbProxy(accountId, enabled, provider = '') {
   try {
     await apiJSON(`/api/smb/proxy-shares/${encodeURIComponent(accountId)}`, {
       method: 'POST',
-      json: { smb_enabled: Boolean(enabled) },
+      json: { smb_enabled: Boolean(enabled), provider },
     });
     toast(enabled ? 'SMB Proxy share enabled & mounted' : 'SMB Proxy share disabled', 'success');
     await renderSettings();
@@ -4243,8 +4711,9 @@ async function toggleDriveSmbProxy(accountId, enabled) {
   }
 }
 
-async function saveDriveSmbShareName(accountId) {
-  const inp = document.getElementById(`smb-share-name-${accountId}`);
+async function saveDriveSmbShareName(accountId, provider = '') {
+  const prov = provider || 'gdrive';
+  const inp = document.getElementById(`smb-share-name-${prov}-${accountId}`) || document.getElementById(`smb-share-name-${accountId}`);
   const rawName = (inp ? inp.value : '').trim();
   if (!rawName) {
     toast('SMB share name cannot be empty', 'error');
@@ -4253,7 +4722,7 @@ async function saveDriveSmbShareName(accountId) {
   try {
     const res = await apiJSON(`/api/smb/proxy-shares/${encodeURIComponent(accountId)}`, {
       method: 'POST',
-      json: { smb_share_name: rawName },
+      json: { smb_share_name: rawName, provider: prov },
     });
     const finalName = res.share?.smb_share_name || rawName;
     toast(`SMB share name updated to "${finalName}"`, 'success');
@@ -4359,6 +4828,90 @@ async function disconnectGDrive(accountId = '', accountName = 'Google Drive') {
   } catch(e) { toast('Failed: '+e.message, 'error'); }
 }
 
+function showAddOneDriveModal() {
+  if (!_odStatus.configured) {
+    setView('settings', 'od_oauth');
+    toast('Save your Microsoft OneDrive OAuth Client ID and Secret first', 'error');
+    return;
+  }
+  const nextNum = _odAccounts.length + 1;
+  const suggested = nextNum === 1 ? 'Personal OneDrive' : `OneDrive ${nextNum}`;
+  showModal(`
+    <div class="modal-header">
+      <span class="modal-title">Connect Microsoft OneDrive Account</span>
+      <button class="btn btn-ghost btn-icon" onclick="closeModal()">
+        <svg data-lucide="x" width="16" height="16"></svg></button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <label class="form-label" for="od-new-custom-name">Custom Display Name</label>
+        <input class="form-input" id="od-new-custom-name" type="text"
+               value="${escHtml(suggested)}"
+               placeholder="e.g. Personal OneDrive, Work OneDrive"
+               onkeydown="if(event.key==='Enter'){event.preventDefault();doStartAddOneDrive()}" />
+        <span style="font-size:var(--text-xs);color:var(--color-text-muted)">
+          Give this Microsoft OneDrive account a custom name so you can easily identify it in the sidebar.
+        </span>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="doStartAddOneDrive()">
+        <svg data-lucide="link" width="14" height="14"></svg> Continue to Microsoft Sign-In
+      </button>
+    </div>
+  `);
+  lucide.createIcons();
+  setTimeout(() => {
+    const inp = document.getElementById('od-new-custom-name');
+    if (inp) { inp.focus(); inp.select(); }
+  }, 40);
+}
+
+function doStartAddOneDrive() {
+  const customName = (document.getElementById('od-new-custom-name')?.value || '').trim();
+  closeModal();
+  connectOneDrive(customName, '');
+}
+
+async function connectOneDrive(customName = '', accountId = '') {
+  try {
+    const qs = new URLSearchParams();
+    if (customName) qs.set('name', customName);
+    if (accountId) qs.set('account_id', accountId);
+    const data = await apiJSON(`/api/onedrive/auth?${qs.toString()}`);
+    if (data.url && data.url.startsWith('/api/onedrive/callback')) {
+      await fetch(data.url);
+      await refreshODStatus();
+      renderSidebar();
+      if (_view === 'settings') renderSettings();
+      toast(`Microsoft OneDrive "${customName || 'Account'}" connected`, 'success');
+      return;
+    }
+    window.open(data.url, '_blank');
+    toast('Complete Microsoft sign-in in the new tab, then return here', 'success');
+  } catch(e) { toast('Failed: '+e.message, 'error'); }
+}
+
+async function disconnectOneDrive(accountId = '', accountName = 'OneDrive') {
+  if (!confirm(`Disconnect "${accountName}"?`)) return;
+  try {
+    if (accountId) {
+      await apiJSON(`/api/onedrive/accounts/${encodeURIComponent(accountId)}`, {method:'DELETE'});
+    } else {
+      await apiJSON('/api/onedrive/revoke', {method:'DELETE'});
+    }
+    toast(`Disconnected "${accountName}"`, 'success');
+    if (_activeDrive?.type === 'onedrive' && (!accountId || _activeDrive?.id === accountId)) {
+      _activeDrive = null;
+      setView('welcome');
+    }
+    await refreshODStatus();
+    renderSidebar();
+    if (_view === 'settings') renderSettings();
+  } catch(e) { toast('Failed: '+e.message, 'error'); }
+}
+
 function showLoading() {
   document.getElementById('content-area').innerHTML =
     `<div class="loading-state"><div class="spinner"></div></div>`;
@@ -4387,6 +4940,10 @@ function bcGo(i) {
   if (_activeDrive?.type === 'smb') {
     _path = c.target;
     loadSMBFiles();
+  } else if (_activeDrive?.type === 'onedrive') {
+    _pathStack = _pathStack.slice(0, c.index + 1);
+    _folderId = c.id || (c.name==='OneDrive'?'root':_pathStack[_pathStack.length-1].id);
+    loadOneDriveFiles();
   } else if (_activeDrive?.type === 'gdrive') {
     _pathStack = _pathStack.slice(0, c.index + 1);
     _folderId = c.id || (c.name==='Google Drive'?'root':_pathStack[_pathStack.length-1].id);
@@ -4472,7 +5029,7 @@ function checkMobile() {
 }
 window.addEventListener('resize', checkMobile);
 
-if (location.hash === '#gdrive-connected') {
+if (location.hash === '#gdrive-connected' || location.hash === '#onedrive-connected') {
   history.replaceState(null,'',location.pathname);
 }
 

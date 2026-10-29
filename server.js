@@ -823,10 +823,28 @@ function probeMediaItem(item) {
           : (fmtDur || audioDur || 0);
       }
 
+      const parseFps = (val) => {
+        if (!val) return 0;
+        const s = String(val).trim();
+        if (!s || s === '0/0' || s === '0') return 0;
+        if (s.includes('/')) {
+          const [numStr, denStr] = s.split('/', 2);
+          const num = parseFloat(numStr);
+          const den = parseFloat(denStr);
+          if (den > 0 && num > 0) return num / den;
+          return 0;
+        }
+        const f = parseFloat(s);
+        return Number.isFinite(f) && f > 0 ? f : 0;
+      };
+      let videoFps = v0 ? (parseFps(v0.avg_frame_rate) || parseFps(v0.r_frame_rate)) : 0;
+      if (videoFps < 1 || videoFps > 240) videoFps = 0;
+
       resolve({
         has_video: hasVideo,
         video_codec: videoCodec,
         video_pix_fmt: videoPixFmt,
+        video_fps: videoFps > 0 ? Math.round(videoFps * 1000) / 1000 : 0,
         has_audio: hasAudio,
         audio_codec: audioCodec,
         audio_channels: audioChannels,

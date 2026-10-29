@@ -1,6 +1,6 @@
 {
-  "summary":  "Plan to fix the Lossless.dll toggle & payload schema mismatch between the Python Docker backend and the frontend UI, and persist Lossless.dll inside /app/data so it survives container restarts without requiring a full image rebuild.",
-  "updatedAt":  "2026-10-29T03:15:54.160316937Z",
+  "summary":  "Plan to fix 3 Lossless.dll playback issues: (1) accurate 24fps base frame rate detection instead of 120Hz monitor refresh rate, (2) 100% untouched native video quality when LSFG is turned off (and zero downscaling/ghosting when active), and (3) 5-second auto-hide for the top Lossless.dll watermark alongside the bottom HUD menu.",
+  "updatedAt":  "2026-10-29T03:38:56.019220478Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

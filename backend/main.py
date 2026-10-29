@@ -1399,11 +1399,17 @@ def _analyze_probe_data(data, filename=""):
         })
 
     duration = _extract_probe_duration(fmt, streams)
+    video_fps = 0.0
+    if v0:
+        video_fps = _parse_fps_str(v0.get("avg_frame_rate")) or _parse_fps_str(v0.get("r_frame_rate"))
+        if video_fps < 1.0 or video_fps > 240.0:
+            video_fps = 0.0
 
     return {
         "has_video": has_video,
         "video_codec": video_codec,
         "video_pix_fmt": video_pix_fmt,
+        "video_fps": round(video_fps, 3) if video_fps > 0 else 0,
         "has_audio": has_audio,
         "audio_codec": audio_codec,
         "audio_channels": audio_channels,
@@ -1417,7 +1423,7 @@ def _analyze_probe_data(data, filename=""):
     }
 
 def probe_media_info(cache_key, internal_url, filename="", fallback_gen_fn=None):
-    cache_key = f"v2:{cache_key}"
+    cache_key = f"v3:{cache_key}"
     now = time.time()
     cached = _PROBE_CACHE.get(cache_key)
     if cached and (now - cached[0]) < _PROBE_TTL:

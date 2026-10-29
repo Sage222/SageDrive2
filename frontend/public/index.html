@@ -334,18 +334,19 @@
       max-height:100vh;width:100vw;height:100vh;object-fit:contain;
     }
     .video-lsfg-canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;
-                       pointer-events:none;z-index:4;opacity:0;transform-origin:center center;
-                       transition:transform 160ms ease, opacity 120ms ease}
+                       pointer-events:none;z-index:4;opacity:0;display:none;transform-origin:center center}
     .video-lsfg-telemetry{position:absolute;top:10px;left:12px;z-index:9;pointer-events:none;
                           background:rgba(10,14,18,.78);backdrop-filter:blur(6px);
                           border:1px solid rgba(45,212,191,.35);border-radius:var(--radius-sm);
                           padding:3px 8px;font-family:var(--font-mono);font-size:10.5px;
                           color:#e6edf3;display:none;align-items:center;gap:6px;
-                          box-shadow:0 2px 10px rgba(0,0,0,.45)}
+                          box-shadow:0 2px 10px rgba(0,0,0,.45);
+                          transition:opacity 180ms ease, transform 180ms ease}
     .video-lsfg-dot{width:6px;height:6px;border-radius:50%;background:var(--color-primary);
                     box-shadow:0 0 6px var(--color-primary)}
     .video-stage.hud-hidden{cursor:none}
     .video-stage.hud-hidden .video-stage-hud{opacity:0;pointer-events:none;transform:translateY(8px)}
+    .video-stage.hud-hidden .video-lsfg-telemetry{opacity:0;pointer-events:none;transform:translateY(-8px)}
     .video-stage-hud{position:absolute;left:0;right:0;bottom:0;z-index:10;
                      background:linear-gradient(to top, rgba(0,0,0,.88) 0%, rgba(0,0,0,.62) 68%, transparent 100%);
                      padding:var(--space-5) var(--space-3) var(--space-2);
@@ -1873,9 +1874,27 @@ function stopLosslessPipeline() {
     cancelAnimationFrame(_lsfgRafId);
     _lsfgRafId = null;
   }
+  const player = document.getElementById('active-media-player');
+  if (player) {
+    player.style.filter = '';
+    player.style.removeProperty('filter');
+    player.style.imageRendering = '';
+    player.style.removeProperty('image-rendering');
+  }
   const canvas = document.getElementById('video-lsfg-canvas');
   if (canvas) {
     canvas.style.opacity = '0';
+    canvas.style.display = 'none';
+    canvas.style.filter = '';
+    canvas.style.removeProperty('filter');
+    try {
+      const c2d = canvas.getContext('2d');
+      if (c2d && canvas.width > 0 && canvas.height > 0) {
+        c2d.clearRect(0, 0, canvas.width, canvas.height);
+      }
+      canvas.width = 0;
+      canvas.height = 0;
+    } catch (_) {}
   }
   const badge = document.getElementById('video-lsfg-telemetry');
   if (badge) {
@@ -1898,9 +1917,15 @@ function applyLosslessPipelineToActivePlayer() {
   const isActive = Boolean(_losslessConfig?.dll?.provided && _losslessConfig?.enabled);
   if (!isActive) {
     stopLosslessPipeline();
-    player.style.filter = '';
-    player.style.imageRendering = '';
     return;
+  }
+
+  // Keep the 2D overlay canvas disabled so hardware <video> rendering stays at 100% native resolution without ghosting
+  if (canvas) {
+    canvas.style.opacity = '0';
+    canvas.style.display = 'none';
+    canvas.width = 0;
+    canvas.height = 0;
   }
 
   // Configure SVG spatial upscaling convolution matrix based on upscale_type, sharpness, and scale_factor
@@ -1908,56 +1933,58 @@ function applyLosslessPipelineToActivePlayer() {
   const rawSharp = Math.max(0, Math.min(1, Number(_losslessConfig.sharpness ?? 0.55)));
   const scaleFactor = Math.max(1, Math.min(3, Number(_losslessConfig.scale_factor || 1.5)));
   const perfFactor = _losslessConfig.performance_mode ? 0.72 : 1.0;
-  const effSharp = rawSharp * (0.75 + (scaleFactor - 1) * 0.35) * perfFactor;
+  const effSharp = rawSharp * (0.45 + (scaleFactor - 1) * 0.20) * perfFactor;
 
   const convEl = document.getElementById('ls-convolve-matrix');
   const funcR = document.getElementById('ls-func-r');
   const funcG = document.getElementById('ls-func-g');
   const funcB = document.getElementById('ls-func-b');
 
-  if (convEl && ut !== 'off') {
+  if (convEl && ut !== 'off' && effSharp > 0.005) {
     let kStr = '0 0 0 0 1 0 0 0 0';
     if (ut === 'ls1') {
-      const e = -(0.18 + effSharp * 0.42).toFixed(4);
-      const d = -(0.04 + effSharp * 0.10).toFixed(4);
-      const c = (1 - 4 * parseFloat(e) - 4 * parseFloat(d)).toFixed(4);
-      kStr = `${d} ${e} ${d} ${e} ${c} ${e} ${d} ${e} ${d}`;
+      const e = -(0.08 + effSharp * 0.22);
+      const d = -(0.02 + effSharp * 0.06);
+      const c = 1 - 4 * e - 4 * d;
+      kStr = `${d.toFixed(4)} ${e.toFixed(4)} ${d.toFixed(4)} ${e.toFixed(4)} ${c.toFixed(4)} ${e.toFixed(4)} ${d.toFixed(4)} ${e.toFixed(4)} ${d.toFixed(4)}`;
     } else if (ut === 'fsr') {
-      const e = -(0.22 + effSharp * 0.48).toFixed(4);
-      const c = (1 - 4 * parseFloat(e)).toFixed(4);
-      kStr = `0 ${e} 0 ${e} ${c} ${e} 0 ${e} 0`;
+      const e = -(0.10 + effSharp * 0.28);
+      const c = 1 - 4 * e;
+      kStr = `0 ${e.toFixed(4)} 0 ${e.toFixed(4)} ${c.toFixed(4)} ${e.toFixed(4)} 0 ${e.toFixed(4)} 0`;
     } else if (ut === 'nis') {
-      const e = -(0.16 + effSharp * 0.38).toFixed(4);
-      const d = -(0.08 + effSharp * 0.22).toFixed(4);
-      const c = (1 - 4 * parseFloat(e) - 4 * parseFloat(d)).toFixed(4);
-      kStr = `${d} ${e} ${d} ${e} ${c} ${e} ${d} ${e} ${d}`;
+      const e = -(0.07 + effSharp * 0.20);
+      const d = -(0.03 + effSharp * 0.10);
+      const c = 1 - 4 * e - 4 * d;
+      kStr = `${d.toFixed(4)} ${e.toFixed(4)} ${d.toFixed(4)} ${e.toFixed(4)} ${c.toFixed(4)} ${e.toFixed(4)} ${d.toFixed(4)} ${e.toFixed(4)} ${d.toFixed(4)}`;
     } else if (ut === 'anime4k') {
-      const e = -(0.26 + effSharp * 0.54).toFixed(4);
-      const d = (0.04 * effSharp).toFixed(4);
-      const c = (1 - 4 * parseFloat(e) - 4 * parseFloat(d)).toFixed(4);
-      kStr = `${d} ${e} ${d} ${e} ${c} ${e} ${d} ${e} ${d}`;
+      const e = -(0.12 + effSharp * 0.32);
+      const d = -(0.02 + effSharp * 0.05);
+      const c = 1 - 4 * e - 4 * d;
+      kStr = `${d.toFixed(4)} ${e.toFixed(4)} ${d.toFixed(4)} ${e.toFixed(4)} ${c.toFixed(4)} ${e.toFixed(4)} ${d.toFixed(4)} ${e.toFixed(4)} ${d.toFixed(4)}`;
     }
     convEl.setAttribute('kernelMatrix', kStr);
+  } else if (convEl) {
+    convEl.setAttribute('kernelMatrix', '0 0 0 0 1 0 0 0 0');
   }
 
-  const hdrSlope = _losslessConfig.hdr_boost ? '1.08' : '1';
-  const hdrIntercept = _losslessConfig.hdr_boost ? '-0.025' : '0';
+  const hdrSlope = _losslessConfig.hdr_boost ? '1.05' : '1';
+  const hdrIntercept = _losslessConfig.hdr_boost ? '-0.015' : '0';
   if (funcR) { funcR.setAttribute('slope', hdrSlope); funcR.setAttribute('intercept', hdrIntercept); }
   if (funcG) { funcG.setAttribute('slope', hdrSlope); funcG.setAttribute('intercept', hdrIntercept); }
   if (funcB) { funcB.setAttribute('slope', hdrSlope); funcB.setAttribute('intercept', hdrIntercept); }
 
   const filterParts = [];
-  if (ut !== 'off') {
+  if (ut !== 'off' && effSharp > 0.005) {
     filterParts.push('url(#ls-upscale-filter)');
   }
   if (_losslessConfig.hdr_boost) {
-    filterParts.push('contrast(1.06) saturate(1.12)');
+    filterParts.push('contrast(1.04) saturate(1.08)');
   }
-  const combinedFilter = filterParts.join(' ');
-  player.style.filter = combinedFilter;
-  if (canvas) {
-    canvas.style.filter = combinedFilter;
-    canvas.style.transform = _videoZoom === 1 ? 'scale(1)' : `scale(${_videoZoom})`;
+  if (filterParts.length > 0) {
+    player.style.filter = filterParts.join(' ');
+  } else {
+    player.style.filter = '';
+    player.style.removeProperty('filter');
   }
 
   if (_lsfgRafId) {
@@ -1973,17 +2000,25 @@ function applyLosslessPipelineToActivePlayer() {
     badge.style.display = _losslessConfig.show_fps_overlay ? 'inline-flex' : 'none';
   }
 
-  let ctx = null;
-  if (canvas && fgMult > 1) {
+  const getDecodedFrameCount = () => {
     try {
-      ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+      if (typeof player.getVideoPlaybackQuality === 'function') {
+        const q = player.getVideoPlaybackQuality();
+        if (q && typeof q.totalVideoFrames === 'number') return q.totalVideoFrames;
+      }
+      if (typeof player.webkitDecodedFrameCount === 'number') {
+        return player.webkitDecodedFrameCount;
+      }
+      if (typeof player.mozPresentedFrames === 'number') {
+        return player.mozPresentedFrames;
+      }
     } catch (_) {}
-  }
+    return -1;
+  };
 
-  let lastMediaTime = -1;
-  let lastFrameChangeWall = performance.now();
-  let estimatedBaseFps = 24;
-  let frameIntervalMs = 1000 / 24;
+  let lastSampleWall = performance.now();
+  let lastDecodedFrames = getDecodedFrameCount();
+  let measuredDecodedFps = 24;
 
   const renderLoop = (now) => {
     if (!document.getElementById('active-media-player') || !_losslessConfig.enabled || !_losslessConfig.dll?.provided) {
@@ -1991,42 +2026,29 @@ function applyLosslessPipelineToActivePlayer() {
       return;
     }
 
-    const curT = player.currentTime || 0;
-    if (!player.paused && curT !== lastMediaTime) {
-      const dt = now - lastFrameChangeWall;
-      if (lastMediaTime >= 0 && dt > 6 && dt < 250) {
-        const instFps = 1000 / dt;
-        estimatedBaseFps = estimatedBaseFps * 0.85 + instFps * 0.15;
-        frameIntervalMs = 1000 / Math.max(12, Math.min(120, estimatedBaseFps));
+    const elapsedSample = now - lastSampleWall;
+    if (elapsedSample >= 500) {
+      const curFrames = getDecodedFrameCount();
+      if (!player.paused && curFrames >= 0 && lastDecodedFrames >= 0 && curFrames >= lastDecodedFrames) {
+        const deltaFrames = curFrames - lastDecodedFrames;
+        const instFps = (deltaFrames * 1000) / elapsedSample;
+        if (instFps >= 10 && instFps <= 120) {
+          measuredDecodedFps = measuredDecodedFps * 0.6 + instFps * 0.4;
+        }
       }
-      lastMediaTime = curT;
-      lastFrameChangeWall = now;
-    }
-
-    // LSFG sub-frame temporal interpolation pass
-    if (ctx && canvas && fgMult > 1 && !player.paused && player.readyState >= 2 && player.videoWidth > 0) {
-      const targetScale = _losslessConfig.performance_mode ? 0.65 : 1.0;
-      const cw = Math.max(160, Math.min(1920, Math.round(player.videoWidth * targetScale)));
-      const ch = Math.max(90, Math.min(1080, Math.round(player.videoHeight * targetScale)));
-      if (canvas.width !== cw || canvas.height !== ch) {
-        canvas.width = cw;
-        canvas.height = ch;
-      }
-      const elapsedSinceVideoTick = now - lastFrameChangeWall;
-      const phase = Math.max(0, Math.min(1, elapsedSinceVideoTick / Math.max(16, frameIntervalMs)));
-      try {
-        ctx.globalAlpha = phase > 0.15 && phase < 0.88 ? (0.42 + 0.25 * Math.sin(phase * Math.PI)) : 0.78;
-        ctx.drawImage(player, 0, 0, cw, ch);
-        canvas.style.opacity = phase > 0.12 && phase < 0.90 ? '0.36' : '0';
-      } catch (_) {
-        canvas.style.opacity = '0';
-      }
-    } else if (canvas) {
-      canvas.style.opacity = '0';
+      lastDecodedFrames = curFrames;
+      lastSampleWall = now;
     }
 
     if (badge && badgeText && _losslessConfig.show_fps_overlay) {
-      const baseFpsRound = player.paused ? 0 : Math.max(15, Math.min(120, Math.round(estimatedBaseFps)));
+      const probedFps = (_activeMediaState && _activeMediaState.probeInfo && _activeMediaState.probeInfo.video_fps > 0)
+        ? Number(_activeMediaState.probeInfo.video_fps)
+        : 0;
+      const rate = Number(_playbackRate || 1);
+      const rawBaseFps = player.paused
+        ? 0
+        : ((probedFps > 0 ? probedFps : measuredDecodedFps) * rate);
+      const baseFpsRound = player.paused ? 0 : Math.max(1, Math.min(240, Math.round(rawBaseFps)));
       const outFpsRound = baseFpsRound * fgMult;
       const resStr = player.videoHeight ? `${player.videoHeight}p` : 'HD';
       badgeText.textContent = fgMult > 1

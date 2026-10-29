@@ -1924,61 +1924,28 @@ def api_save_theme():
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-# ── Lossless.dll Upscaling & Frame Generation Settings ────────────────────────
-_LOSSLESS_BASE_DIR = getattr(auth, "DATA_DIR", Path(os.environ.get("DATA_DIR", "/app/data")))
-_LOSSLESS_DIR = _LOSSLESS_BASE_DIR / "lossless"
-_LOSSLESS_DLL_PATH = _LOSSLESS_DIR / "Lossless.dll"
-_LOSSLESS_CFG_FILE = _LOSSLESS_BASE_DIR / "lossless_config.json"
+# ── Built-in GPU Upscaling (1.25x / 1.5x) & 2x Frame Generation Settings ──────
+_UPSCALE_BASE_DIR = getattr(auth, "DATA_DIR", Path(os.environ.get("DATA_DIR", "/app/data")))
+_UPSCALE_CFG_FILE = _UPSCALE_BASE_DIR / "upscale_config.json"
+_LEGACY_LOSSLESS_CFG_FILE = _UPSCALE_BASE_DIR / "lossless_config.json"
+_LEGACY_LOSSLESS_DIR = _UPSCALE_BASE_DIR / "lossless"
+_upscale_lock = threading.Lock()
 
-_LEGACY_LOSSLESS_DLL_PATH = Path("/data/lossless/Lossless.dll")
-_LEGACY_LOSSLESS_CFG_FILE = Path("/data/lossless_config.json")
-_lossless_lock = threading.Lock()
-
-_DEFAULT_LOSSLESS_CFG = {
+_DEFAULT_UPSCALE_CFG = {
     "enabled": False,
-    "upscale_type": "ls1",
-    "scale_factor": 1.5,
-    "sharpness": 0.55,
-    "frame_gen": "lsfg3_2x",
-    "performance_mode": False,
-    "hdr_boost": False,
+    "scale_factor": 1.5,        # 1.0 (Off) | 1.25 (1.25x) | 1.5 (1.5x)
+    "frame_gen": "2x",          # "off" | "2x"
+    "sharpness": 0.55,          # 0.0 .. 1.0 (RCAS edge sharpness)
     "show_fps_overlay": True,
 }
 
-def _migrate_legacy_lossless_files():
-    try:
-        if not _LOSSLESS_DLL_PATH.exists() and _LEGACY_LOSSLESS_DLL_PATH.exists():
-            _LOSSLESS_DIR.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(_LEGACY_LOSSLESS_DLL_PATH, _LOSSLESS_DLL_PATH)
-        if not _LOSSLESS_CFG_FILE.exists() and _LEGACY_LOSSLESS_CFG_FILE.exists():
-            _LOSSLESS_CFG_FILE.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(_LEGACY_LOSSLESS_CFG_FILE, _LOSSLESS_CFG_FILE)
-    except Exception:
-        pass
-
-def _inspect_dll_bytes(data_bytes):
-    sz = len(data_bytes)
-    sha = hashlib.sha256(data_bytes).hexdigest()
-    valid_pe = False
-    arch = "Custom DLL Binary"
-    if sz >= 64 and data_bytes[:2] == b"MZ":
-        valid_pe = True
-        arch = "Windows PE DLL"
+def _cleanup_legacy_lossless_dll():
+    for p in (_LEGACY_LOSSLESS_DIR / "Lossless.dll", Path("/data/lossless/Lossless.dll")):
         try:
-            pe_offset = struct.unpack("<I", data_bytes[0x3C:0x40])[0]
-            if pe_offset + 6 <= sz and data_bytes[pe_offset:pe_offset+4] == b"PE\x00\x00":
-                machine = struct.unpack("<H", data_bytes[pe_offset+4:pe_offset+6])[0]
-                if machine == 0x8664:
-                    arch = "x64 PE32+ (AMD64)"
-                elif machine == 0x014C:
-                    arch = "x86 PE32 (i386)"
-                elif machine == 0xAA64:
-                    arch = "ARM64 PE32+"
-                else:
-                    arch = f"PE (0x{machine:04x})"
+            if p.exists():
+                p.unlink()
         except Exception:
             pass
-    return {"size": sz, "sha256": sha, "arch": arch, "valid_pe": valid_pe}
 
 def _normalize_sharpness(val, default=0.55):
     try:
@@ -1991,157 +1958,90 @@ def _normalize_sharpness(val, default=0.55):
     except Exception:
         return default
 
-def _load_lossless_cfg():
-    with _lossless_lock:
-        _migrate_legacy_lossless_files()
-        cfg = dict(_DEFAULT_LOSSLESS_CFG)
-        if _LOSSLESS_CFG_FILE.exists():
+def _normalize_scale_factor(val, default=1.5):
+    try:
+        sf = float(val)
+        if sf <= 1.05:
+            return 1.0
+        if sf <= 1.37:
+            return 1.25
+        return 1.5
+    except Exception:
+        return default
+
+def _normalize_frame_gen(val, default="2x"):
+    s = str(val or "").strip().lower()
+    if s in ("off", "none", "0", "false", "1x"):
+        return "off"
+    return "2x"
+
+def _load_upscale_cfg():
+    with _upscale_lock:
+        _cleanup_legacy_lossless_dll()
+        cfg = dict(_DEFAULT_UPSCALE_CFG)
+        src_file = _UPSCALE_CFG_FILE if _UPSCALE_CFG_FILE.exists() else (
+            _LEGACY_LOSSLESS_CFG_FILE if _LEGACY_LOSSLESS_CFG_FILE.exists() else None
+        )
+        if src_file:
             try:
-                loaded = json.loads(_LOSSLESS_CFG_FILE.read_text())
+                loaded = json.loads(src_file.read_text())
                 if isinstance(loaded, dict):
-                    for k in _DEFAULT_LOSSLESS_CFG:
-                        if k in loaded:
-                            cfg[k] = loaded[k]
+                    if "enabled" in loaded:
+                        cfg["enabled"] = bool(loaded["enabled"])
+                    if "scale_factor" in loaded:
+                        cfg["scale_factor"] = _normalize_scale_factor(loaded["scale_factor"])
+                    elif loaded.get("upscale_type") == "off":
+                        cfg["scale_factor"] = 1.0
+                    if "frame_gen" in loaded:
+                        cfg["frame_gen"] = _normalize_frame_gen(loaded["frame_gen"])
+                    if "sharpness" in loaded:
+                        cfg["sharpness"] = _normalize_sharpness(loaded["sharpness"])
+                    if "show_fps_overlay" in loaded:
+                        cfg["show_fps_overlay"] = bool(loaded["show_fps_overlay"])
             except Exception:
                 pass
+        return cfg
 
-        cfg["sharpness"] = _normalize_sharpness(cfg.get("sharpness", 0.55))
-        try:
-            cfg["scale_factor"] = max(1.0, min(3.0, float(cfg.get("scale_factor", 1.5))))
-        except Exception:
-            cfg["scale_factor"] = 1.5
-
-        dll_exists = _LOSSLESS_DLL_PATH.exists() and _LOSSLESS_DLL_PATH.stat().st_size >= 16
-        dll_info = {
-            "provided": False,
-            "filename": "Lossless.dll",
-            "size": 0,
-            "sha256": "",
-            "valid_pe": False,
-            "arch": "",
-            "uploaded_at": 0,
+def _save_upscale_cfg(cfg):
+    with _upscale_lock:
+        to_save = {
+            "enabled": bool(cfg.get("enabled", False)),
+            "scale_factor": _normalize_scale_factor(cfg.get("scale_factor", 1.5)),
+            "frame_gen": _normalize_frame_gen(cfg.get("frame_gen", "2x")),
+            "sharpness": _normalize_sharpness(cfg.get("sharpness", 0.55)),
+            "show_fps_overlay": bool(cfg.get("show_fps_overlay", True)),
         }
-        if dll_exists:
-            try:
-                st = _LOSSLESS_DLL_PATH.stat()
-                meta = _inspect_dll_bytes(_LOSSLESS_DLL_PATH.read_bytes())
-                dll_info = {
-                    "provided": True,
-                    "filename": "Lossless.dll",
-                    "size": meta["size"],
-                    "sha256": meta["sha256"],
-                    "valid_pe": meta["valid_pe"],
-                    "arch": meta["arch"],
-                    "uploaded_at": int(st.st_mtime),
-                }
-            except Exception:
-                dll_exists = False
+        _UPSCALE_CFG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _UPSCALE_CFG_FILE.write_text(json.dumps(to_save, indent=2))
+        return to_save
 
-        if not dll_exists:
-            cfg["enabled"] = False
-
-        return {
-            **cfg,
-            "dll_installed": bool(dll_exists),
-            "dll_filename": dll_info["filename"] if dll_exists else "",
-            "dll_size": dll_info["size"],
-            "dll_sha256": dll_info["sha256"],
-            "dll_arch": dll_info["arch"],
-            "dll": dll_info,
-        }
-
-def _save_lossless_cfg(cfg):
-    with _lossless_lock:
-        to_save = {k: cfg.get(k, _DEFAULT_LOSSLESS_CFG[k]) for k in _DEFAULT_LOSSLESS_CFG}
-        to_save["sharpness"] = _normalize_sharpness(to_save.get("sharpness", 0.55))
-        _LOSSLESS_CFG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _LOSSLESS_CFG_FILE.write_text(json.dumps(to_save, indent=2))
-
+@app.get("/api/settings/upscaling")
 @app.get("/api/settings/lossless")
 @auth.require_auth
-def api_get_lossless_settings():
-    return jsonify(_load_lossless_cfg())
+def api_get_upscale_settings():
+    return jsonify(_load_upscale_cfg())
 
+@app.post("/api/settings/upscaling")
 @app.post("/api/settings/lossless")
 @auth.require_auth
-def api_save_lossless_settings():
+def api_save_upscale_settings():
     b = request.get_json(force=True, silent=True) or {}
-    cfg = _load_lossless_cfg()
-    dll_exists = bool(cfg.get("dll", {}).get("provided") or cfg.get("dll_installed"))
+    cfg = _load_upscale_cfg()
 
     if "enabled" in b:
-        want_enabled = bool(b.get("enabled"))
-        if want_enabled and not dll_exists:
-            return jsonify({"error": "Please upload your Lossless.dll binary first before enabling Upscaling & Frame Generation."}), 400
-        cfg["enabled"] = want_enabled and dll_exists
-
-    valid_upscalers = {"ls1", "fsr", "nis", "anime4k", "off"}
-    if "upscale_type" in b:
-        utype = str(b.get("upscale_type", cfg["upscale_type"])).strip().lower()
-        if utype in valid_upscalers:
-            cfg["upscale_type"] = utype
-
+        cfg["enabled"] = bool(b.get("enabled"))
     if "scale_factor" in b:
-        try:
-            sf = float(b.get("scale_factor", cfg["scale_factor"]))
-            if not math.isnan(sf) and not math.isinf(sf):
-                cfg["scale_factor"] = max(1.0, min(3.0, sf))
-        except Exception:
-            pass
-
+        cfg["scale_factor"] = _normalize_scale_factor(b.get("scale_factor"), cfg["scale_factor"])
+    if "frame_gen" in b:
+        cfg["frame_gen"] = _normalize_frame_gen(b.get("frame_gen"), cfg["frame_gen"])
     if "sharpness" in b:
         cfg["sharpness"] = _normalize_sharpness(b.get("sharpness"), cfg["sharpness"])
-
-    valid_fg = {"off", "lsfg3_2x", "lsfg3_3x", "lsfg3_4x"}
-    if "frame_gen" in b:
-        fg = str(b.get("frame_gen", cfg["frame_gen"])).strip().lower()
-        if fg in valid_fg:
-            cfg["frame_gen"] = fg
-
-    if "performance_mode" in b:
-        cfg["performance_mode"] = bool(b.get("performance_mode"))
-    if "hdr_boost" in b:
-        cfg["hdr_boost"] = bool(b.get("hdr_boost"))
     if "show_fps_overlay" in b:
         cfg["show_fps_overlay"] = bool(b.get("show_fps_overlay"))
 
-    _save_lossless_cfg(cfg)
-    return jsonify(_load_lossless_cfg())
+    saved = _save_upscale_cfg(cfg)
+    return jsonify(saved)
 
-@app.post("/api/settings/lossless-dll")
-@auth.require_auth
-def api_upload_lossless_dll():
-    if "file" not in request.files:
-        return jsonify({"error": "No file uploaded. Please select your Lossless.dll file."}), 400
-    f = request.files["file"]
-    fname = (f.filename or "").strip()
-    if not fname.lower().endswith(".dll"):
-        return jsonify({"error": "Invalid file type. Please upload Lossless.dll (.dll binary)."}), 400
-    data = f.read()
-    if len(data) < 64:
-        return jsonify({"error": "Uploaded Lossless.dll file is empty or too small to be a valid binary."}), 400
-
-    _LOSSLESS_DIR.mkdir(parents=True, exist_ok=True)
-    _LOSSLESS_DLL_PATH.write_bytes(data)
-
-    cfg = _load_lossless_cfg()
-    cfg["enabled"] = True
-    _save_lossless_cfg(cfg)
-    return jsonify(_load_lossless_cfg())
-
-@app.delete("/api/settings/lossless-dll")
-@auth.require_auth
-def api_delete_lossless_dll():
-    for p in (_LOSSLESS_DLL_PATH, _LEGACY_LOSSLESS_DLL_PATH):
-        try:
-            if p.exists():
-                p.unlink()
-        except Exception:
-            pass
-    cfg = _load_lossless_cfg()
-    cfg["enabled"] = False
-    _save_lossless_cfg(cfg)
-    return jsonify(_load_lossless_cfg())
 
 # ── SMB ───────────────────────────────────────────────────────────────────────
 @app.get("/api/smb/shares")

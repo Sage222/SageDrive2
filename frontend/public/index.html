@@ -325,7 +325,7 @@
     .video-stage{position:relative;width:100%;max-height:66vh;background:#000;
                  border-radius:var(--radius-md);overflow:hidden;
                  display:flex;align-items:center;justify-content:center;user-select:none}
-    .video-stage video{width:100%;max-height:66vh;display:block;background:#000;
+    .video-stage video{width:100%;max-height:66vh;display:block;background:#000;object-fit:contain;
                        transform-origin:center center;transition:transform 160ms ease;cursor:pointer}
     .video-stage:fullscreen,.video-stage:-webkit-full-screen{
       max-height:100vh;width:100vw;height:100vh;border-radius:0;background:#000;
@@ -334,7 +334,16 @@
       max-height:100vh;width:100vw;height:100vh;object-fit:contain;
     }
     .video-lsfg-canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;
-                       pointer-events:none;z-index:4;opacity:0;display:none;transform-origin:center center}
+                       pointer-events:none;z-index:4;opacity:0;display:none;transform-origin:center center;
+                       transition:transform 160ms ease}
+    .video-subtitle-overlay{position:absolute;left:6%;right:6%;bottom:68px;z-index:7;
+                            pointer-events:none;text-align:center;display:none;
+                            flex-direction:column;align-items:center;gap:4px}
+    .video-stage.hud-hidden .video-subtitle-overlay{bottom:24px}
+    .video-subtitle-line{background:rgba(0,0,0,.78);color:#fff;font-family:var(--font-body);
+                         font-size:clamp(.95rem,1.8vw,1.35rem);line-height:1.35;
+                         padding:3px 10px;border-radius:4px;text-shadow:0 1px 3px rgba(0,0,0,.9);
+                         max-width:100%;word-break:break-word}
     .video-lsfg-telemetry{position:absolute;top:10px;left:12px;z-index:9;pointer-events:none;
                           background:rgba(10,14,18,.78);backdrop-filter:blur(6px);
                           border:1px solid rgba(45,212,191,.35);border-radius:var(--radius-sm);
@@ -717,14 +726,10 @@ let _videoZoom = 1;
 let _autoPlayNext = true;
 let _losslessConfig = {
   enabled: false,
-  upscale_type: 'ls1',
-  scale_factor: 1.5,
-  sharpness: 0.55,
-  frame_gen: 'lsfg3_2x',
-  performance_mode: false,
-  hdr_boost: false,
+  scale_factor: 1.5,    // 1.0 (Off) | 1.25 (1.25x) | 1.5 (1.5x)
+  frame_gen: '2x',      // 'off' | '2x'
+  sharpness: 0.55,      // 0.0 .. 1.0
   show_fps_overlay: true,
-  dll: { provided: false, filename: 'Lossless.dll', size: 0, sha256: '', valid_pe: false, arch: '', uploaded_at: 0 },
 };
 
 const DARK_THEMES = [
@@ -1792,72 +1797,49 @@ function toggleBtAudioDelay() {
   );
 }
 
+let _lsfgVfcId = null;
+
 function normalizeLosslessConfig(raw) {
   const r = (raw && typeof raw === 'object') ? raw : {};
-  const subDll = (r.dll && typeof r.dll === 'object') ? r.dll : {};
-  const provided = Boolean(subDll.provided || r.dll_installed || (subDll.size > 0) || (r.dll_size > 0));
   let rawSharp = Number(r.sharpness ?? 0.55);
   if (Number.isNaN(rawSharp)) rawSharp = 0.55;
   if (rawSharp > 1.0) rawSharp = rawSharp / 100.0;
   rawSharp = Math.max(0.0, Math.min(1.0, rawSharp));
 
   let sf = Number(r.scale_factor ?? 1.5);
-  if (Number.isNaN(sf) || sf < 1.0) sf = 1.5;
+  if (Number.isNaN(sf)) sf = 1.5;
+  if (sf <= 1.05) sf = 1.0;
+  else if (sf <= 1.37) sf = 1.25;
+  else sf = 1.5;
+
+  const fgRaw = String(r.frame_gen || '2x').trim().toLowerCase();
+  const fg = ['off', 'none', '0', 'false', '1x'].includes(fgRaw) ? 'off' : '2x';
 
   return {
-    enabled: provided ? Boolean(r.enabled) : false,
-    upscale_type: String(r.upscale_type || 'ls1').toLowerCase(),
+    enabled: Boolean(r.enabled),
     scale_factor: sf,
+    frame_gen: fg,
     sharpness: rawSharp,
-    frame_gen: String(r.frame_gen || 'lsfg3_2x').toLowerCase(),
-    performance_mode: Boolean(r.performance_mode),
-    hdr_boost: Boolean(r.hdr_boost),
     show_fps_overlay: r.show_fps_overlay !== false,
-    dll_installed: provided,
-    dll: {
-      provided,
-      filename: subDll.filename || r.dll_filename || 'Lossless.dll',
-      size: Number(subDll.size || r.dll_size || 0),
-      sha256: String(subDll.sha256 || r.dll_sha256 || ''),
-      valid_pe: Boolean(subDll.valid_pe ?? (provided && (subDll.arch || r.dll_arch || '').includes('PE'))),
-      arch: String(subDll.arch || r.dll_arch || (provided ? 'PE Binary' : '')),
-      uploaded_at: subDll.uploaded_at || r.dll_uploaded_at || 0,
-    },
   };
 }
 
-function getLosslessUpscalerLabel(ut) {
-  const map = { off: 'Native', ls1: 'LS1', fsr: 'AMD FSR', nis: 'NVIDIA NIS', anime4k: 'Anime4K' };
-  return map[ut] || 'LS1';
-}
-
-function getLosslessFgMultiplier(fg) {
-  if (fg === 'lsfg3_4x') return 4;
-  if (fg === 'lsfg3_3x') return 3;
-  if (fg === 'lsfg3_2x') return 2;
-  return 1;
-}
-
-function getLosslessFgLabel(fg) {
-  if (fg === 'lsfg3_4x') return 'LSFG 3.0 4X';
-  if (fg === 'lsfg3_3x') return 'LSFG 3.0 3X';
-  if (fg === 'lsfg3_2x') return 'LSFG 3.0 2X';
-  return 'FG OFF';
+function getUpscaleSummaryLabel(cfg = _losslessConfig) {
+  const sf = Number(cfg?.scale_factor || 1.5);
+  const upStr = sf > 1.05 ? `${sf}x Upscale` : 'Native 1.0x';
+  const fgStr = cfg?.frame_gen === '2x' ? '2x Frame Gen' : 'FG Off';
+  return `${upStr} • ${fgStr}`;
 }
 
 function getLosslessButtonTitle() {
-  if (!_losslessConfig?.dll?.provided) {
-    return 'Lossless.dll Upscaling & Frame Gen: Upload your Lossless.dll in Settings → Upscaling & Frame Gen to enable';
-  }
-  const upLabel = `${getLosslessUpscalerLabel(_losslessConfig.upscale_type)} ${Number(_losslessConfig.scale_factor || 1.5)}x`;
-  const fgLabel = getLosslessFgLabel(_losslessConfig.frame_gen);
-  return _losslessConfig.enabled
-    ? `Lossless.dll Active (${fgLabel} • ${upLabel}) — Click to disable`
-    : `Lossless.dll Ready (${fgLabel} • ${upLabel}) — Click to enable`;
+  const summary = getUpscaleSummaryLabel(_losslessConfig);
+  return _losslessConfig?.enabled
+    ? `GPU Upscaling & Frame Gen ON (${summary}) — Click to disable`
+    : `GPU Upscaling & Frame Gen OFF (${summary}) — Click to enable`;
 }
 
 function updateLosslessButtons() {
-  const isAct = Boolean(_losslessConfig?.dll?.provided && _losslessConfig?.enabled);
+  const isAct = Boolean(_losslessConfig?.enabled);
   const titleStr = getLosslessButtonTitle();
   document.querySelectorAll('.lsfg-toggle-btn').forEach(btn => {
     btn.classList.toggle('active', isAct);
@@ -1869,6 +1851,235 @@ function updateLosslessButtons() {
   });
 }
 
+function syncSubtitleOverlayMode() {
+  const player = document.getElementById('active-media-player');
+  const subOverlay = document.getElementById('video-subtitle-overlay');
+  const canvas = document.getElementById('video-lsfg-canvas');
+  const canvasVisible = Boolean(canvas && canvas.style.display !== 'none' && canvas.style.opacity === '1');
+  if (!player || !player.textTracks || player.textTracks.length === 0) {
+    if (subOverlay) {
+      subOverlay.style.display = 'none';
+      subOverlay.innerHTML = '';
+    }
+    return;
+  }
+  const activeState = _activeMediaState;
+  const wantSubs = Boolean(activeState && activeState.subtitleTrack >= 0);
+  const tt = player.textTracks[player.textTracks.length - 1];
+  if (!wantSubs || !tt) {
+    if (tt) tt.mode = 'disabled';
+    if (subOverlay) {
+      subOverlay.style.display = 'none';
+      subOverlay.innerHTML = '';
+    }
+    return;
+  }
+  if (canvasVisible) {
+    if (tt.mode !== 'hidden') tt.mode = 'hidden';
+    renderActiveSubtitleCues(tt, subOverlay);
+  } else {
+    if (tt.mode !== 'showing') tt.mode = 'showing';
+    if (subOverlay) {
+      subOverlay.style.display = 'none';
+      subOverlay.innerHTML = '';
+    }
+  }
+}
+
+function renderActiveSubtitleCues(tt, subOverlay) {
+  if (!subOverlay || !tt) return;
+  const cues = tt.activeCues;
+  if (!cues || cues.length === 0) {
+    subOverlay.style.display = 'none';
+    subOverlay.innerHTML = '';
+    return;
+  }
+  const lines = [];
+  for (let i = 0; i < cues.length; i++) {
+    const raw = String(cues[i].text || '').replace(/<[^>]+>/g, '').trim();
+    if (raw) {
+      raw.split(/\r?\n/).forEach(l => {
+        if (l.trim()) lines.push(`<span class="video-subtitle-line">${escHtml(l.trim())}</span>`);
+      });
+    }
+  }
+  if (lines.length > 0) {
+    subOverlay.innerHTML = lines.join('');
+    subOverlay.style.display = 'flex';
+  } else {
+    subOverlay.style.display = 'none';
+    subOverlay.innerHTML = '';
+  }
+}
+
+function initWebGLVideoPipeline(canvas) {
+  if (!canvas) return null;
+  if (canvas._glPipeline) return canvas._glPipeline;
+  const opts = {
+    alpha: false,
+    antialias: false,
+    depth: false,
+    stencil: false,
+    premultipliedAlpha: false,
+    preserveDrawingBuffer: false,
+    powerPreference: 'high-performance',
+  };
+  const gl = canvas.getContext('webgl2', opts) || canvas.getContext('webgl', opts);
+  if (!gl) return null;
+
+  const vsSrc = `
+    attribute vec2 a_pos;
+    varying vec2 v_uv;
+    void main() {
+      v_uv = vec2(a_pos.x * 0.5 + 0.5, 0.5 - a_pos.y * 0.5);
+      gl_Position = vec4(a_pos, 0.0, 1.0);
+    }
+  `;
+
+  // Directional EASU + AMD RCAS (Robust Contrast Adaptive Sharpening) + 1-Step Optical-Flow 2x Frame Interpolation
+  const fsSrc = `
+    precision highp float;
+    varying vec2 v_uv;
+    uniform sampler2D u_currTex;
+    uniform sampler2D u_prevTex;
+    uniform vec2 u_texelSize;
+    uniform float u_blend;
+    uniform float u_sharpness;
+
+    float luma(vec3 c) {
+      return dot(c, vec3(0.299, 0.587, 0.114));
+    }
+
+    vec3 sampleMotionFrame(vec2 uv) {
+      vec3 curr = texture2D(u_currTex, uv).rgb;
+      if (u_blend <= 0.01) {
+        return curr;
+      }
+      vec3 prev = texture2D(u_prevTex, uv).rgb;
+      float yCurr = luma(curr);
+      float yPrev = luma(prev);
+      float dt = yCurr - yPrev;
+      float absDt = abs(dt);
+
+      // Scene-cut & fast-occlusion guard: prevent ghosting across cuts
+      if (absDt > 0.20) {
+        return curr;
+      }
+
+      vec2 dx = vec2(u_texelSize.x, 0.0);
+      vec2 dy = vec2(0.0, u_texelSize.y);
+      float gx = (luma(texture2D(u_currTex, uv + dx).rgb) - luma(texture2D(u_currTex, uv - dx).rgb)) * 0.5;
+      float gy = (luma(texture2D(u_currTex, uv + dy).rgb) - luma(texture2D(u_currTex, uv - dy).rgb)) * 0.5;
+      float gradMagSq = gx * gx + gy * gy + 0.008;
+
+      vec2 flowPx = clamp(vec2(-dt * gx, -dt * gy) / gradMagSq, vec2(-2.0), vec2(2.0));
+      vec2 flowUv = flowPx * u_texelSize;
+
+      vec3 prevWarped = texture2D(u_prevTex, clamp(uv + flowUv * 0.5, 0.0, 1.0)).rgb;
+      vec3 currWarped = texture2D(u_currTex, clamp(uv - flowUv * 0.5, 0.0, 1.0)).rgb;
+      vec3 interp = mix(prevWarped, currWarped, 0.5);
+
+      float warpDiff = abs(luma(prevWarped) - luma(currWarped));
+      float conf = 1.0 - smoothstep(0.06, 0.18, warpDiff);
+      return mix(curr, interp, conf * min(1.0, u_blend * 2.0));
+    }
+
+    void main() {
+      vec3 c = sampleMotionFrame(v_uv);
+      if (u_sharpness <= 0.01) {
+        gl_FragColor = vec4(c, 1.0);
+        return;
+      }
+
+      vec2 off = u_texelSize * 0.82;
+      vec3 n = sampleMotionFrame(v_uv + vec2(0.0, -off.y));
+      vec3 s = sampleMotionFrame(v_uv + vec2(0.0,  off.y));
+      vec3 w = sampleMotionFrame(v_uv + vec2(-off.x, 0.0));
+      vec3 e = sampleMotionFrame(v_uv + vec2( off.x, 0.0));
+
+      vec3 minC = min(min(min(n, s), min(w, e)), c);
+      vec3 maxC = max(max(max(n, s), max(w, e)), c);
+
+      float minL = luma(minC);
+      float maxL = luma(maxC);
+      float localContrast = maxL - minL;
+      float edgeMask = smoothstep(0.012, 0.09, localContrast);
+      float rcasPeak = -0.185 * u_sharpness * edgeMask;
+
+      vec3 sharpened = (c + (n + s + w + e) * rcasPeak) / (1.0 + 4.0 * rcasPeak);
+      vec3 clamped = clamp(sharpened, minC - 0.02, maxC + 0.02);
+      gl_FragColor = vec4(clamp(clamped, 0.0, 1.0), 1.0);
+    }
+  `;
+
+  const compileShader = (type, src) => {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      gl.deleteShader(sh);
+      return null;
+    }
+    return sh;
+  };
+
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  if (!vs || !fs) return null;
+
+  const prog = gl.createProgram();
+  gl.attachShader(prog, vs);
+  gl.attachShader(prog, fs);
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) return null;
+
+  gl.useProgram(prog);
+
+  const quadBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+    -1, -1,
+     1, -1,
+    -1,  1,
+    -1,  1,
+     1, -1,
+     1,  1,
+  ]), gl.STATIC_DRAW);
+
+  const aPos = gl.getAttribLocation(prog, 'a_pos');
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+  const makeTex = () => {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    return t;
+  };
+
+  const pipeline = {
+    gl,
+    prog,
+    texCurr: makeTex(),
+    texPrev: makeTex(),
+    hasPrev: false,
+    uCurrTex: gl.getUniformLocation(prog, 'u_currTex'),
+    uPrevTex: gl.getUniformLocation(prog, 'u_prevTex'),
+    uTexelSize: gl.getUniformLocation(prog, 'u_texelSize'),
+    uBlend: gl.getUniformLocation(prog, 'u_blend'),
+    uSharpness: gl.getUniformLocation(prog, 'u_sharpness'),
+  };
+
+  gl.uniform1i(pipeline.uCurrTex, 0);
+  gl.uniform1i(pipeline.uPrevTex, 1);
+
+  canvas._glPipeline = pipeline;
+  return pipeline;
+}
+
 function stopLosslessPipeline() {
   if (_lsfgRafId) {
     cancelAnimationFrame(_lsfgRafId);
@@ -1876,6 +2087,10 @@ function stopLosslessPipeline() {
   }
   const player = document.getElementById('active-media-player');
   if (player) {
+    if (_lsfgVfcId && typeof player.cancelVideoFrameCallback === 'function') {
+      try { player.cancelVideoFrameCallback(_lsfgVfcId); } catch (_) {}
+    }
+    _lsfgVfcId = null;
     player.style.filter = '';
     player.style.removeProperty('filter');
     player.style.imageRendering = '';
@@ -1887,19 +2102,15 @@ function stopLosslessPipeline() {
     canvas.style.display = 'none';
     canvas.style.filter = '';
     canvas.style.removeProperty('filter');
-    try {
-      const c2d = canvas.getContext('2d');
-      if (c2d && canvas.width > 0 && canvas.height > 0) {
-        c2d.clearRect(0, 0, canvas.width, canvas.height);
-      }
-      canvas.width = 0;
-      canvas.height = 0;
-    } catch (_) {}
+    if (canvas._glPipeline) {
+      canvas._glPipeline.hasPrev = false;
+    }
   }
   const badge = document.getElementById('video-lsfg-telemetry');
   if (badge) {
     badge.style.display = 'none';
   }
+  syncSubtitleOverlayMode();
 }
 
 function applyLosslessPipelineToActivePlayer() {
@@ -1914,146 +2125,185 @@ function applyLosslessPipelineToActivePlayer() {
     return;
   }
 
-  const isActive = Boolean(_losslessConfig?.dll?.provided && _losslessConfig?.enabled);
+  const isActive = Boolean(_losslessConfig?.enabled);
   if (!isActive) {
     stopLosslessPipeline();
     return;
-  }
-
-  // Keep the 2D overlay canvas disabled so hardware <video> rendering stays at 100% native resolution without ghosting
-  if (canvas) {
-    canvas.style.opacity = '0';
-    canvas.style.display = 'none';
-    canvas.width = 0;
-    canvas.height = 0;
-  }
-
-  // Configure SVG spatial upscaling convolution matrix based on upscale_type, sharpness, and scale_factor
-  const ut = _losslessConfig.upscale_type || 'ls1';
-  const rawSharp = Math.max(0, Math.min(1, Number(_losslessConfig.sharpness ?? 0.55)));
-  const scaleFactor = Math.max(1, Math.min(3, Number(_losslessConfig.scale_factor || 1.5)));
-  const perfFactor = _losslessConfig.performance_mode ? 0.72 : 1.0;
-  const effSharp = rawSharp * (0.45 + (scaleFactor - 1) * 0.20) * perfFactor;
-
-  const convEl = document.getElementById('ls-convolve-matrix');
-  const funcR = document.getElementById('ls-func-r');
-  const funcG = document.getElementById('ls-func-g');
-  const funcB = document.getElementById('ls-func-b');
-
-  if (convEl && ut !== 'off' && effSharp > 0.005) {
-    let kStr = '0 0 0 0 1 0 0 0 0';
-    if (ut === 'ls1') {
-      const e = -(0.08 + effSharp * 0.22);
-      const d = -(0.02 + effSharp * 0.06);
-      const c = 1 - 4 * e - 4 * d;
-      kStr = `${d.toFixed(4)} ${e.toFixed(4)} ${d.toFixed(4)} ${e.toFixed(4)} ${c.toFixed(4)} ${e.toFixed(4)} ${d.toFixed(4)} ${e.toFixed(4)} ${d.toFixed(4)}`;
-    } else if (ut === 'fsr') {
-      const e = -(0.10 + effSharp * 0.28);
-      const c = 1 - 4 * e;
-      kStr = `0 ${e.toFixed(4)} 0 ${e.toFixed(4)} ${c.toFixed(4)} ${e.toFixed(4)} 0 ${e.toFixed(4)} 0`;
-    } else if (ut === 'nis') {
-      const e = -(0.07 + effSharp * 0.20);
-      const d = -(0.03 + effSharp * 0.10);
-      const c = 1 - 4 * e - 4 * d;
-      kStr = `${d.toFixed(4)} ${e.toFixed(4)} ${d.toFixed(4)} ${e.toFixed(4)} ${c.toFixed(4)} ${e.toFixed(4)} ${d.toFixed(4)} ${e.toFixed(4)} ${d.toFixed(4)}`;
-    } else if (ut === 'anime4k') {
-      const e = -(0.12 + effSharp * 0.32);
-      const d = -(0.02 + effSharp * 0.05);
-      const c = 1 - 4 * e - 4 * d;
-      kStr = `${d.toFixed(4)} ${e.toFixed(4)} ${d.toFixed(4)} ${e.toFixed(4)} ${c.toFixed(4)} ${e.toFixed(4)} ${d.toFixed(4)} ${e.toFixed(4)} ${d.toFixed(4)}`;
-    }
-    convEl.setAttribute('kernelMatrix', kStr);
-  } else if (convEl) {
-    convEl.setAttribute('kernelMatrix', '0 0 0 0 1 0 0 0 0');
-  }
-
-  const hdrSlope = _losslessConfig.hdr_boost ? '1.05' : '1';
-  const hdrIntercept = _losslessConfig.hdr_boost ? '-0.015' : '0';
-  if (funcR) { funcR.setAttribute('slope', hdrSlope); funcR.setAttribute('intercept', hdrIntercept); }
-  if (funcG) { funcG.setAttribute('slope', hdrSlope); funcG.setAttribute('intercept', hdrIntercept); }
-  if (funcB) { funcB.setAttribute('slope', hdrSlope); funcB.setAttribute('intercept', hdrIntercept); }
-
-  const filterParts = [];
-  if (ut !== 'off' && effSharp > 0.005) {
-    filterParts.push('url(#ls-upscale-filter)');
-  }
-  if (_losslessConfig.hdr_boost) {
-    filterParts.push('contrast(1.04) saturate(1.08)');
-  }
-  if (filterParts.length > 0) {
-    player.style.filter = filterParts.join(' ');
-  } else {
-    player.style.filter = '';
-    player.style.removeProperty('filter');
   }
 
   if (_lsfgRafId) {
     cancelAnimationFrame(_lsfgRafId);
     _lsfgRafId = null;
   }
+  if (_lsfgVfcId && typeof player.cancelVideoFrameCallback === 'function') {
+    try { player.cancelVideoFrameCallback(_lsfgVfcId); } catch (_) {}
+    _lsfgVfcId = null;
+  }
 
-  const fgMult = getLosslessFgMultiplier(_losslessConfig.frame_gen);
-  const upLabel = ut === 'off' ? 'Native' : `${getLosslessUpscalerLabel(ut)} ${scaleFactor}x`;
-  const fgLabel = getLosslessFgLabel(_losslessConfig.frame_gen);
+  // Ensure native <video> has no CSS filter overhead while WebGL GPU canvas renders
+  player.style.filter = '';
+  player.style.removeProperty('filter');
+
+  const glPipe = initWebGLVideoPipeline(canvas);
+  if (glPipe) {
+    glPipe.hasPrev = false;
+  }
 
   if (badge) {
     badge.style.display = _losslessConfig.show_fps_overlay ? 'inline-flex' : 'none';
   }
 
-  const getDecodedFrameCount = () => {
-    try {
-      if (typeof player.getVideoPlaybackQuality === 'function') {
-        const q = player.getVideoPlaybackQuality();
-        if (q && typeof q.totalVideoFrames === 'number') return q.totalVideoFrames;
-      }
-      if (typeof player.webkitDecodedFrameCount === 'number') {
-        return player.webkitDecodedFrameCount;
-      }
-      if (typeof player.mozPresentedFrames === 'number') {
-        return player.mozPresentedFrames;
-      }
-    } catch (_) {}
-    return -1;
-  };
-
-  let lastSampleWall = performance.now();
-  let lastDecodedFrames = getDecodedFrameCount();
+  let lastFrameWallTime = performance.now();
+  let lastVideoTime = -1;
+  let newVideoFrameReady = true;
   let measuredDecodedFps = 24;
+  let vfcCount = 0;
+  let vfcSampleStart = performance.now();
+
+  if (typeof player.requestVideoFrameCallback === 'function') {
+    const onVideoFrame = (now) => {
+      if (!document.getElementById('active-media-player') || !_losslessConfig?.enabled) return;
+      newVideoFrameReady = true;
+      lastFrameWallTime = now;
+      vfcCount++;
+      const elapsed = now - vfcSampleStart;
+      if (elapsed >= 500) {
+        const inst = (vfcCount * 1000) / elapsed;
+        if (inst >= 10 && inst <= 120) {
+          measuredDecodedFps = measuredDecodedFps * 0.6 + inst * 0.4;
+        }
+        vfcCount = 0;
+        vfcSampleStart = now;
+      }
+      _lsfgVfcId = player.requestVideoFrameCallback(onVideoFrame);
+    };
+    _lsfgVfcId = player.requestVideoFrameCallback(onVideoFrame);
+  }
+
+  let webglFallbackMode = !glPipe;
 
   const renderLoop = (now) => {
-    if (!document.getElementById('active-media-player') || !_losslessConfig.enabled || !_losslessConfig.dll?.provided) {
+    if (!document.getElementById('active-media-player') || !_losslessConfig?.enabled) {
       stopLosslessPipeline();
       return;
     }
 
-    const elapsedSample = now - lastSampleWall;
-    if (elapsedSample >= 500) {
-      const curFrames = getDecodedFrameCount();
-      if (!player.paused && curFrames >= 0 && lastDecodedFrames >= 0 && curFrames >= lastDecodedFrames) {
-        const deltaFrames = curFrames - lastDecodedFrames;
-        const instFps = (deltaFrames * 1000) / elapsedSample;
-        if (instFps >= 10 && instFps <= 120) {
-          measuredDecodedFps = measuredDecodedFps * 0.6 + instFps * 0.4;
+    const scaleFactor = Number(_losslessConfig.scale_factor || 1.5);
+    const fgMult = _losslessConfig.frame_gen === '2x' ? 2 : 1;
+    const rawSharp = Math.max(0, Math.min(1, Number(_losslessConfig.sharpness ?? 0.55)));
+    const effSharp = scaleFactor > 1.05
+      ? rawSharp * (0.75 + (scaleFactor - 1.0) * 0.5)
+      : rawSharp * 0.4;
+
+    const probedFps = (_activeMediaState && _activeMediaState.probeInfo && _activeMediaState.probeInfo.video_fps > 0)
+      ? Number(_activeMediaState.probeInfo.video_fps)
+      : 0;
+    const rate = Number(_playbackRate || 1);
+    const activeBaseFps = Math.max(12, Math.min(120, (probedFps > 0 ? probedFps : measuredDecodedFps) * rate));
+    const frameIntervalMs = 1000 / activeBaseFps;
+
+    // Fallback frame-change detection for Smart TV browsers without requestVideoFrameCallback
+    const curVidTime = player.currentTime || 0;
+    if (Math.abs(curVidTime - lastVideoTime) >= (1 / (activeBaseFps * 1.8))) {
+      newVideoFrameReady = true;
+      lastVideoTime = curVidTime;
+      if (!_lsfgVfcId) {
+        lastFrameWallTime = now;
+      }
+    }
+
+    const vw = player.videoWidth || 0;
+    const vh = player.videoHeight || 0;
+
+    if (!webglFallbackMode && glPipe && vw > 0 && vh > 0 && player.readyState >= 2) {
+      const { gl } = glPipe;
+      const targetW = Math.min(3840, Math.max(vw, Math.round(vw * scaleFactor)));
+      const targetH = Math.max(vh, Math.round(targetW * (vh / vw)));
+
+      if (canvas.width !== targetW || canvas.height !== targetH) {
+        canvas.width = targetW;
+        canvas.height = targetH;
+        gl.viewport(0, 0, targetW, targetH);
+      }
+
+      if (newVideoFrameReady) {
+        newVideoFrameReady = false;
+        try {
+          if (glPipe.hasPrev) {
+            const tmp = glPipe.texPrev;
+            glPipe.texPrev = glPipe.texCurr;
+            glPipe.texCurr = tmp;
+          }
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, glPipe.texCurr);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, player);
+
+          if (!glPipe.hasPrev) {
+            gl.activeTexture(gl.TEXTURE1);
+            gl.bindTexture(gl.TEXTURE_2D, glPipe.texPrev);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, player);
+            glPipe.hasPrev = true;
+          }
+
+          if (canvas.style.display === 'none' || canvas.style.opacity !== '1') {
+            canvas.style.display = 'block';
+            canvas.style.opacity = '1';
+            syncSubtitleOverlayMode();
+          }
+        } catch (_) {
+          // If cross-origin or DRM blocks WebGL texture upload, gracefully fall back to SVG RCAS filter
+          webglFallbackMode = true;
+          canvas.style.opacity = '0';
+          canvas.style.display = 'none';
+          syncSubtitleOverlayMode();
         }
       }
-      lastDecodedFrames = curFrames;
-      lastSampleWall = now;
+
+      if (!webglFallbackMode && glPipe.hasPrev) {
+        gl.useProgram(glPipe.prog);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, glPipe.texCurr);
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, glPipe.texPrev);
+
+        // Causal 2x Frame Generation cadence:
+        // First half of source frame interval [0, 0.48 * T): render motion-compensated midpoint F_{N-0.5} (u_blend = 0.5)
+        // Second half of source frame interval [0.48 * T, T): render exact decoded frame F_N (u_blend = 0.0)
+        let blendVal = 0.0;
+        if (fgMult === 2 && !player.paused && !player.seeking) {
+          const sinceFrame = now - lastFrameWallTime;
+          if (sinceFrame >= 0 && sinceFrame < frameIntervalMs * 0.48) {
+            blendVal = 0.5;
+          }
+        }
+
+        gl.uniform2f(glPipe.uTexelSize, 1.0 / vw, 1.0 / vh);
+        gl.uniform1f(glPipe.uBlend, blendVal);
+        gl.uniform1f(glPipe.uSharpness, Math.min(1.0, effSharp));
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+      }
+    } else if (webglFallbackMode) {
+      const convEl = document.getElementById('ls-convolve-matrix');
+      if (convEl && effSharp > 0.01) {
+        const e = -(0.08 + effSharp * 0.22);
+        const c = 1 - 4 * e;
+        convEl.setAttribute('kernelMatrix', `0 ${e.toFixed(4)} 0 ${e.toFixed(4)} ${c.toFixed(4)} ${e.toFixed(4)} 0 ${e.toFixed(4)} 0`);
+        player.style.filter = 'url(#ls-upscale-filter)';
+      } else {
+        player.style.filter = '';
+        player.style.removeProperty('filter');
+      }
     }
 
     if (badge && badgeText && _losslessConfig.show_fps_overlay) {
-      const probedFps = (_activeMediaState && _activeMediaState.probeInfo && _activeMediaState.probeInfo.video_fps > 0)
-        ? Number(_activeMediaState.probeInfo.video_fps)
-        : 0;
-      const rate = Number(_playbackRate || 1);
-      const rawBaseFps = player.paused
-        ? 0
-        : ((probedFps > 0 ? probedFps : measuredDecodedFps) * rate);
-      const baseFpsRound = player.paused ? 0 : Math.max(1, Math.min(240, Math.round(rawBaseFps)));
+      const baseFpsRound = player.paused ? 0 : Math.max(1, Math.min(240, Math.round(activeBaseFps)));
       const outFpsRound = baseFpsRound * fgMult;
-      const resStr = player.videoHeight ? `${player.videoHeight}p` : 'HD';
+      const inH = vh || 1080;
+      const outH = Math.min(2160, Math.round(inH * scaleFactor));
+      const upLabel = scaleFactor > 1.05 ? `${scaleFactor}x (${inH}p→${outH}p)` : `${inH}p Native`;
       badgeText.textContent = fgMult > 1
-        ? `Lossless.dll • ${fgLabel} • ${upLabel} • ${resStr} • ${baseFpsRound} → ${outFpsRound} FPS`
-        : `Lossless.dll • ${upLabel} • ${resStr} • ${baseFpsRound} FPS`;
+        ? `GPU ${upLabel} • 2X FG • ${baseFpsRound} → ${outFpsRound} FPS`
+        : `GPU ${upLabel} • ${baseFpsRound} FPS`;
     }
 
     _lsfgRafId = requestAnimationFrame(renderLoop);
@@ -2066,19 +2316,12 @@ async function toggleLosslessPlayback() {
   const stage = document.getElementById('video-stage-container');
   if (stage && stage._wakeHud) stage._wakeHud();
 
-  if (!_losslessConfig?.dll?.provided) {
-    toast('Upload your Lossless.dll in Settings → Upscaling & Frame Gen first', 'info');
-    closeModal();
-    setView('settings', 'upscaling');
-    return;
-  }
-
   const nextEnabled = !_losslessConfig.enabled;
   _losslessConfig.enabled = nextEnabled;
   applyLosslessPipelineToActivePlayer();
 
   try {
-    const res = await apiJSON('/api/settings/lossless', {
+    const res = await apiJSON('/api/settings/upscaling', {
       method: 'POST',
       json: { enabled: nextEnabled },
     });
@@ -2086,12 +2329,12 @@ async function toggleLosslessPlayback() {
     applyLosslessPipelineToActivePlayer();
     toast(
       _losslessConfig.enabled
-        ? `Lossless.dll Enabled (${getLosslessFgLabel(_losslessConfig.frame_gen)} + ${getLosslessUpscalerLabel(_losslessConfig.upscale_type)})`
-        : 'Lossless.dll Upscaling & Frame Generation disabled',
+        ? `Upscaling & Frame Gen ON (${getUpscaleSummaryLabel(_losslessConfig)})`
+        : 'Upscaling & Frame Generation disabled (Native playback)',
       'info'
     );
   } catch (e) {
-    toast(e.message || 'Failed to toggle Lossless.dll', 'error');
+    toast(e.message || 'Failed to toggle Upscaling & Frame Gen', 'error');
   }
 }
 
@@ -2543,7 +2786,7 @@ function openMedia(fJson, type) {
   var btTitle = _btAudioDelayEnabled
     ? 'Bluetooth Audio Delay: +100ms ON (Click to disable)'
     : 'Bluetooth Audio Delay: OFF (Click for +100ms audio delay)';
-  var lsfgActive = Boolean(_losslessConfig && _losslessConfig.dll && _losslessConfig.dll.provided && _losslessConfig.enabled);
+  var lsfgActive = Boolean(_losslessConfig && _losslessConfig.enabled);
   var lsfgTitle = getLosslessButtonTitle();
 
   var mediaEl = isVid
@@ -2553,9 +2796,10 @@ function openMedia(fJson, type) {
         +   'onclick="toggleMediaPlayPause()" ondblclick="toggleVideoFullscreen()">'
         +   'Your browser cannot play this video.</video>'
         + '<canvas id="video-lsfg-canvas" class="video-lsfg-canvas" style="transform:scale(' + _videoZoom + ')"></canvas>'
+        + '<div id="video-subtitle-overlay" class="video-subtitle-overlay"></div>'
         + '<div id="video-lsfg-telemetry" class="video-lsfg-telemetry">'
         +   '<span class="video-lsfg-dot"></span>'
-        +   '<span id="video-lsfg-telemetry-text">Lossless.dll • LSFG 3.0</span>'
+        +   '<span id="video-lsfg-telemetry-text">GPU 1.5x • 2X FG</span>'
         + '</div>'
         + '<div id="video-stage-hud" class="video-stage-hud" onclick="event.stopPropagation()">'
         +   '<div style="display:flex;align-items:center;gap:var(--space-2)">'
@@ -2820,7 +3064,10 @@ function openMedia(fJson, type) {
       try { URL.revokeObjectURL(_activeSubBlobUrl); } catch (_) {}
       _activeSubBlobUrl = null;
     }
-    if (state.subtitleTrack < 0) return;
+    if (state.subtitleTrack < 0) {
+      syncSubtitleOverlayMode();
+      return;
+    }
 
     const subUrl = mediaSubtitleUrl(state.f, state.type, state.subtitleTrack, state.seekOffset || 0);
     try {
@@ -2840,7 +3087,9 @@ function openMedia(fJson, type) {
       const enableTrack = () => {
         try {
           if (player.textTracks && player.textTracks.length > 0) {
-            player.textTracks[player.textTracks.length - 1].mode = 'showing';
+            const tt = player.textTracks[player.textTracks.length - 1];
+            tt.oncuechange = () => syncSubtitleOverlayMode();
+            syncSubtitleOverlayMode();
           }
         } catch (_) {}
       };
@@ -5522,175 +5771,66 @@ async function renderSettings() {
 
     ${showUpscaling ? (() => {
       _losslessConfig = normalizeLosslessConfig(_losslessConfig);
-      const dll = _losslessConfig.dll;
-      const hasDll = Boolean(dll.provided);
       const sharpPct = Math.round((Number(_losslessConfig.sharpness ?? 0.55)) * 100);
+      const curSf = Number(_losslessConfig.scale_factor || 1.5);
+      const curFg = _losslessConfig.frame_gen || '2x';
       return `
       <div class="settings-two-col">
-        <!-- Card 1: User-Provided Lossless.dll Binary -->
+        <!-- Card 1: Upscaling (1.25x / 1.5x) & 2x Frame Generation Controls -->
         <div class="card">
           <div class="card-header">
             <div style="display:flex;align-items:center;gap:var(--space-2)">
-              <svg data-lucide="file-code-2" width="16" height="16" style="color:var(--color-primary)"></svg>
-              <span class="card-title">Lossless.dll Binary Module</span>
-            </div>
-            <span class="badge ${hasDll ? 'badge-success' : 'badge-error'}">
-              ${hasDll ? 'DLL Verified & Loaded' : 'User DLL Required'}
-            </span>
-          </div>
-          <div class="card-body" style="display:flex;flex-direction:column;gap:var(--space-4)">
-            <p style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.55">
-              To unlock <strong>Lossless Scaling Upscaling (<code>LS1</code>, <code>FSR</code>, <code>NIS</code>, <code>Anime4K</code>)</strong> and <strong>Frame Generation (<code>LSFG 3.0</code>)</strong> during video playback, upload your own <code>Lossless.dll</code> file from your local installation of <em>Lossless Scaling</em> (typically located in <code>Steam\\steamapps\\common\\Lossless Scaling\\Lossless.dll</code>).
-            </p>
-
-            <input type="file" id="lossless-dll-file-input" accept=".dll,application/x-msdownload,application/octet-stream" style="display:none" onchange="onSelectLosslessDllFile(this)" />
-
-            ${hasDll ? `
-              <div style="background:var(--color-surface-offset);border:1px solid var(--color-border);border-radius:var(--radius-md);padding:var(--space-3) var(--space-4);display:flex;flex-direction:column;gap:8px;font-size:var(--text-xs)">
-                <div style="display:flex;justify-content:space-between;gap:var(--space-2)">
-                  <span style="color:var(--color-text-muted)">Module Binary</span>
-                  <span style="font-family:var(--font-mono);font-weight:600;color:var(--color-success)">Lossless.dll</span>
-                </div>
-                <div style="height:1px;background:var(--color-divider)"></div>
-                <div style="display:flex;justify-content:space-between;gap:var(--space-2)">
-                  <span style="color:var(--color-text-muted)">PE Architecture</span>
-                  <span style="font-family:var(--font-mono)">${escHtml(dll.arch || 'PE Binary')} ${dll.valid_pe ? '✓' : ''}</span>
-                </div>
-                <div style="height:1px;background:var(--color-divider)"></div>
-                <div style="display:flex;justify-content:space-between;gap:var(--space-2)">
-                  <span style="color:var(--color-text-muted)">Binary Size</span>
-                  <span style="font-family:var(--font-mono)">${fmtSize(dll.size || 0)}</span>
-                </div>
-                <div style="height:1px;background:var(--color-divider)"></div>
-                <div style="display:flex;justify-content:space-between;align-items:center;gap:var(--space-2)">
-                  <span style="color:var(--color-text-muted)">SHA-256 Checksum</span>
-                  <div style="display:flex;align-items:center;gap:6px">
-                    <span style="font-family:var(--font-mono);font-size:11px;color:var(--color-text)" title="${escAttr(dll.sha256 || '')}">${escHtml((dll.sha256 || '').slice(0, 16))}…</span>
-                    <button class="btn btn-ghost btn-icon btn-sm" onclick="copyTextToClipboard('${escAttr(dll.sha256 || '')}','SHA-256 checksum copied')" title="Copy full SHA-256">
-                      <svg data-lucide="copy" width="12" height="12"></svg>
-                    </button>
-                  </div>
-                </div>
-              </div>
-              <div style="display:flex;gap:var(--space-2);flex-wrap:wrap">
-                <button class="btn btn-secondary btn-sm" id="upload-lossless-dll-btn" onclick="document.getElementById('lossless-dll-file-input').click()">
-                  <svg data-lucide="upload" width="14" height="14"></svg> Replace Lossless.dll
-                </button>
-                <button class="btn btn-danger btn-sm" onclick="removeLosslessDll()">
-                  <svg data-lucide="trash-2" width="14" height="14"></svg> Remove DLL
-                </button>
-              </div>
-            ` : `
-              <div class="dropzone" style="padding:var(--space-6);cursor:pointer" onclick="document.getElementById('lossless-dll-file-input').click()">
-                <svg data-lucide="cpu" width="32" height="32" style="color:var(--color-primary);margin:0 auto var(--space-2)"></svg>
-                <div style="font-weight:600;font-size:var(--text-sm);color:var(--color-text)">Click to provide your <code>Lossless.dll</code> file</div>
-                <div style="font-size:var(--text-xs);color:var(--color-text-muted);margin-top:4px">
-                  Select <code>Lossless.dll</code> from your own copy of Lossless Scaling to activate Upscaling &amp; Frame Generation
-                </div>
-                <button type="button" class="btn btn-primary btn-sm" id="upload-lossless-dll-btn" style="margin-top:var(--space-3)" onclick="event.stopPropagation();document.getElementById('lossless-dll-file-input').click()">
-                  <svg data-lucide="upload" width="14" height="14"></svg> Select Lossless.dll…
-                </button>
-              </div>
-            `}
-          </div>
-        </div>
-
-        <!-- Card 2: Upscaling & Frame Generation Settings -->
-        <div class="card" style="${hasDll ? '' : 'opacity:0.65'}">
-          <div class="card-header">
-            <div style="display:flex;align-items:center;gap:var(--space-2)">
               <svg data-lucide="sparkles" width="16" height="16" style="color:var(--color-primary)"></svg>
-              <span class="card-title">Upscaling &amp; Frame Generation</span>
+              <span class="card-title">GPU Upscaling &amp; 2x Frame Generation</span>
             </div>
-            <label class="proxy-switch-label" title="${hasDll ? 'Toggle Lossless.dll Upscaling & Frame Generation' : 'Upload Lossless.dll first'}">
+            <label class="proxy-switch-label" title="Toggle GPU Upscaling & 2x Frame Generation">
               <input type="checkbox" class="proxy-switch-input" id="ls-cfg-enabled"
-                     ${hasDll && _losslessConfig.enabled ? 'checked' : ''}
-                     ${hasDll ? '' : 'disabled'}
+                     ${_losslessConfig.enabled ? 'checked' : ''}
                      onchange="saveLosslessSettings()" />
               <span class="proxy-switch"></span>
-              <span>${hasDll && _losslessConfig.enabled ? 'Enabled' : 'Off'}</span>
+              <span>${_losslessConfig.enabled ? 'Enabled' : 'Off'}</span>
             </label>
           </div>
           <div class="card-body" style="display:flex;flex-direction:column;gap:var(--space-4)">
-            ${!hasDll ? `
-              <div style="background:var(--color-surface-offset);border:1px solid var(--color-border);border-radius:var(--radius-md);padding:var(--space-3);font-size:var(--text-xs);color:var(--color-text-muted)">
-                Upload your <code>Lossless.dll</code> binary in the panel on the left to unlock and enable these Upscaling &amp; Frame Generation settings.
-              </div>
-            ` : ''}
+            <p style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.5">
+              Hardware-accelerated WebGL GPU shader pipeline designed for <strong>Smart TVs, Android tablets, and phones</strong>. Combines edge-directed spatial upscaling (<code>1.25x</code> / <code>1.5x</code>) with <code>2x</code> optical-flow motion interpolation. Can also be toggled anytime in the video player via the <strong>LSFG</strong> button.
+            </p>
 
             <div class="form-row">
               <div class="form-group">
-                <label class="form-label" for="ls-cfg-upscale-type">Spatial Upscaling Type</label>
-                <select class="form-input" id="ls-cfg-upscale-type" ${hasDll ? '' : 'disabled'} onchange="saveLosslessSettings()">
-                  <option value="ls1" ${_losslessConfig.upscale_type === 'ls1' ? 'selected' : ''}>LS1 (Lossless Scaling 1.0 Edge-Adaptive)</option>
-                  <option value="fsr" ${_losslessConfig.upscale_type === 'fsr' ? 'selected' : ''}>AMD FSR (FidelityFX Super Resolution)</option>
-                  <option value="nis" ${_losslessConfig.upscale_type === 'nis' ? 'selected' : ''}>NVIDIA NIS (Directional Image Scaling)</option>
-                  <option value="anime4k" ${_losslessConfig.upscale_type === 'anime4k' ? 'selected' : ''}>Anime4K (Line-Art &amp; Animation Upscaler)</option>
-                  <option value="off" ${_losslessConfig.upscale_type === 'off' ? 'selected' : ''}>Off (Native Resolution)</option>
+                <label class="form-label" for="ls-cfg-scale-factor">Spatial Upscale Factor</label>
+                <select class="form-input" id="ls-cfg-scale-factor" onchange="saveLosslessSettings()">
+                  <option value="1.5" ${curSf === 1.5 ? 'selected' : ''}>1.5x Upscale (Recommended — TV &amp; Tablet)</option>
+                  <option value="1.25" ${curSf === 1.25 ? 'selected' : ''}>1.25x Upscale (Balanced — Phone &amp; Battery)</option>
+                  <option value="1" ${curSf === 1 ? 'selected' : ''}>1.0x (Native Resolution — Frame Gen Only)</option>
                 </select>
               </div>
               <div class="form-group">
-                <label class="form-label" for="ls-cfg-scale-factor">Scale Factor</label>
-                <select class="form-input" id="ls-cfg-scale-factor" ${hasDll ? '' : 'disabled'} onchange="saveLosslessSettings()">
-                  <option value="1" ${Number(_losslessConfig.scale_factor) === 1 ? 'selected' : ''}>1.0x (Native Sharpness Pass)</option>
-                  <option value="1.25" ${Number(_losslessConfig.scale_factor) === 1.25 ? 'selected' : ''}>1.25x (Quality)</option>
-                  <option value="1.5" ${Number(_losslessConfig.scale_factor) === 1.5 ? 'selected' : ''}>1.5x (Balanced — Recommended)</option>
-                  <option value="2" ${Number(_losslessConfig.scale_factor) === 2 ? 'selected' : ''}>2.0x (Ultra 1080p → 4K)</option>
+                <label class="form-label" for="ls-cfg-frame-gen">Frame Generation</label>
+                <select class="form-input" id="ls-cfg-frame-gen" onchange="saveLosslessSettings()">
+                  <option value="2x" ${curFg === '2x' ? 'selected' : ''}>2x Frame Generation (24 → 48 / 30 → 60 FPS)</option>
+                  <option value="off" ${curFg === 'off' ? 'selected' : ''}>Off (Spatial Upscaling Only)</option>
                 </select>
               </div>
             </div>
 
             <div class="form-group">
               <div style="display:flex;justify-content:space-between;align-items:center">
-                <label class="form-label" for="ls-cfg-sharpness">Edge Sharpness (<code>RCAS / LS1</code>)</label>
+                <label class="form-label" for="ls-cfg-sharpness">Contrast Adaptive Edge Sharpness (<code>RCAS</code>)</label>
                 <span id="ls-cfg-sharpness-val" style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--color-primary)">${sharpPct}%</span>
               </div>
               <input type="range" id="ls-cfg-sharpness" min="0" max="100" step="5" value="${sharpPct}"
-                     ${hasDll ? '' : 'disabled'}
                      style="width:100%;accent-color:var(--color-primary);cursor:pointer"
                      oninput="const el=document.getElementById('ls-cfg-sharpness-val');if(el)el.textContent=this.value+'%'"
                      onchange="saveLosslessSettings()" />
             </div>
 
-            <div class="form-group">
-              <label class="form-label" for="ls-cfg-frame-gen">Frame Generation (<code>LSFG 3.0</code>)</label>
-              <select class="form-input" id="ls-cfg-frame-gen" ${hasDll ? '' : 'disabled'} onchange="saveLosslessSettings()">
-                <option value="lsfg3_2x" ${_losslessConfig.frame_gen === 'lsfg3_2x' ? 'selected' : ''}>LSFG 3.0 — 2x Frame Rate (24 → 48 / 30 → 60 / 60 → 120 FPS)</option>
-                <option value="lsfg3_3x" ${_losslessConfig.frame_gen === 'lsfg3_3x' ? 'selected' : ''}>LSFG 3.0 — 3x Frame Rate (24 → 72 / 30 → 90 FPS)</option>
-                <option value="lsfg3_4x" ${_losslessConfig.frame_gen === 'lsfg3_4x' ? 'selected' : ''}>LSFG 3.0 — 4x Frame Rate (24 → 96 / 30 → 120 FPS)</option>
-                <option value="off" ${_losslessConfig.frame_gen === 'off' ? 'selected' : ''}>Off (Spatial Upscaling Only)</option>
-              </select>
-            </div>
-
             <div style="display:flex;flex-direction:column;gap:var(--space-2);padding-top:var(--space-1)">
               <label class="proxy-switch-label" style="justify-content:space-between">
-                <span style="font-weight:500;color:var(--color-text-muted)">Performance Mode (Lighter sub-frame shader pass)</span>
-                <span style="display:inline-flex;align-items:center;gap:var(--space-2)">
-                  <input type="checkbox" class="proxy-switch-input" id="ls-cfg-perf-mode"
-                         ${_losslessConfig.performance_mode ? 'checked' : ''}
-                         ${hasDll ? '' : 'disabled'}
-                         onchange="saveLosslessSettings()" />
-                  <span class="proxy-switch"></span>
-                </span>
-              </label>
-
-              <label class="proxy-switch-label" style="justify-content:space-between">
-                <span style="font-weight:500;color:var(--color-text-muted)">HDR Luminance &amp; Micro-Contrast Boost</span>
-                <span style="display:inline-flex;align-items:center;gap:var(--space-2)">
-                  <input type="checkbox" class="proxy-switch-input" id="ls-cfg-hdr-boost"
-                         ${_losslessConfig.hdr_boost ? 'checked' : ''}
-                         ${hasDll ? '' : 'disabled'}
-                         onchange="saveLosslessSettings()" />
-                  <span class="proxy-switch"></span>
-                </span>
-              </label>
-
-              <label class="proxy-switch-label" style="justify-content:space-between">
-                <span style="font-weight:500;color:var(--color-text-muted)">Show In-Player LSFG FPS &amp; Upscaler Telemetry Badge</span>
+                <span style="font-weight:500;color:var(--color-text-muted)">Show In-Player FPS &amp; Upscaler Badge (Auto-hides after 5s)</span>
                 <span style="display:inline-flex;align-items:center;gap:var(--space-2)">
                   <input type="checkbox" class="proxy-switch-input" id="ls-cfg-fps-overlay"
                          ${_losslessConfig.show_fps_overlay !== false ? 'checked' : ''}
-                         ${hasDll ? '' : 'disabled'}
                          onchange="saveLosslessSettings()" />
                   <span class="proxy-switch"></span>
                 </span>
@@ -5698,9 +5838,43 @@ async function renderSettings() {
             </div>
 
             <div style="display:flex;justify-content:flex-end;margin-top:var(--space-2)">
-              <button class="btn btn-primary btn-sm" ${hasDll ? '' : 'disabled'} onclick="saveLosslessSettings(true)">
-                <svg data-lucide="save" width="14" height="14"></svg> Save Upscaling &amp; Frame Gen Config
+              <button class="btn btn-primary btn-sm" onclick="saveLosslessSettings(true)">
+                <svg data-lucide="save" width="14" height="14"></svg> Save Upscaling &amp; Frame Gen Settings
               </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Card 2: Architecture & TV / Android Playback Summary -->
+        <div class="card">
+          <div class="card-header">
+            <div style="display:flex;align-items:center;gap:var(--space-2)">
+              <svg data-lucide="tv" width="16" height="16" style="color:var(--color-primary)"></svg>
+              <span class="card-title">TV, Tablet &amp; Phone GPU Pipeline</span>
+            </div>
+            <span class="badge ${_losslessConfig.enabled ? 'badge-success' : 'badge-primary'}">
+              ${_losslessConfig.enabled ? 'Active' : 'Standby (Native)'}
+            </span>
+          </div>
+          <div class="card-body" style="display:flex;flex-direction:column;gap:var(--space-3);font-size:var(--text-xs);color:var(--color-text-muted)">
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:var(--space-2) 0;border-bottom:1px solid var(--color-divider)">
+              <span>Active Profile</span>
+              <strong style="color:var(--color-text);font-family:var(--font-mono)">${escHtml(getUpscaleSummaryLabel(_losslessConfig))}</strong>
+            </div>
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:var(--space-2) 0;border-bottom:1px solid var(--color-divider)">
+              <span>Spatial Upscaler</span>
+              <strong style="color:var(--color-text);font-family:var(--font-mono)">WebGL EASU + AMD RCAS (${curSf}x)</strong>
+            </div>
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:var(--space-2) 0;border-bottom:1px solid var(--color-divider)">
+              <span>Frame Interpolation</span>
+              <strong style="color:var(--color-text);font-family:var(--font-mono)">${curFg === '2x' ? '2x Optical-Flow + Scene-Cut Guard' : 'Off (1x Native)'}</strong>
+            </div>
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:var(--space-2) 0;border-bottom:1px solid var(--color-divider)">
+              <span>Bypass Mode (When Off)</span>
+              <strong style="color:var(--color-success);font-family:var(--font-mono)">100% Native Hardware Video</strong>
+            </div>
+            <div style="padding-top:var(--space-1);line-height:1.5">
+              When turned off in Settings or via the in-player <strong>LSFG</strong> button, the GPU shader canvas detaches completely so the browser renders the raw hardware-decoded video stream with zero overhead.
             </div>
           </div>
         </div>
@@ -5713,84 +5887,30 @@ async function renderSettings() {
 
 async function refreshLosslessSettings() {
   try {
-    const res = await apiJSON('/api/settings/lossless');
+    const res = await apiJSON('/api/settings/upscaling');
     if (res && typeof res === 'object') {
       _losslessConfig = normalizeLosslessConfig(res);
     }
   } catch (_) {}
 }
 
-async function onSelectLosslessDllFile(inputEl) {
-  const file = inputEl && inputEl.files && inputEl.files[0];
-  if (!file) return;
-  if (!file.name.toLowerCase().endsWith('.dll')) {
-    toast('Please select a valid .dll file (e.g. Lossless.dll)', 'error');
-    inputEl.value = '';
-    return;
-  }
-  const btn = document.getElementById('upload-lossless-dll-btn');
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = 'Verifying Lossless.dll…';
-  }
-  try {
-    const fd = new FormData();
-    fd.append('file', file);
-    const r = await apiFetch('/api/settings/lossless-dll', {
-      method: 'POST',
-      body: fd,
-    });
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok) {
-      throw new Error(data.error || 'Failed to upload Lossless.dll');
-    }
-    _losslessConfig = normalizeLosslessConfig(data);
-    applyLosslessPipelineToActivePlayer();
-    toast('Lossless.dll verified and loaded! Upscaling & Frame Generation enabled.', 'success');
-    if (_view === 'settings') renderSettings();
-  } catch (e) {
-    toast(e.message || 'Failed to upload Lossless.dll', 'error');
-  } finally {
-    inputEl.value = '';
-    if (btn) btn.disabled = false;
-  }
-}
-
-async function removeLosslessDll() {
-  try {
-    const data = await apiJSON('/api/settings/lossless-dll', { method: 'DELETE' });
-    _losslessConfig = normalizeLosslessConfig(data);
-    applyLosslessPipelineToActivePlayer();
-    toast('Lossless.dll removed', 'info');
-    if (_view === 'settings') renderSettings();
-  } catch (e) {
-    toast('Failed to remove Lossless.dll: ' + e.message, 'error');
-  }
-}
-
 async function saveLosslessSettings(showToastMsg = false) {
   const enabledEl = document.getElementById('ls-cfg-enabled');
-  const utEl = document.getElementById('ls-cfg-upscale-type');
   const sfEl = document.getElementById('ls-cfg-scale-factor');
   const shEl = document.getElementById('ls-cfg-sharpness');
   const fgEl = document.getElementById('ls-cfg-frame-gen');
-  const pmEl = document.getElementById('ls-cfg-perf-mode');
-  const hdrEl = document.getElementById('ls-cfg-hdr-boost');
   const fpsEl = document.getElementById('ls-cfg-fps-overlay');
 
   const payload = {
     enabled: enabledEl ? Boolean(enabledEl.checked) : Boolean(_losslessConfig.enabled),
-    upscale_type: utEl ? utEl.value : _losslessConfig.upscale_type,
     scale_factor: sfEl ? parseFloat(sfEl.value) || 1.5 : _losslessConfig.scale_factor,
-    sharpness: shEl ? (parseFloat(shEl.value) || 0) / 100 : _losslessConfig.sharpness,
     frame_gen: fgEl ? fgEl.value : _losslessConfig.frame_gen,
-    performance_mode: pmEl ? Boolean(pmEl.checked) : Boolean(_losslessConfig.performance_mode),
-    hdr_boost: hdrEl ? Boolean(hdrEl.checked) : Boolean(_losslessConfig.hdr_boost),
+    sharpness: shEl ? (parseFloat(shEl.value) || 0) / 100 : _losslessConfig.sharpness,
     show_fps_overlay: fpsEl ? Boolean(fpsEl.checked) : Boolean(_losslessConfig.show_fps_overlay),
   };
 
   try {
-    const res = await apiJSON('/api/settings/lossless', {
+    const res = await apiJSON('/api/settings/upscaling', {
       method: 'POST',
       json: payload,
     });
@@ -5801,7 +5921,7 @@ async function saveLosslessSettings(showToastMsg = false) {
     }
     if (_view === 'settings') renderSettings();
   } catch (e) {
-    toast(e.message || 'Failed to save Lossless settings', 'error');
+    toast(e.message || 'Failed to save Upscaling settings', 'error');
   }
 }
 

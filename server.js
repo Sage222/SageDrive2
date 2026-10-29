@@ -1253,191 +1253,96 @@ app.post('/api/auth/theme', requireAuth, (req, res) => {
   return res.json({ ok: true, theme: rawTheme });
 });
 
-// ── Lossless.dll Upscaling & Frame Generation ────────────────────────────────
-const LOSSLESS_DIR = path.join(DATA_DIR, 'lossless');
-fs.mkdirSync(LOSSLESS_DIR, { recursive: true });
-const LOSSLESS_DLL_FILE = path.join(LOSSLESS_DIR, 'Lossless.dll');
-const LOSSLESS_CONFIG_FILE = path.join(DATA_DIR, 'lossless_config.json');
+// ── Built-in GPU Upscaling (1.25x / 1.5x) & 2x Frame Generation ─────────────
+const UPSCALE_CONFIG_FILE = path.join(DATA_DIR, 'upscale_config.json');
+const LEGACY_LOSSLESS_CONFIG_FILE = path.join(DATA_DIR, 'lossless_config.json');
+const LEGACY_LOSSLESS_DLL_FILE = path.join(DATA_DIR, 'lossless', 'Lossless.dll');
 
-const DEFAULT_LOSSLESS_CONFIG = {
+try {
+  if (fs.existsSync(LEGACY_LOSSLESS_DLL_FILE)) {
+    fs.unlinkSync(LEGACY_LOSSLESS_DLL_FILE);
+  }
+} catch (_) {}
+
+const DEFAULT_UPSCALE_CONFIG = {
   enabled: false,
-  upscale_type: 'ls1',        // 'off' | 'ls1' | 'fsr' | 'nis' | 'anime4k'
-  scale_factor: 1.5,          // 1.0 | 1.25 | 1.5 | 2.0
-  sharpness: 0.55,            // 0.0 .. 1.0
-  frame_gen: 'lsfg3_2x',      // 'off' | 'lsfg3_2x' | 'lsfg3_3x' | 'lsfg3_4x'
-  performance_mode: false,
-  hdr_boost: false,
+  scale_factor: 1.5,        // 1.0 (Off) | 1.25 (1.25x) | 1.5 (1.5x)
+  frame_gen: '2x',          // 'off' | '2x'
+  sharpness: 0.55,          // 0.0 .. 1.0 (RCAS edge sharpness)
   show_fps_overlay: true,
 };
 
-function inspectDllBuffer(buf) {
-  const size = buf ? buf.length : 0;
-  const sha256 = crypto.createHash('sha256').update(buf || Buffer.alloc(0)).digest('hex');
-  let validPe = false;
-  let arch = 'Unknown';
-  try {
-    if (size >= 64 && buf[0] === 0x4d && buf[1] === 0x5a) {
-      validPe = true;
-      const peOffset = buf.readUInt32LE(0x3c);
-      if (peOffset + 6 <= size && buf.slice(peOffset, peOffset + 4).equals(Buffer.from([0x50, 0x45, 0x00, 0x00]))) {
-        const machine = buf.readUInt16LE(peOffset + 4);
-        if (machine === 0x8664) arch = 'x64 PE32+ (AMD64)';
-        else if (machine === 0x014c) arch = 'x86 PE32 (i386)';
-        else if (machine === 0xaa64) arch = 'ARM64 PE32+';
-        else arch = `PE (0x${machine.toString(16)})`;
-      } else {
-        arch = 'MZ Binary';
-      }
-    }
-  } catch (_) {}
-  return {
-    size,
-    sha256,
-    valid_pe: validPe,
-    arch,
-  };
+function normalizeScaleFactorVal(val, def = 1.5) {
+  const sf = Number(val);
+  if (Number.isNaN(sf)) return def;
+  if (sf <= 1.05) return 1.0;
+  if (sf <= 1.37) return 1.25;
+  return 1.5;
 }
 
-function loadLosslessConfig() {
-  const raw = loadJson(LOSSLESS_CONFIG_FILE, {});
-  const cfg = { ...DEFAULT_LOSSLESS_CONFIG };
+function normalizeFrameGenVal(val) {
+  const s = String(val || '').trim().toLowerCase();
+  if (['off', 'none', '0', 'false', '1x'].includes(s)) return 'off';
+  return '2x';
+}
+
+function normalizeSharpnessVal(val, def = 0.55) {
+  let sh = Number(val);
+  if (Number.isNaN(sh)) return def;
+  if (sh > 1.0) sh = sh / 100.0;
+  return Math.round(Math.max(0.0, Math.min(1.0, sh)) * 10000) / 10000;
+}
+
+function loadUpscaleConfig() {
+  const srcFile = fs.existsSync(UPSCALE_CONFIG_FILE)
+    ? UPSCALE_CONFIG_FILE
+    : (fs.existsSync(LEGACY_LOSSLESS_CONFIG_FILE) ? LEGACY_LOSSLESS_CONFIG_FILE : null);
+  const raw = srcFile ? loadJson(srcFile, {}) : {};
+  const cfg = { ...DEFAULT_UPSCALE_CONFIG };
   if (raw && typeof raw === 'object') {
-    for (const k of Object.keys(DEFAULT_LOSSLESS_CONFIG)) {
-      if (k in raw) cfg[k] = raw[k];
+    if ('enabled' in raw) cfg.enabled = Boolean(raw.enabled);
+    if ('scale_factor' in raw) {
+      cfg.scale_factor = normalizeScaleFactorVal(raw.scale_factor);
+    } else if (raw.upscale_type === 'off') {
+      cfg.scale_factor = 1.0;
     }
-  }
-  const dllExists = fs.existsSync(LOSSLESS_DLL_FILE);
-  if (!dllExists) {
-    cfg.enabled = false;
+    if ('frame_gen' in raw) cfg.frame_gen = normalizeFrameGenVal(raw.frame_gen);
+    if ('sharpness' in raw) cfg.sharpness = normalizeSharpnessVal(raw.sharpness);
+    if ('show_fps_overlay' in raw) cfg.show_fps_overlay = Boolean(raw.show_fps_overlay);
   }
   return cfg;
 }
 
-function saveLosslessConfig(cfg) {
-  saveJson(LOSSLESS_CONFIG_FILE, cfg);
+function saveUpscaleConfig(cfg) {
+  const clean = {
+    enabled: Boolean(cfg.enabled),
+    scale_factor: normalizeScaleFactorVal(cfg.scale_factor),
+    frame_gen: normalizeFrameGenVal(cfg.frame_gen),
+    sharpness: normalizeSharpnessVal(cfg.sharpness),
+    show_fps_overlay: cfg.show_fps_overlay !== false,
+  };
+  saveJson(UPSCALE_CONFIG_FILE, clean);
+  return clean;
 }
 
-function getLosslessStatusPayload() {
-  const cfg = loadLosslessConfig();
-  let dllInfo = {
-    provided: false,
-    filename: 'Lossless.dll',
-    size: 0,
-    sha256: '',
-    valid_pe: false,
-    arch: '',
-    uploaded_at: 0,
-  };
-  if (fs.existsSync(LOSSLESS_DLL_FILE)) {
-    try {
-      const st = fs.statSync(LOSSLESS_DLL_FILE);
-      const data = fs.readFileSync(LOSSLESS_DLL_FILE);
-      const meta = inspectDllBuffer(data);
-      dllInfo = {
-        provided: true,
-        filename: 'Lossless.dll',
-        size: meta.size,
-        sha256: meta.sha256,
-        valid_pe: meta.valid_pe,
-        arch: meta.arch,
-        uploaded_at: Math.floor(st.mtimeMs / 1000),
-      };
-    } catch (_) {}
-  }
-  return {
-    ...cfg,
-    dll_installed: Boolean(dllInfo.provided),
-    dll_filename: dllInfo.provided ? dllInfo.filename : '',
-    dll_size: dllInfo.size,
-    dll_sha256: dllInfo.sha256,
-    dll_arch: dllInfo.arch,
-    dll: dllInfo,
-  };
-}
-
-app.get('/api/settings/lossless', requireAuth, (_req, res) => {
-  return res.json(getLosslessStatusPayload());
+app.get(['/api/settings/upscaling', '/api/settings/lossless'], requireAuth, (_req, res) => {
+  return res.json(loadUpscaleConfig());
 });
 
-app.post('/api/settings/lossless', requireAuth, (req, res) => {
+app.post(['/api/settings/upscaling', '/api/settings/lossless'], requireAuth, (req, res) => {
   const b = req.body || {};
-  const cfg = loadLosslessConfig();
-  const dllExists = fs.existsSync(LOSSLESS_DLL_FILE);
+  const cfg = loadUpscaleConfig();
 
-  const validUpscalers = new Set(['off', 'ls1', 'fsr', 'nis', 'anime4k']);
-  const validFg = new Set(['off', 'lsfg3_2x', 'lsfg3_3x', 'lsfg3_4x']);
-
-  if ('upscale_type' in b) {
-    const ut = String(b.upscale_type || 'ls1').trim().toLowerCase();
-    if (validUpscalers.has(ut)) cfg.upscale_type = ut;
-  }
-  if ('scale_factor' in b) {
-    const sf = Number(b.scale_factor);
-    if (!Number.isNaN(sf)) cfg.scale_factor = Math.max(1.0, Math.min(3.0, sf));
-  }
-  if ('sharpness' in b) {
-    let sh = Number(b.sharpness);
-    if (!Number.isNaN(sh)) {
-      if (sh > 1.0) sh = sh / 100.0;
-      cfg.sharpness = Math.max(0.0, Math.min(1.0, sh));
-    }
-  }
-  if ('frame_gen' in b) {
-    const fg = String(b.frame_gen || 'lsfg3_2x').trim().toLowerCase();
-    if (validFg.has(fg)) cfg.frame_gen = fg;
-  }
-  if ('performance_mode' in b) cfg.performance_mode = Boolean(b.performance_mode);
-  if ('hdr_boost' in b) cfg.hdr_boost = Boolean(b.hdr_boost);
+  if ('enabled' in b) cfg.enabled = Boolean(b.enabled);
+  if ('scale_factor' in b) cfg.scale_factor = normalizeScaleFactorVal(b.scale_factor, cfg.scale_factor);
+  if ('frame_gen' in b) cfg.frame_gen = normalizeFrameGenVal(b.frame_gen);
+  if ('sharpness' in b) cfg.sharpness = normalizeSharpnessVal(b.sharpness, cfg.sharpness);
   if ('show_fps_overlay' in b) cfg.show_fps_overlay = Boolean(b.show_fps_overlay);
-  if ('enabled' in b) {
-    const wantEnabled = Boolean(b.enabled);
-    if (wantEnabled && !dllExists) {
-      return res.status(400).json({ error: 'Please upload your own Lossless.dll file first before enabling Upscaling & Frame Generation.' });
-    }
-    cfg.enabled = wantEnabled && dllExists;
-  }
 
-  saveLosslessConfig(cfg);
-  return res.json(getLosslessStatusPayload());
+  const saved = saveUpscaleConfig(cfg);
+  return res.json(saved);
 });
 
-app.post('/api/settings/lossless-dll', requireAuth, upload.single('file'), (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: 'No Lossless.dll file provided' });
-  }
-  const origName = String(req.file.originalname || '').trim();
-  if (!origName.toLowerCase().endsWith('.dll')) {
-    try { fs.unlinkSync(req.file.path); } catch (_) {}
-    return res.status(400).json({ error: 'Uploaded file must be a .dll binary (e.g. Lossless.dll)' });
-  }
-  let rawBytes;
-  try {
-    rawBytes = fs.readFileSync(req.file.path);
-  } catch (_) {
-    return res.status(400).json({ error: 'Failed to read uploaded .dll file' });
-  } finally {
-    try { fs.unlinkSync(req.file.path); } catch (_) {}
-  }
-  if (!rawBytes || rawBytes.length < 64) {
-    return res.status(400).json({ error: 'Uploaded .dll file is empty or too small to be a valid binary' });
-  }
-  fs.mkdirSync(LOSSLESS_DIR, { recursive: true });
-  fs.writeFileSync(LOSSLESS_DLL_FILE, rawBytes);
-  const cfg = loadLosslessConfig();
-  cfg.enabled = true;
-  saveLosslessConfig(cfg);
-  return res.json(getLosslessStatusPayload());
-});
-
-app.delete('/api/settings/lossless-dll', requireAuth, (_req, res) => {
-  if (fs.existsSync(LOSSLESS_DLL_FILE)) {
-    try { fs.unlinkSync(LOSSLESS_DLL_FILE); } catch (_) {}
-  }
-  const cfg = loadLosslessConfig();
-  cfg.enabled = false;
-  saveLosslessConfig(cfg);
-  return res.json(getLosslessStatusPayload());
-});
 
 // ── SMB Helpers & Routes ──────────────────────────────────────────────────────
 function listShares() {

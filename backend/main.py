@@ -1401,8 +1401,11 @@ def _analyze_probe_data(data, filename=""):
     duration = _extract_probe_duration(fmt, streams)
     video_fps = 0.0
     if v0:
-        video_fps = _parse_fps_str(v0.get("avg_frame_rate")) or _parse_fps_str(v0.get("r_frame_rate"))
-        if video_fps < 1.0 or video_fps > 240.0:
+        try:
+            video_fps = _parse_fps(v0.get("avg_frame_rate")) or _parse_fps(v0.get("r_frame_rate"))
+            if video_fps < 1.0 or video_fps > 240.0:
+                video_fps = 0.0
+        except Exception:
             video_fps = 0.0
 
     return {

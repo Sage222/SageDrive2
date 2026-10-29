@@ -1691,6 +1691,69 @@ let _activeMediaBlobUrl = null;
 let _activeSubBlobUrl = null;
 let _activeMediaState = null;
 let _hudIdleTimer = null;
+let _btAudioDelayEnabled = false;
+let _sharedBtAudioCtx = null;
+
+function applyBtAudioDelayToPlayer(player) {
+  if (!player) return;
+  try {
+    if (!player._btAudioGraph) {
+      if (!_btAudioDelayEnabled) return;
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+      if (!_sharedBtAudioCtx) {
+        _sharedBtAudioCtx = new AudioCtx();
+      }
+      if (_sharedBtAudioCtx.state === 'suspended') {
+        _sharedBtAudioCtx.resume().catch(() => {});
+      }
+      const source = _sharedBtAudioCtx.createMediaElementSource(player);
+      const delayNode = _sharedBtAudioCtx.createDelay(1.0);
+      delayNode.delayTime.value = _btAudioDelayEnabled ? 0.03 : 0;
+      source.connect(delayNode);
+      delayNode.connect(_sharedBtAudioCtx.destination);
+      player._btAudioGraph = { source, delayNode };
+    } else {
+      if (_sharedBtAudioCtx && _sharedBtAudioCtx.state === 'suspended') {
+        _sharedBtAudioCtx.resume().catch(() => {});
+      }
+      const targetDelay = _btAudioDelayEnabled ? 0.03 : 0;
+      if (_sharedBtAudioCtx) {
+        player._btAudioGraph.delayNode.delayTime.setTargetAtTime(targetDelay, _sharedBtAudioCtx.currentTime, 0.005);
+      } else {
+        player._btAudioGraph.delayNode.delayTime.value = targetDelay;
+      }
+    }
+  } catch (_) {}
+}
+
+function updateBtDelayButtons() {
+  document.querySelectorAll('.bt-delay-btn').forEach(btn => {
+    btn.classList.toggle('active', _btAudioDelayEnabled);
+    if (btn.classList.contains('btn')) {
+      btn.classList.toggle('btn-primary', _btAudioDelayEnabled);
+      btn.classList.toggle('btn-secondary', !_btAudioDelayEnabled);
+    }
+    btn.title = _btAudioDelayEnabled
+      ? 'Bluetooth Audio Delay: +30ms ON (Click to disable)'
+      : 'Bluetooth Audio Delay: OFF (Click for +30ms audio delay)';
+  });
+}
+
+function toggleBtAudioDelay() {
+  _btAudioDelayEnabled = !_btAudioDelayEnabled;
+  const player = document.getElementById('active-media-player');
+  applyBtAudioDelayToPlayer(player);
+  updateBtDelayButtons();
+  const stage = document.getElementById('video-stage-container');
+  if (stage && stage._wakeHud) stage._wakeHud();
+  toast(
+    _btAudioDelayEnabled
+      ? 'Bluetooth audio delay (+30ms) enabled'
+      : 'Bluetooth audio delay disabled',
+    'info'
+  );
+}
 
 function cleanupActiveMedia() {
   if (_activeMediaState && _activeMediaState.skipDebounceTimer) {
@@ -1708,6 +1771,11 @@ function cleanupActiveMedia() {
   const player = document.getElementById('active-media-player');
   if (player) {
     try {
+      if (player._btAudioGraph) {
+        try { player._btAudioGraph.source.disconnect(); } catch (_) {}
+        try { player._btAudioGraph.delayNode.disconnect(); } catch (_) {}
+        player._btAudioGraph = null;
+      }
       player.onerror = null;
       player.onloadeddata = null;
       player.oncanplay = null;
@@ -1814,6 +1882,8 @@ function setPlaybackRate(rate) {
   document.querySelectorAll('.speed-btn, .hud-speed-btn').forEach(btn => {
     btn.classList.toggle('active', Math.abs(parseFloat(btn.dataset.rate) - rate) < 0.001);
   });
+  const stage = document.getElementById('video-stage-container');
+  if (stage && stage._wakeHud) stage._wakeHud();
 }
 
 function setVideoZoom(zoom) {
@@ -1825,6 +1895,8 @@ function setVideoZoom(zoom) {
   document.querySelectorAll('.zoom-btn, .hud-zoom-btn').forEach(btn => {
     btn.classList.toggle('active', Math.abs(parseFloat(btn.dataset.zoom) - zoom) < 0.001);
   });
+  const stage = document.getElementById('video-stage-container');
+  if (stage && stage._wakeHud) stage._wakeHud();
 }
 
 function toggleMediaPlayPause() {
@@ -1836,6 +1908,8 @@ function toggleMediaPlayPause() {
     player.pause();
   }
   updatePlayPauseIcons();
+  const stage = document.getElementById('video-stage-container');
+  if (stage && stage._wakeHud) stage._wakeHud();
 }
 
 function updatePlayPauseIcons() {
@@ -1859,6 +1933,8 @@ function toggleMediaMute() {
     muteBtn.innerHTML = `<svg data-lucide="${iconName}" width="14" height="14"></svg>`;
     lucide.createIcons();
   }
+  const stage = document.getElementById('video-stage-container');
+  if (stage && stage._wakeHud) stage._wakeHud();
 }
 
 function toggleVideoFullscreen() {
@@ -1884,7 +1960,9 @@ function getMediaCurrentTime() {
     return _activeMediaState.pendingSeekTarget;
   }
   const player = document.getElementById('active-media-player');
-  const pTime = (player && Number.isFinite(player.currentTime)) ? player.currentTime : 0;
+  const pTime = (!_activeMediaState.awaitingMetadata && player && Number.isFinite(player.currentTime))
+    ? player.currentTime
+    : 0;
   return Math.max(0, (_activeMediaState.seekOffset || 0) + pTime);
 }
 
@@ -1894,6 +1972,9 @@ function skipMediaBy(deltaSec) {
   const cur = getMediaCurrentTime();
   const maxDur = state.totalDuration > 0 ? Math.max(0, state.totalDuration - 0.5) : Infinity;
   const target = Math.max(0, Math.min(maxDur, cur + (Number(deltaSec) || 0)));
+
+  const stage = document.getElementById('video-stage-container');
+  if (stage && stage._wakeHud) stage._wakeHud();
 
   // Update timeline UI immediately for instant feedback on rapid skips
   state.pendingSeekTarget = target;
@@ -1929,14 +2010,18 @@ function skipMediaBy(deltaSec) {
   }
 }
 
-document.addEventListener('fullscreenchange', () => {
+function _onFullscreenChange() {
   const isFs = Boolean(document.fullscreenElement || document.webkitFullscreenElement);
   document.querySelectorAll('.fs-toggle-btn').forEach(btn => {
     btn.innerHTML = `<svg data-lucide="${isFs ? 'minimize' : 'maximize'}" width="14" height="14"></svg>`;
     btn.title = isFs ? 'Exit Fullscreen (F)' : 'Fullscreen (F)';
   });
   lucide.createIcons();
-});
+  const stage = document.getElementById('video-stage-container');
+  if (stage && stage._wakeHud) stage._wakeHud();
+}
+document.addEventListener('fullscreenchange', _onFullscreenChange);
+document.addEventListener('webkitfullscreenchange', _onFullscreenChange);
 
 document.addEventListener('keydown', (e) => {
   if (!_activeMediaState) return;
@@ -2005,6 +2090,8 @@ function fmtMediaTime(sec) {
 function onMediaTimelineScrubInput(val) {
   if (!_activeMediaState) return;
   _activeMediaState.isScrubbing = true;
+  const stage = document.getElementById('video-stage-container');
+  if (stage && stage._wakeHud) stage._wakeHud();
   const num = parseFloat(val) || 0;
   const fmt = fmtMediaTime(num);
   const curEl = document.getElementById('media-time-current');
@@ -2021,6 +2108,8 @@ function onMediaTimelineScrubChange(val) {
   if (!_activeMediaState) return;
   const targetSec = Math.max(0, parseFloat(val) || 0);
   _activeMediaState.isScrubbing = false;
+  const stage = document.getElementById('video-stage-container');
+  if (stage && stage._wakeHud) stage._wakeHud();
   if (_activeMediaState.seekTo) {
     _activeMediaState.seekTo(targetSec);
   }
@@ -2034,6 +2123,9 @@ function changeMediaAudioTrack(trackIdxStr) {
   const sel2 = document.getElementById('hud-audio-track-select');
   if (sel1 && sel1.value !== String(idx)) sel1.value = String(idx);
   if (sel2 && sel2.value !== String(idx)) sel2.value = String(idx);
+  if (sel2) try { sel2.blur(); } catch (_) {}
+  const stage = document.getElementById('video-stage-container');
+  if (stage && stage._wakeHud) stage._wakeHud();
   const curPos = getMediaCurrentTime();
   const targetMode = (_activeMediaState.mode === 'direct')
     ? (_activeMediaState.canRemux ? 'remux' : 'full')
@@ -2049,6 +2141,9 @@ function changeMediaSubtitleTrack(trackIdxStr) {
   const sel2 = document.getElementById('hud-subtitle-track-select');
   if (sel1 && sel1.value !== String(_activeMediaState.subtitleTrack)) sel1.value = String(_activeMediaState.subtitleTrack);
   if (sel2 && sel2.value !== String(_activeMediaState.subtitleTrack)) sel2.value = String(_activeMediaState.subtitleTrack);
+  if (sel2) try { sel2.blur(); } catch (_) {}
+  const stage = document.getElementById('video-stage-container');
+  if (stage && stage._wakeHud) stage._wakeHud();
   if (_activeMediaState.refreshSubtitles) {
     _activeMediaState.refreshSubtitles();
   }
@@ -2100,6 +2195,10 @@ function openMedia(fJson, type) {
     `<button class="hud-pill hud-zoom-btn ${Math.abs(_videoZoom - z.val) < 0.001 ? 'active' : ''}" data-zoom="${z.val}" onclick="event.stopPropagation();setVideoZoom(${z.val})" title="Fullscreen Zoom ${z.label}">${z.label}</button>`
   ).join('');
 
+  var btTitle = _btAudioDelayEnabled
+    ? 'Bluetooth Audio Delay: +30ms ON (Click to disable)'
+    : 'Bluetooth Audio Delay: OFF (Click for +30ms audio delay)';
+
   var mediaEl = isVid
     ? '<div id="video-stage-container" class="video-stage">'
         + '<video id="active-media-player" autoplay playsinline preload="auto" crossorigin="anonymous" '
@@ -2133,6 +2232,9 @@ function openMedia(fJson, type) {
         +       '</button>'
         +       '<button class="hud-btn" id="stage-mute-btn" onclick="toggleMediaMute()" title="Mute / Unmute (M)">'
         +         '<svg data-lucide="volume-2" width="14" height="14"></svg>'
+        +       '</button>'
+        +       '<button class="hud-btn bt-delay-btn ' + (_btAudioDelayEnabled ? 'active' : '') + '" id="stage-bt-btn" onclick="toggleBtAudioDelay()" title="' + btTitle + '">'
+        +         'BT'
         +       '</button>'
         +     '</div>'
         +     '<div class="video-hud-right">'
@@ -2203,7 +2305,8 @@ function openMedia(fJson, type) {
     +     '30s <svg data-lucide="rotate-cw" width="13" height="13"></svg>'
     +   '</button>'
     +   (isVid
-          ? '<button class="btn btn-secondary btn-sm fs-toggle-btn" onclick="toggleVideoFullscreen()" title="Fullscreen (F)" style="padding:4px 8px">'
+          ? '<button class="btn ' + (_btAudioDelayEnabled ? 'btn-primary active' : 'btn-secondary') + ' btn-sm bt-delay-btn" onclick="toggleBtAudioDelay()" title="' + btTitle + '" style="padding:4px 8px;font-family:var(--font-mono)">BT</button>'
+            + '<button class="btn btn-secondary btn-sm fs-toggle-btn" onclick="toggleVideoFullscreen()" title="Fullscreen (F)" style="padding:4px 8px">'
             + '<svg data-lucide="maximize" width="14" height="14"></svg></button>'
           : '')
     + '</div>'
@@ -2274,20 +2377,43 @@ function openMedia(fJson, type) {
 
   if (!player) return;
 
+  if (_btAudioDelayEnabled) {
+    applyBtAudioDelayToPlayer(player);
+  }
+
   if (stageContainer) {
+    let lastMouseX = -1;
+    let lastMouseY = -1;
     const wakeHud = () => {
       stageContainer.classList.remove('hud-hidden');
       if (_hudIdleTimer) clearTimeout(_hudIdleTimer);
       _hudIdleTimer = setTimeout(() => {
-        if (player && !player.paused && !_activeMediaState?.isScrubbing) {
+        if (!stageContainer) return;
+        if (_activeMediaState?.isScrubbing) {
+          wakeHud();
+          return;
+        }
+        const isFs = Boolean(document.fullscreenElement || document.webkitFullscreenElement);
+        if (isFs || (player && !player.paused)) {
           stageContainer.classList.add('hud-hidden');
         }
-      }, 2600);
+      }, 5000);
     };
-    stageContainer.addEventListener('mousemove', wakeHud);
+    stageContainer._wakeHud = wakeHud;
+    stageContainer.addEventListener('mousemove', (e) => {
+      if (Math.abs(e.clientX - lastMouseX) < 2 && Math.abs(e.clientY - lastMouseY) < 2) {
+        return;
+      }
+      lastMouseX = e.clientX;
+      lastMouseY = e.clientY;
+      wakeHud();
+    });
+    stageContainer.addEventListener('mousedown', wakeHud);
+    stageContainer.addEventListener('click', wakeHud);
     stageContainer.addEventListener('touchstart', wakeHud, { passive: true });
     stageContainer.addEventListener('mouseleave', () => {
-      if (player && !player.paused && !_activeMediaState?.isScrubbing && !document.fullscreenElement) {
+      const isFs = Boolean(document.fullscreenElement || document.webkitFullscreenElement);
+      if (player && !player.paused && !_activeMediaState?.isScrubbing && !isFs) {
         stageContainer.classList.add('hud-hidden');
       }
     });
@@ -2307,6 +2433,7 @@ function openMedia(fJson, type) {
     probeInfo: null,
     totalDuration: 0,
     seekOffset: 0,
+    awaitingMetadata: false,
     pendingSeekTarget: null,
     skipDebounceTimer: null,
     isScrubbing: false,
@@ -2365,11 +2492,24 @@ function openMedia(fJson, type) {
   state.refreshSubtitles = refreshSubtitles;
 
   function syncTimelineUi() {
-    const pDur = (player && Number.isFinite(player.duration) && player.duration > 0 && player.duration < 86400 * 7)
-      ? (state.seekOffset + player.duration)
-      : 0;
     const probeDur = (state.probeInfo && state.probeInfo.duration > 0) ? state.probeInfo.duration : 0;
-    const effTotal = Math.max(state.totalDuration || 0, probeDur, pDur);
+    const rawPlayerDur = (!state.awaitingMetadata && player && Number.isFinite(player.duration) && player.duration > 0 && player.duration < 86400 * 7)
+      ? player.duration
+      : 0;
+
+    let effTotal = state.totalDuration || 0;
+    if (probeDur > 0) {
+      if (state.mode === 'direct' && state.seekOffset === 0 && rawPlayerDur > 10 && rawPlayerDur < probeDur - 5) {
+        effTotal = rawPlayerDur;
+      } else {
+        effTotal = probeDur;
+      }
+    } else if (state.mode === 'direct' && state.seekOffset === 0 && rawPlayerDur > 0) {
+      effTotal = rawPlayerDur;
+    } else if (effTotal <= 0 && state.seekOffset === 0 && rawPlayerDur > 0) {
+      effTotal = rawPlayerDur;
+    }
+
     if (effTotal > 0) {
       state.totalDuration = effTotal;
       if (timelineBar) timelineBar.style.display = 'flex';
@@ -2381,9 +2521,12 @@ function openMedia(fJson, type) {
       if (stageTimeTotalEl) stageTimeTotalEl.textContent = totFmt;
     }
     if (!state.isScrubbing && state.pendingSeekTarget === null) {
+      const relTime = (!state.awaitingMetadata && player && Number.isFinite(player.currentTime))
+        ? player.currentTime
+        : 0;
       const curPos = Math.min(
         effTotal || Infinity,
-        Math.max(0, state.seekOffset + (Number.isFinite(player.currentTime) ? player.currentTime : 0))
+        Math.max(0, state.seekOffset + relTime)
       );
       const valStr = String(Math.round(curPos * 10) / 10);
       const curFmt = fmtMediaTime(curPos);
@@ -2430,6 +2573,7 @@ function openMedia(fJson, type) {
     const startSec = (typeof seekSeconds === 'number' && Number.isFinite(seekSeconds) && seekSeconds >= 0)
       ? seekSeconds
       : 0;
+    state.awaitingMetadata = true;
     state.seekOffset = (newMode === 'direct') ? 0 : startSec;
     updateCodecUi();
     syncTimelineUi();
@@ -2451,7 +2595,8 @@ function openMedia(fJson, type) {
     }
 
     let targetUrl = src;
-    const durParam = state.totalDuration > 0 ? `&duration=${encodeURIComponent(state.totalDuration.toFixed(2))}` : '';
+    const authDur = (state.probeInfo && state.probeInfo.duration > 0) ? state.probeInfo.duration : state.totalDuration;
+    const durParam = authDur > 0 ? `&duration=${encodeURIComponent(authDur.toFixed(2))}` : '';
     const ssParam = state.seekOffset > 0 ? `&ss=${encodeURIComponent(state.seekOffset.toFixed(2))}` : '';
     const cacheBust = `&_t=${Date.now()}`;
     if (newMode === 'remux') {
@@ -2526,12 +2671,17 @@ function openMedia(fJson, type) {
   state.seekTo = seekTo;
 
   player.playbackRate = _playbackRate;
-  player.onplay = () => updatePlayPauseIcons();
+  player.onplay = () => {
+    if (_btAudioDelayEnabled) applyBtAudioDelayToPlayer(player);
+    updatePlayPauseIcons();
+    if (stageContainer && stageContainer._wakeHud) stageContainer._wakeHud();
+  };
   player.onpause = () => {
     updatePlayPauseIcons();
     if (stageContainer) stageContainer.classList.remove('hud-hidden');
   };
   player.onloadedmetadata = () => {
+    state.awaitingMetadata = false;
     player.playbackRate = _playbackRate;
     syncTimelineUi();
     updateCodecUi();
@@ -2541,6 +2691,7 @@ function openMedia(fJson, type) {
     updateCodecUi();
   };
   player.onloadeddata = () => {
+    state.awaitingMetadata = false;
     player.playbackRate = _playbackRate;
     state.ignoreNextSeeking = false;
     if (statusWrap) statusWrap.style.display = 'none';
@@ -2548,6 +2699,7 @@ function openMedia(fJson, type) {
     updatePlayPauseIcons();
   };
   player.oncanplay = () => {
+    state.awaitingMetadata = false;
     player.playbackRate = _playbackRate;
     state.ignoreNextSeeking = false;
     if (statusWrap) statusWrap.style.display = 'none';
@@ -2562,17 +2714,31 @@ function openMedia(fJson, type) {
     }
   };
   player.onplaying = () => {
+    state.awaitingMetadata = false;
     state.ignoreNextSeeking = false;
+    if (_btAudioDelayEnabled) applyBtAudioDelayToPlayer(player);
     if (statusWrap) statusWrap.style.display = 'none';
     syncTimelineUi();
     updatePlayPauseIcons();
+    if (stageContainer && stageContainer._wakeHud) stageContainer._wakeHud();
   };
   player.onended = () => {
     updatePlayPauseIcons();
-    const absPos = state.seekOffset + (Number.isFinite(player.currentTime) ? player.currentTime : 0);
-    if (state.mode !== 'direct' && state.totalDuration > 0 && absPos < state.totalDuration - 5) {
-      switchMode(state.mode, false, absPos);
+    const relPlayed = (!state.awaitingMetadata && player && Number.isFinite(player.currentTime)) ? player.currentTime : 0;
+    const absPos = state.seekOffset + relPlayed;
+    if (state.mode !== 'direct' && relPlayed < 1.0 && state.seekOffset > 5) {
+      const safeEnd = Math.max(1, state.seekOffset - 2);
+      state.totalDuration = safeEnd;
+      if (state.probeInfo) state.probeInfo.duration = safeEnd;
+      syncTimelineUi();
+      updateCodecUi();
       return;
+    }
+    if (absPos > 5 && state.totalDuration > absPos + 2) {
+      state.totalDuration = absPos;
+      if (state.probeInfo) state.probeInfo.duration = absPos;
+      syncTimelineUi();
+      updateCodecUi();
     }
     if (_autoPlayNext && _mediaPlaylist.length > 1) {
       nextMediaTrack(type);

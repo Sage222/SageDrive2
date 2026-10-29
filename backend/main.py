@@ -1192,16 +1192,10 @@ def _parse_duration_val(val):
     if val is None:
         return 0.0
     if isinstance(val, (int, float)):
-        return float(val) if val > 0 else 0.0
+        return float(val) if (val > 0 and math.isfinite(val)) else 0.0
     s = str(val).strip()
     if not s or s.upper() == "N/A":
         return 0.0
-    try:
-        v = float(s)
-        if v > 0 and math.isfinite(v):
-            return v
-    except Exception:
-        pass
     m = re.match(r"^(\d+):(\d{1,2}):(\d{1,2}(?:\.\d+)?)", s)
     if m:
         try:
@@ -1211,24 +1205,110 @@ def _parse_duration_val(val):
             return hrs * 3600.0 + mins * 60.0 + secs
         except Exception:
             pass
+    try:
+        v = float(s)
+        if v > 0 and math.isfinite(v):
+            return v
+    except Exception:
+        pass
+    return 0.0
+
+def _parse_tag_duration(tags):
+    if not tags or not isinstance(tags, dict):
+        return 0.0
+    for k, v in tags.items():
+        kl = str(k).lower().strip()
+        if "ts" in kl:
+            continue
+        if kl == "duration" or kl.startswith("duration-") or kl.startswith("duration_"):
+            s = str(v or "").strip()
+            if ":" in s:
+                d = _parse_duration_val(s)
+                if d > 0:
+                    return d
+    return 0.0
+
+def _parse_fps(rate_str):
+    if not rate_str:
+        return 0.0
+    s = str(rate_str).strip()
+    if "/" in s:
+        parts = s.split("/", 1)
+        try:
+            num = float(parts[0])
+            den = float(parts[1])
+            if num > 0 and den > 0:
+                return num / den
+        except Exception:
+            return 0.0
+    try:
+        v = float(s)
+        return v if v > 0 else 0.0
+    except Exception:
+        return 0.0
+
+def _extract_stream_duration(st, is_video=False):
+    if not st or not isinstance(st, dict):
+        return 0.0
+    d = _parse_duration_val(st.get("duration"))
+    if d > 0:
+        return d
+    tags = st.get("tags") or {}
+    td = _parse_tag_duration(tags)
+    if td > 0:
+        return td
+    if is_video:
+        nb_frames = 0
+        raw_frames = st.get("nb_frames")
+        if raw_frames and str(raw_frames).isdigit():
+            nb_frames = int(raw_frames)
+        else:
+            for k, v in tags.items():
+                kl = str(k).lower().strip()
+                if kl == "number_of_frames" or kl.startswith("number_of_frames-"):
+                    if str(v).strip().isdigit():
+                        nb_frames = int(str(v).strip())
+                        break
+        if nb_frames > 0:
+            fps = _parse_fps(st.get("avg_frame_rate")) or _parse_fps(st.get("r_frame_rate"))
+            if fps > 0:
+                return nb_frames / fps
     return 0.0
 
 def _extract_probe_duration(fmt, streams):
-    candidates = [
-        _parse_duration_val((fmt or {}).get("duration")),
+    fmt_dur = _parse_duration_val((fmt or {}).get("duration"))
+    if fmt_dur <= 0:
+        fmt_dur = _parse_tag_duration((fmt or {}).get("tags"))
+
+    non_cover_videos = [
+        s for s in (streams or [])
+        if s.get("codec_type") == "video"
+        and (s.get("codec_name") or "").lower() not in ("mjpeg", "png", "bmp", "gif", "webp")
     ]
-    fmt_tags = (fmt or {}).get("tags") or {}
-    for k, v in fmt_tags.items():
-        if str(k).lower().startswith("duration"):
-            candidates.append(_parse_duration_val(v))
-    for st in (streams or []):
-        candidates.append(_parse_duration_val(st.get("duration")))
-        st_tags = st.get("tags") or {}
-        for k, v in st_tags.items():
-            if str(k).lower().startswith("duration"):
-                candidates.append(_parse_duration_val(v))
-    valid = [c for c in candidates if c and c > 0 and math.isfinite(c)]
-    return max(valid) if valid else 0.0
+    audio_streams = [s for s in (streams or []) if s.get("codec_type") == "audio"]
+
+    video_durs = [d for d in (_extract_stream_duration(s, is_video=True) for s in non_cover_videos) if d > 0]
+    audio_durs = [d for d in (_extract_stream_duration(s, is_video=False) for s in audio_streams) if d > 0]
+
+    video_dur = video_durs[0] if video_durs else 0.0
+    audio_dur = audio_durs[0] if audio_durs else 0.0
+
+    if non_cover_videos:
+        if video_dur > 5:
+            if audio_dur > 5 and abs(video_dur - audio_dur) <= 20:
+                return max(video_dur, audio_dur)
+            if 5 < fmt_dur < video_dur and (video_dur - fmt_dur) <= 30:
+                return fmt_dur
+            return video_dur
+        if audio_dur > 5 and fmt_dur > audio_dur + 20:
+            return audio_dur
+        if fmt_dur > 0:
+            return fmt_dur
+        return audio_dur
+
+    if audio_dur > 5 and (fmt_dur <= 0 or fmt_dur > audio_dur + 15):
+        return audio_dur
+    return fmt_dur if fmt_dur > 0 else audio_dur
 
 def _analyze_probe_data(data, filename=""):
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
@@ -1337,24 +1417,25 @@ def _analyze_probe_data(data, filename=""):
     }
 
 def probe_media_info(cache_key, internal_url, filename="", fallback_gen_fn=None):
+    cache_key = f"v2:{cache_key}"
     now = time.time()
     cached = _PROBE_CACHE.get(cache_key)
     if cached and (now - cached[0]) < _PROBE_TTL:
         return cached[1]
 
-    show_entries = "stream=index,codec_type,codec_name,profile,pix_fmt,channels,sample_rate,duration:stream_disposition=default,forced:stream_tags:format=format_name,duration:format_tags"
+    show_entries = "stream=index,codec_type,codec_name,profile,pix_fmt,channels,sample_rate,duration,nb_frames,avg_frame_rate,r_frame_rate:stream_disposition=default,forced:stream_tags:format=format_name,duration:format_tags"
     cmd = [
         "ffprobe",
         "-v", "error",
-        "-probesize", "10000000",
-        "-analyzeduration", "10000000",
+        "-probesize", "5000000",
+        "-analyzeduration", "5000000",
         "-show_entries", show_entries,
         "-of", "json",
         internal_url,
     ]
     data = None
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
         if res.returncode == 0 and res.stdout.strip():
             parsed = json.loads(res.stdout)
             if parsed.get("streams"):
@@ -1368,8 +1449,8 @@ def probe_media_info(cache_key, internal_url, filename="", fallback_gen_fn=None)
                 [
                     "ffprobe",
                     "-v", "error",
-                    "-probesize", "8000000",
-                    "-analyzeduration", "8000000",
+                    "-probesize", "5000000",
+                    "-analyzeduration", "5000000",
                     "-show_entries", show_entries,
                     "-of", "json",
                     "pipe:0",
@@ -1382,7 +1463,7 @@ def probe_media_info(cache_key, internal_url, filename="", fallback_gen_fn=None)
             sent = 0
             try:
                 for chunk in gen:
-                    if proc.poll() is not None or sent >= 8 * 1024 * 1024:
+                    if proc.poll() is not None or sent >= 5 * 1024 * 1024:
                         break
                     proc.stdin.write(chunk)
                     sent += len(chunk)
@@ -1433,7 +1514,9 @@ def _patch_mp4_moov_duration(chunk, duration_sec):
                     if ver == 0 and sz >= 28:
                         ts = struct.unpack(">I", b[pos+20:pos+24])[0] or 1000
                         mvhd_ts[0] = ts
-                        struct.pack_into(">I", b, pos+24, min(0xFFFFFFFF, int(round(duration_sec * ts))))
+                        scaled = int(round(duration_sec * ts))
+                        if 0 < scaled <= 0x7FFFFFFF:
+                            struct.pack_into(">I", b, pos+24, scaled)
                     elif ver == 1 and sz >= 40:
                         ts = struct.unpack(">I", b[pos+28:pos+32])[0] or 1000
                         mvhd_ts[0] = ts
@@ -1442,14 +1525,18 @@ def _patch_mp4_moov_duration(chunk, duration_sec):
                     ver = b[pos+8]
                     ts = mvhd_ts[0]
                     if ver == 0 and sz >= 32:
-                        struct.pack_into(">I", b, pos+28, min(0xFFFFFFFF, int(round(duration_sec * ts))))
+                        scaled = int(round(duration_sec * ts))
+                        if 0 < scaled <= 0x7FFFFFFF:
+                            struct.pack_into(">I", b, pos+28, scaled)
                     elif ver == 1 and sz >= 44:
                         struct.pack_into(">Q", b, pos+36, int(round(duration_sec * ts)))
                 elif btype == b"mdhd":
                     ver = b[pos+8]
                     if ver == 0 and sz >= 28:
                         ts = struct.unpack(">I", b[pos+20:pos+24])[0] or 1000
-                        struct.pack_into(">I", b, pos+24, min(0xFFFFFFFF, int(round(duration_sec * ts))))
+                        scaled = int(round(duration_sec * ts))
+                        if 0 < scaled <= 0x7FFFFFFF:
+                            struct.pack_into(">I", b, pos+24, scaled)
                     elif ver == 1 and sz >= 40:
                         ts = struct.unpack(">I", b[pos+28:pos+32])[0] or 1000
                         struct.pack_into(">Q", b, pos+32, int(round(duration_sec * ts)))

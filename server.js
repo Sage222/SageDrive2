@@ -669,9 +669,9 @@ function probeMediaItem(item) {
 
     const ff = spawn('ffprobe', [
       '-v', 'error',
-      '-probesize', '10000000',
-      '-analyzeduration', '10000000',
-      '-show_entries', 'stream=index,codec_type,codec_name,profile,pix_fmt,channels,sample_rate,duration:stream_disposition=default,forced:stream_tags:format=format_name,duration:format_tags',
+      '-probesize', '5000000',
+      '-analyzeduration', '5000000',
+      '-show_entries', 'stream=index,codec_type,codec_name,profile,pix_fmt,channels,sample_rate,duration,nb_frames,avg_frame_rate,r_frame_rate:stream_disposition=default,forced:stream_tags:format=format_name,duration:format_tags',
       '-of', 'json',
       blobPath,
     ]);
@@ -770,19 +770,57 @@ function probeMediaItem(item) {
 
       const parseDur = (val) => {
         if (!val) return 0;
-        const n = parseFloat(val);
-        if (Number.isFinite(n) && n > 0 && !String(val).includes(':')) return n;
-        const m = /^(\d+):(\d{1,2}):(\d{1,2}(?:\.\d+)?)/.exec(String(val).trim());
+        const s = String(val).trim();
+        const m = /^(\d+):(\d{1,2}):(\d{1,2}(?:\.\d+)?)/.exec(s);
         if (m) return parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60 + parseFloat(m[3]);
+        const n = parseFloat(s);
         return Number.isFinite(n) && n > 0 ? n : 0;
       };
-      let maxDur = parseDur(fmt.duration);
-      for (const s of streams) {
-        maxDur = Math.max(maxDur, parseDur(s.duration));
-        const stTags = s.tags || {};
-        for (const [k, v] of Object.entries(stTags)) {
-          if (String(k).toLowerCase().startsWith('duration')) maxDur = Math.max(maxDur, parseDur(v));
+      const parseTagDur = (tags) => {
+        if (!tags || typeof tags !== 'object') return 0;
+        for (const [k, v] of Object.entries(tags)) {
+          const kl = String(k).toLowerCase().trim();
+          if (kl.includes('ts')) continue;
+          if (kl === 'duration' || kl.startsWith('duration-') || kl.startsWith('duration_')) {
+            const sv = String(v || '').trim();
+            if (sv.includes(':')) {
+              const d = parseDur(sv);
+              if (d > 0) return d;
+            }
+          }
         }
+        return 0;
+      };
+      const extractStreamDur = (st) => {
+        if (!st) return 0;
+        const d = parseDur(st.duration);
+        if (d > 0) return d;
+        return parseTagDur(st.tags);
+      };
+
+      const fmtDur = parseDur(fmt.duration) || parseTagDur(fmt.tags);
+      const videoDur = nonCoverVideos.length ? extractStreamDur(nonCoverVideos[0]) : 0;
+      const audioDur = audioStreams.length ? extractStreamDur(audioStreams[0]) : 0;
+
+      let finalDur = 0;
+      if (nonCoverVideos.length) {
+        if (videoDur > 5) {
+          if (audioDur > 5 && Math.abs(videoDur - audioDur) <= 20) {
+            finalDur = Math.max(videoDur, audioDur);
+          } else if (fmtDur > 5 && fmtDur < videoDur && (videoDur - fmtDur) <= 30) {
+            finalDur = fmtDur;
+          } else {
+            finalDur = videoDur;
+          }
+        } else if (audioDur > 5 && fmtDur > audioDur + 20) {
+          finalDur = audioDur;
+        } else {
+          finalDur = fmtDur || audioDur || 0;
+        }
+      } else {
+        finalDur = (audioDur > 5 && (fmtDur <= 0 || fmtDur > audioDur + 15))
+          ? audioDur
+          : (fmtDur || audioDur || 0);
       }
 
       resolve({
@@ -794,7 +832,7 @@ function probeMediaItem(item) {
         audio_channels: audioChannels,
         audio_streams: audioTracksOut,
         subtitle_streams: subtitleTracksOut,
-        duration: maxDur,
+        duration: finalDur,
         needs_audio_transcode: needsAudioTranscode,
         needs_video_transcode: needsVideoTranscode,
         can_remux_video: canRemuxVideo,
@@ -852,18 +890,27 @@ function patchMp4MoovDuration(chunk, durationSec) {
           const ver = b[pos + 8];
           if (ver === 0 && sz >= 28) {
             mvhdTs = b.readUInt32BE(pos + 20) || 1000;
-            b.writeUInt32BE(Math.min(0xFFFFFFFF, Math.round(durationSec * mvhdTs)), pos + 24);
+            const scaled = Math.round(durationSec * mvhdTs);
+            if (scaled > 0 && scaled <= 0x7FFFFFFF) {
+              b.writeUInt32BE(scaled, pos + 24);
+            }
           }
         } else if (btype === 'tkhd') {
           const ver = b[pos + 8];
           if (ver === 0 && sz >= 32) {
-            b.writeUInt32BE(Math.min(0xFFFFFFFF, Math.round(durationSec * mvhdTs)), pos + 28);
+            const scaled = Math.round(durationSec * mvhdTs);
+            if (scaled > 0 && scaled <= 0x7FFFFFFF) {
+              b.writeUInt32BE(scaled, pos + 28);
+            }
           }
         } else if (btype === 'mdhd') {
           const ver = b[pos + 8];
           if (ver === 0 && sz >= 28) {
             const ts = b.readUInt32BE(pos + 20) || 1000;
-            b.writeUInt32BE(Math.min(0xFFFFFFFF, Math.round(durationSec * ts)), pos + 24);
+            const scaled = Math.round(durationSec * ts);
+            if (scaled > 0 && scaled <= 0x7FFFFFFF) {
+              b.writeUInt32BE(scaled, pos + 24);
+            }
           }
         } else if (btype === 'moov' || btype === 'trak' || btype === 'mdia') {
           walk(b, pos + 8, pos + sz);

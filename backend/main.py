@@ -1916,33 +1916,44 @@ def api_save_theme():
         return jsonify({"error": str(e)}), 400
 
 # ── Lossless.dll Upscaling & Frame Generation Settings ────────────────────────
-_LOSSLESS_DIR = Path("/data/lossless")
+_LOSSLESS_BASE_DIR = getattr(auth, "DATA_DIR", Path(os.environ.get("DATA_DIR", "/app/data")))
+_LOSSLESS_DIR = _LOSSLESS_BASE_DIR / "lossless"
 _LOSSLESS_DLL_PATH = _LOSSLESS_DIR / "Lossless.dll"
-_LOSSLESS_CFG_FILE = Path("/data/lossless_config.json")
+_LOSSLESS_CFG_FILE = _LOSSLESS_BASE_DIR / "lossless_config.json"
+
+_LEGACY_LOSSLESS_DLL_PATH = Path("/data/lossless/Lossless.dll")
+_LEGACY_LOSSLESS_CFG_FILE = Path("/data/lossless_config.json")
 _lossless_lock = threading.Lock()
 
 _DEFAULT_LOSSLESS_CFG = {
-    "dll_installed": False,
-    "dll_filename": "",
-    "dll_size": 0,
-    "dll_sha256": "",
-    "dll_arch": "",
-    "dll_uploaded_at": "",
     "enabled": False,
     "upscale_type": "ls1",
     "scale_factor": 1.5,
-    "sharpness": 55,
+    "sharpness": 0.55,
     "frame_gen": "lsfg3_2x",
     "performance_mode": False,
     "hdr_boost": False,
     "show_fps_overlay": True,
 }
 
+def _migrate_legacy_lossless_files():
+    try:
+        if not _LOSSLESS_DLL_PATH.exists() and _LEGACY_LOSSLESS_DLL_PATH.exists():
+            _LOSSLESS_DIR.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(_LEGACY_LOSSLESS_DLL_PATH, _LOSSLESS_DLL_PATH)
+        if not _LOSSLESS_CFG_FILE.exists() and _LEGACY_LOSSLESS_CFG_FILE.exists():
+            _LOSSLESS_CFG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(_LEGACY_LOSSLESS_CFG_FILE, _LOSSLESS_CFG_FILE)
+    except Exception:
+        pass
+
 def _inspect_dll_bytes(data_bytes):
     sz = len(data_bytes)
     sha = hashlib.sha256(data_bytes).hexdigest()
+    valid_pe = False
     arch = "Custom DLL Binary"
     if sz >= 64 and data_bytes[:2] == b"MZ":
+        valid_pe = True
         arch = "Windows PE DLL"
         try:
             pe_offset = struct.unpack("<I", data_bytes[0x3C:0x40])[0]
@@ -1954,42 +1965,88 @@ def _inspect_dll_bytes(data_bytes):
                     arch = "x86 PE32 (i386)"
                 elif machine == 0xAA64:
                     arch = "ARM64 PE32+"
+                else:
+                    arch = f"PE (0x{machine:04x})"
         except Exception:
             pass
-    return {"size": sz, "sha256": sha, "arch": arch}
+    return {"size": sz, "sha256": sha, "arch": arch, "valid_pe": valid_pe}
+
+def _normalize_sharpness(val, default=0.55):
+    try:
+        num = float(val)
+        if math.isnan(num) or math.isinf(num):
+            return default
+        if num > 1.0:
+            num = num / 100.0
+        return round(max(0.0, min(1.0, num)), 4)
+    except Exception:
+        return default
 
 def _load_lossless_cfg():
     with _lossless_lock:
+        _migrate_legacy_lossless_files()
         cfg = dict(_DEFAULT_LOSSLESS_CFG)
         if _LOSSLESS_CFG_FILE.exists():
             try:
                 loaded = json.loads(_LOSSLESS_CFG_FILE.read_text())
                 if isinstance(loaded, dict):
-                    cfg.update(loaded)
+                    for k in _DEFAULT_LOSSLESS_CFG:
+                        if k in loaded:
+                            cfg[k] = loaded[k]
             except Exception:
                 pass
+
+        cfg["sharpness"] = _normalize_sharpness(cfg.get("sharpness", 0.55))
+        try:
+            cfg["scale_factor"] = max(1.0, min(3.0, float(cfg.get("scale_factor", 1.5))))
+        except Exception:
+            cfg["scale_factor"] = 1.5
+
         dll_exists = _LOSSLESS_DLL_PATH.exists() and _LOSSLESS_DLL_PATH.stat().st_size >= 16
-        cfg["dll_installed"] = bool(dll_exists)
+        dll_info = {
+            "provided": False,
+            "filename": "Lossless.dll",
+            "size": 0,
+            "sha256": "",
+            "valid_pe": False,
+            "arch": "",
+            "uploaded_at": 0,
+        }
+        if dll_exists:
+            try:
+                st = _LOSSLESS_DLL_PATH.stat()
+                meta = _inspect_dll_bytes(_LOSSLESS_DLL_PATH.read_bytes())
+                dll_info = {
+                    "provided": True,
+                    "filename": "Lossless.dll",
+                    "size": meta["size"],
+                    "sha256": meta["sha256"],
+                    "valid_pe": meta["valid_pe"],
+                    "arch": meta["arch"],
+                    "uploaded_at": int(st.st_mtime),
+                }
+            except Exception:
+                dll_exists = False
+
         if not dll_exists:
             cfg["enabled"] = False
-            cfg["dll_size"] = 0
-            cfg["dll_sha256"] = ""
-            cfg["dll_arch"] = ""
-        elif not cfg.get("dll_sha256"):
-            try:
-                info = _inspect_dll_bytes(_LOSSLESS_DLL_PATH.read_bytes())
-                cfg["dll_filename"] = "Lossless.dll"
-                cfg["dll_size"] = info["size"]
-                cfg["dll_sha256"] = info["sha256"]
-                cfg["dll_arch"] = info["arch"]
-            except Exception:
-                pass
-        return cfg
+
+        return {
+            **cfg,
+            "dll_installed": bool(dll_exists),
+            "dll_filename": dll_info["filename"] if dll_exists else "",
+            "dll_size": dll_info["size"],
+            "dll_sha256": dll_info["sha256"],
+            "dll_arch": dll_info["arch"],
+            "dll": dll_info,
+        }
 
 def _save_lossless_cfg(cfg):
     with _lossless_lock:
+        to_save = {k: cfg.get(k, _DEFAULT_LOSSLESS_CFG[k]) for k in _DEFAULT_LOSSLESS_CFG}
+        to_save["sharpness"] = _normalize_sharpness(to_save.get("sharpness", 0.55))
         _LOSSLESS_CFG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _LOSSLESS_CFG_FILE.write_text(json.dumps(cfg, indent=2))
+        _LOSSLESS_CFG_FILE.write_text(json.dumps(to_save, indent=2))
 
 @app.get("/api/settings/lossless")
 @auth.require_auth
@@ -1999,42 +2056,48 @@ def api_get_lossless_settings():
 @app.post("/api/settings/lossless")
 @auth.require_auth
 def api_save_lossless_settings():
-    b = request.get_json(force=True) or {}
+    b = request.get_json(force=True, silent=True) or {}
     cfg = _load_lossless_cfg()
-    want_enabled = bool(b.get("enabled", cfg["enabled"]))
-    if want_enabled and not cfg.get("dll_installed"):
-        return jsonify({"error": "Please upload your Lossless.dll binary first before enabling Upscaling & Frame Generation."}), 400
+    dll_exists = bool(cfg.get("dll", {}).get("provided") or cfg.get("dll_installed"))
+
+    if "enabled" in b:
+        want_enabled = bool(b.get("enabled"))
+        if want_enabled and not dll_exists:
+            return jsonify({"error": "Please upload your Lossless.dll binary first before enabling Upscaling & Frame Generation."}), 400
+        cfg["enabled"] = want_enabled and dll_exists
 
     valid_upscalers = {"ls1", "fsr", "nis", "anime4k", "off"}
-    utype = str(b.get("upscale_type", cfg["upscale_type"])).strip().lower()
-    if utype in valid_upscalers:
-        cfg["upscale_type"] = utype
+    if "upscale_type" in b:
+        utype = str(b.get("upscale_type", cfg["upscale_type"])).strip().lower()
+        if utype in valid_upscalers:
+            cfg["upscale_type"] = utype
 
-    try:
-        sf = float(b.get("scale_factor", cfg["scale_factor"]))
-        if sf in (1.0, 1.25, 1.5, 2.0):
-            cfg["scale_factor"] = sf
-    except Exception:
-        pass
+    if "scale_factor" in b:
+        try:
+            sf = float(b.get("scale_factor", cfg["scale_factor"]))
+            if not math.isnan(sf) and not math.isinf(sf):
+                cfg["scale_factor"] = max(1.0, min(3.0, sf))
+        except Exception:
+            pass
 
-    try:
-        sharp = int(b.get("sharpness", cfg["sharpness"]))
-        cfg["sharpness"] = max(0, min(100, sharp))
-    except Exception:
-        pass
+    if "sharpness" in b:
+        cfg["sharpness"] = _normalize_sharpness(b.get("sharpness"), cfg["sharpness"])
 
     valid_fg = {"off", "lsfg3_2x", "lsfg3_3x", "lsfg3_4x"}
-    fg = str(b.get("frame_gen", cfg["frame_gen"])).strip().lower()
-    if fg in valid_fg:
-        cfg["frame_gen"] = fg
+    if "frame_gen" in b:
+        fg = str(b.get("frame_gen", cfg["frame_gen"])).strip().lower()
+        if fg in valid_fg:
+            cfg["frame_gen"] = fg
 
-    cfg["enabled"] = want_enabled
-    cfg["performance_mode"] = bool(b.get("performance_mode", cfg["performance_mode"]))
-    cfg["hdr_boost"] = bool(b.get("hdr_boost", cfg["hdr_boost"]))
-    cfg["show_fps_overlay"] = bool(b.get("show_fps_overlay", cfg["show_fps_overlay"]))
+    if "performance_mode" in b:
+        cfg["performance_mode"] = bool(b.get("performance_mode"))
+    if "hdr_boost" in b:
+        cfg["hdr_boost"] = bool(b.get("hdr_boost"))
+    if "show_fps_overlay" in b:
+        cfg["show_fps_overlay"] = bool(b.get("show_fps_overlay"))
 
     _save_lossless_cfg(cfg)
-    return jsonify(cfg)
+    return jsonify(_load_lossless_cfg())
 
 @app.post("/api/settings/lossless-dll")
 @auth.require_auth
@@ -2046,42 +2109,30 @@ def api_upload_lossless_dll():
     if not fname.lower().endswith(".dll"):
         return jsonify({"error": "Invalid file type. Please upload Lossless.dll (.dll binary)."}), 400
     data = f.read()
-    if len(data) < 16:
-        return jsonify({"error": "Uploaded Lossless.dll file is empty or corrupted."}), 400
+    if len(data) < 64:
+        return jsonify({"error": "Uploaded Lossless.dll file is empty or too small to be a valid binary."}), 400
 
     _LOSSLESS_DIR.mkdir(parents=True, exist_ok=True)
     _LOSSLESS_DLL_PATH.write_bytes(data)
 
-    info = _inspect_dll_bytes(data)
     cfg = _load_lossless_cfg()
-    cfg["dll_installed"] = True
-    cfg["dll_filename"] = "Lossless.dll"
-    cfg["dll_size"] = info["size"]
-    cfg["dll_sha256"] = info["sha256"]
-    cfg["dll_arch"] = info["arch"]
-    cfg["dll_uploaded_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     cfg["enabled"] = True
     _save_lossless_cfg(cfg)
-    return jsonify(cfg)
+    return jsonify(_load_lossless_cfg())
 
 @app.delete("/api/settings/lossless-dll")
 @auth.require_auth
 def api_delete_lossless_dll():
-    try:
-        if _LOSSLESS_DLL_PATH.exists():
-            _LOSSLESS_DLL_PATH.unlink()
-    except Exception:
-        pass
+    for p in (_LOSSLESS_DLL_PATH, _LEGACY_LOSSLESS_DLL_PATH):
+        try:
+            if p.exists():
+                p.unlink()
+        except Exception:
+            pass
     cfg = _load_lossless_cfg()
-    cfg["dll_installed"] = False
-    cfg["dll_filename"] = ""
-    cfg["dll_size"] = 0
-    cfg["dll_sha256"] = ""
-    cfg["dll_arch"] = ""
-    cfg["dll_uploaded_at"] = ""
     cfg["enabled"] = False
     _save_lossless_cfg(cfg)
-    return jsonify(cfg)
+    return jsonify(_load_lossless_cfg())
 
 # ── SMB ───────────────────────────────────────────────────────────────────────
 @app.get("/api/smb/shares")

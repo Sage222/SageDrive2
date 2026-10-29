@@ -1,6 +1,6 @@
 {
-  "summary":  "Implementation plan for adding Microsoft OneDrive multi-account integration (with SMB Proxy support), embedded MKV/MP4 subtitle extraction and playback, and Audio + Subtitle track selectors in the Fullscreen HUD.",
-  "updatedAt":  "2026-10-26T23:15:40.160395052Z",
+  "summary":  "Plan to fix the Lossless.dll toggle & payload schema mismatch between the Python Docker backend and the frontend UI, and persist Lossless.dll inside /app/data so it survives container restarts without requiring a full image rebuild.",
+  "updatedAt":  "2026-10-29T03:15:54.160316937Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

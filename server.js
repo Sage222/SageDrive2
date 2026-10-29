@@ -1328,6 +1328,11 @@ function getLosslessStatusPayload() {
   }
   return {
     ...cfg,
+    dll_installed: Boolean(dllInfo.provided),
+    dll_filename: dllInfo.provided ? dllInfo.filename : '',
+    dll_size: dllInfo.size,
+    dll_sha256: dllInfo.sha256,
+    dll_arch: dllInfo.arch,
     dll: dllInfo,
   };
 }
@@ -1353,8 +1358,11 @@ app.post('/api/settings/lossless', requireAuth, (req, res) => {
     if (!Number.isNaN(sf)) cfg.scale_factor = Math.max(1.0, Math.min(3.0, sf));
   }
   if ('sharpness' in b) {
-    const sh = Number(b.sharpness);
-    if (!Number.isNaN(sh)) cfg.sharpness = Math.max(0.0, Math.min(1.0, sh));
+    let sh = Number(b.sharpness);
+    if (!Number.isNaN(sh)) {
+      if (sh > 1.0) sh = sh / 100.0;
+      cfg.sharpness = Math.max(0.0, Math.min(1.0, sh));
+    }
   }
   if ('frame_gen' in b) {
     const fg = String(b.frame_gen || 'lsfg3_2x').trim().toLowerCase();

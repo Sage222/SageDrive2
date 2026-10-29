@@ -1791,6 +1791,40 @@ function toggleBtAudioDelay() {
   );
 }
 
+function normalizeLosslessConfig(raw) {
+  const r = (raw && typeof raw === 'object') ? raw : {};
+  const subDll = (r.dll && typeof r.dll === 'object') ? r.dll : {};
+  const provided = Boolean(subDll.provided || r.dll_installed || (subDll.size > 0) || (r.dll_size > 0));
+  let rawSharp = Number(r.sharpness ?? 0.55);
+  if (Number.isNaN(rawSharp)) rawSharp = 0.55;
+  if (rawSharp > 1.0) rawSharp = rawSharp / 100.0;
+  rawSharp = Math.max(0.0, Math.min(1.0, rawSharp));
+
+  let sf = Number(r.scale_factor ?? 1.5);
+  if (Number.isNaN(sf) || sf < 1.0) sf = 1.5;
+
+  return {
+    enabled: provided ? Boolean(r.enabled) : false,
+    upscale_type: String(r.upscale_type || 'ls1').toLowerCase(),
+    scale_factor: sf,
+    sharpness: rawSharp,
+    frame_gen: String(r.frame_gen || 'lsfg3_2x').toLowerCase(),
+    performance_mode: Boolean(r.performance_mode),
+    hdr_boost: Boolean(r.hdr_boost),
+    show_fps_overlay: r.show_fps_overlay !== false,
+    dll_installed: provided,
+    dll: {
+      provided,
+      filename: subDll.filename || r.dll_filename || 'Lossless.dll',
+      size: Number(subDll.size || r.dll_size || 0),
+      sha256: String(subDll.sha256 || r.dll_sha256 || ''),
+      valid_pe: Boolean(subDll.valid_pe ?? (provided && (subDll.arch || r.dll_arch || '').includes('PE'))),
+      arch: String(subDll.arch || r.dll_arch || (provided ? 'PE Binary' : '')),
+      uploaded_at: subDll.uploaded_at || r.dll_uploaded_at || 0,
+    },
+  };
+}
+
 function getLosslessUpscalerLabel(ut) {
   const map = { off: 'Native', ls1: 'LS1', fsr: 'AMD FSR', nis: 'NVIDIA NIS', anime4k: 'Anime4K' };
   return map[ut] || 'LS1';
@@ -2022,10 +2056,11 @@ async function toggleLosslessPlayback() {
   applyLosslessPipelineToActivePlayer();
 
   try {
-    _losslessConfig = await apiJSON('/api/settings/lossless', {
+    const res = await apiJSON('/api/settings/lossless', {
       method: 'POST',
       json: { enabled: nextEnabled },
     });
+    _losslessConfig = normalizeLosslessConfig(res);
     applyLosslessPipelineToActivePlayer();
     toast(
       _losslessConfig.enabled
@@ -5464,7 +5499,8 @@ async function renderSettings() {
     ` : ''}
 
     ${showUpscaling ? (() => {
-      const dll = (_losslessConfig && _losslessConfig.dll) ? _losslessConfig.dll : { provided: false };
+      _losslessConfig = normalizeLosslessConfig(_losslessConfig);
+      const dll = _losslessConfig.dll;
       const hasDll = Boolean(dll.provided);
       const sharpPct = Math.round((Number(_losslessConfig.sharpness ?? 0.55)) * 100);
       return `
@@ -5657,7 +5693,7 @@ async function refreshLosslessSettings() {
   try {
     const res = await apiJSON('/api/settings/lossless');
     if (res && typeof res === 'object') {
-      _losslessConfig = res;
+      _losslessConfig = normalizeLosslessConfig(res);
     }
   } catch (_) {}
 }
@@ -5686,7 +5722,7 @@ async function onSelectLosslessDllFile(inputEl) {
     if (!r.ok) {
       throw new Error(data.error || 'Failed to upload Lossless.dll');
     }
-    _losslessConfig = data;
+    _losslessConfig = normalizeLosslessConfig(data);
     applyLosslessPipelineToActivePlayer();
     toast('Lossless.dll verified and loaded! Upscaling & Frame Generation enabled.', 'success');
     if (_view === 'settings') renderSettings();
@@ -5701,7 +5737,7 @@ async function onSelectLosslessDllFile(inputEl) {
 async function removeLosslessDll() {
   try {
     const data = await apiJSON('/api/settings/lossless-dll', { method: 'DELETE' });
-    _losslessConfig = data;
+    _losslessConfig = normalizeLosslessConfig(data);
     applyLosslessPipelineToActivePlayer();
     toast('Lossless.dll removed', 'info');
     if (_view === 'settings') renderSettings();
@@ -5732,10 +5768,11 @@ async function saveLosslessSettings(showToastMsg = false) {
   };
 
   try {
-    _losslessConfig = await apiJSON('/api/settings/lossless', {
+    const res = await apiJSON('/api/settings/lossless', {
       method: 'POST',
       json: payload,
     });
+    _losslessConfig = normalizeLosslessConfig(res);
     applyLosslessPipelineToActivePlayer();
     if (showToastMsg) {
       toast('Upscaling & Frame Generation settings saved', 'success');

@@ -333,29 +333,8 @@
     .video-stage:fullscreen video,.video-stage:-webkit-full-screen video{
       max-height:100vh;width:100vw;height:100vh;object-fit:contain;
     }
-    .video-lsfg-canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;
-                       pointer-events:none;z-index:4;opacity:0;display:none;transform-origin:center center;
-                       transition:transform 160ms ease}
-    .video-subtitle-overlay{position:absolute;left:6%;right:6%;bottom:68px;z-index:7;
-                            pointer-events:none;text-align:center;display:none;
-                            flex-direction:column;align-items:center;gap:4px}
-    .video-stage.hud-hidden .video-subtitle-overlay{bottom:24px}
-    .video-subtitle-line{background:rgba(0,0,0,.78);color:#fff;font-family:var(--font-body);
-                         font-size:clamp(.95rem,1.8vw,1.35rem);line-height:1.35;
-                         padding:3px 10px;border-radius:4px;text-shadow:0 1px 3px rgba(0,0,0,.9);
-                         max-width:100%;word-break:break-word}
-    .video-lsfg-telemetry{position:absolute;top:10px;left:12px;z-index:9;pointer-events:none;
-                          background:rgba(10,14,18,.78);backdrop-filter:blur(6px);
-                          border:1px solid rgba(45,212,191,.35);border-radius:var(--radius-sm);
-                          padding:3px 8px;font-family:var(--font-mono);font-size:10.5px;
-                          color:#e6edf3;display:none;align-items:center;gap:6px;
-                          box-shadow:0 2px 10px rgba(0,0,0,.45);
-                          transition:opacity 180ms ease, transform 180ms ease}
-    .video-lsfg-dot{width:6px;height:6px;border-radius:50%;background:var(--color-primary);
-                    box-shadow:0 0 6px var(--color-primary)}
     .video-stage.hud-hidden{cursor:none}
     .video-stage.hud-hidden .video-stage-hud{opacity:0;pointer-events:none;transform:translateY(8px)}
-    .video-stage.hud-hidden .video-lsfg-telemetry{opacity:0;pointer-events:none;transform:translateY(-8px)}
     .video-stage-hud{position:absolute;left:0;right:0;bottom:0;z-index:10;
                      background:linear-gradient(to top, rgba(0,0,0,.88) 0%, rgba(0,0,0,.62) 68%, transparent 100%);
                      padding:var(--space-5) var(--space-3) var(--space-2);
@@ -706,18 +685,6 @@
 <div class="toast-container" id="toasts"></div>
 <div id="modal-root"></div>
 <div class="context-menu" id="context-menu"></div>
-<svg width="0" height="0" style="position:absolute;width:0;height:0;pointer-events:none;overflow:hidden" aria-hidden="true">
-  <defs>
-    <filter id="ls-upscale-filter" x="0%" y="0%" width="100%" height="100%" color-interpolation-filters="sRGB">
-      <feConvolveMatrix id="ls-convolve-matrix" order="3 3" kernelMatrix="0 -0.25 0 -0.25 2 -0.25 0 -0.25 0" divisor="1" bias="0" edgeMode="duplicate" preserveAlpha="true" result="sharpened"/>
-      <feComponentTransfer in="sharpened">
-        <feFuncR id="ls-func-r" type="linear" slope="1" intercept="0"/>
-        <feFuncG id="ls-func-g" type="linear" slope="1" intercept="0"/>
-        <feFuncB id="ls-func-b" type="linear" slope="1" intercept="0"/>
-      </feComponentTransfer>
-    </filter>
-  </defs>
-</svg>
 
 <script>
 const API = '';
@@ -761,13 +728,6 @@ try {
     if (Array.isArray(parsedFavs)) _favoriteFolders = parsedFavs;
   }
 } catch (_) {}
-let _losslessConfig = {
-  enabled: false,
-  scale_factor: 1.5,    // 1.0 (Off) | 1.25 (1.25x) | 1.5 (1.5x)
-  frame_gen: '2x',      // 'off' | '2x'
-  sharpness: 0.55,      // 0.0 .. 1.0
-  show_fps_overlay: true,
-};
 
 const DARK_THEMES = [
   {
@@ -1135,7 +1095,6 @@ async function initApp() {
   await refreshShares();
   await refreshGDStatus();
   await refreshODStatus();
-  await refreshLosslessSettings();
   await refreshFavorites();
   renderSidebar();
   setView('welcome');
@@ -2083,7 +2042,6 @@ let _activeMediaState = null;
 let _hudIdleTimer = null;
 let _btAudioDelayEnabled = false;
 let _sharedBtAudioCtx = null;
-let _lsfgRafId = null;
 
 function applyBtAudioDelayToPlayer(player) {
   if (!player) return;
@@ -2144,662 +2102,6 @@ function toggleBtAudioDelay() {
       : 'Bluetooth audio delay disabled',
     'info'
   );
-}
-
-let _lsfgVfcId = null;
-
-function normalizeLosslessConfig(raw) {
-  const r = (raw && typeof raw === 'object') ? raw : {};
-  let rawSharp = Number(r.sharpness ?? 0.55);
-  if (Number.isNaN(rawSharp)) rawSharp = 0.55;
-  if (rawSharp > 1.0) rawSharp = rawSharp / 100.0;
-  rawSharp = Math.max(0.0, Math.min(1.0, rawSharp));
-
-  let sf = Number(r.scale_factor ?? 1.5);
-  if (Number.isNaN(sf)) sf = 1.5;
-  if (sf <= 1.05) sf = 1.0;
-  else if (sf <= 1.37) sf = 1.25;
-  else sf = 1.5;
-
-  const fgRaw = String(r.frame_gen || '2x').trim().toLowerCase();
-  const fg = ['off', 'none', '0', 'false', '1x'].includes(fgRaw) ? 'off' : '2x';
-
-  return {
-    enabled: Boolean(r.enabled),
-    scale_factor: sf,
-    frame_gen: fg,
-    sharpness: rawSharp,
-    show_fps_overlay: r.show_fps_overlay !== false,
-  };
-}
-
-function getUpscaleSummaryLabel(cfg = _losslessConfig) {
-  const sf = Number(cfg?.scale_factor || 1.5);
-  const upStr = sf > 1.05 ? `${sf}x Upscale` : 'Native 1.0x';
-  const fgStr = cfg?.frame_gen === '2x' ? '2x Frame Gen' : 'FG Off';
-  return `${upStr} • ${fgStr}`;
-}
-
-function getLosslessButtonTitle() {
-  const summary = getUpscaleSummaryLabel(_losslessConfig);
-  return _losslessConfig?.enabled
-    ? `GPU Upscaling & Frame Gen ON (${summary}) — Click to disable`
-    : `GPU Upscaling & Frame Gen OFF (${summary}) — Click to enable`;
-}
-
-function getFrameGenButtonTitle() {
-  const isFgOn = Boolean(_losslessConfig?.enabled && _losslessConfig?.frame_gen === '2x');
-  return isFgOn
-    ? '2x Frame Generation ON — Click to disable 2x motion interpolation'
-    : '2x Frame Generation OFF — Click to enable 2x motion interpolation';
-}
-
-function updateLosslessButtons() {
-  const isAct = Boolean(_losslessConfig?.enabled);
-  const isFgOn = Boolean(isAct && _losslessConfig?.frame_gen === '2x');
-  const titleStr = getLosslessButtonTitle();
-  const fgTitleStr = getFrameGenButtonTitle();
-  document.querySelectorAll('.lsfg-toggle-btn').forEach(btn => {
-    btn.classList.toggle('active', isAct);
-    if (btn.classList.contains('btn')) {
-      btn.classList.toggle('btn-primary', isAct);
-      btn.classList.toggle('btn-secondary', !isAct);
-    }
-    btn.title = titleStr;
-  });
-  document.querySelectorAll('.fg-toggle-btn').forEach(btn => {
-    btn.classList.toggle('active', isFgOn);
-    btn.title = fgTitleStr;
-  });
-}
-
-function syncSubtitleOverlayMode() {
-  const player = document.getElementById('active-media-player');
-  const subOverlay = document.getElementById('video-subtitle-overlay');
-  const canvas = document.getElementById('video-lsfg-canvas');
-  const canvasVisible = Boolean(canvas && canvas.style.display !== 'none' && canvas.style.opacity === '1');
-  if (!player || !player.textTracks || player.textTracks.length === 0) {
-    if (subOverlay) {
-      subOverlay.style.display = 'none';
-      subOverlay.innerHTML = '';
-    }
-    return;
-  }
-  const activeState = _activeMediaState;
-  const wantSubs = Boolean(activeState && activeState.subtitleTrack >= 0);
-  const tt = player.textTracks[player.textTracks.length - 1];
-  if (!wantSubs || !tt) {
-    if (tt) tt.mode = 'disabled';
-    if (subOverlay) {
-      subOverlay.style.display = 'none';
-      subOverlay.innerHTML = '';
-    }
-    return;
-  }
-  if (canvasVisible) {
-    if (tt.mode !== 'hidden') tt.mode = 'hidden';
-    renderActiveSubtitleCues(tt, subOverlay);
-  } else {
-    if (tt.mode !== 'showing') tt.mode = 'showing';
-    if (subOverlay) {
-      subOverlay.style.display = 'none';
-      subOverlay.innerHTML = '';
-    }
-  }
-}
-
-function renderActiveSubtitleCues(tt, subOverlay) {
-  if (!subOverlay || !tt) return;
-  const cues = tt.activeCues;
-  if (!cues || cues.length === 0) {
-    subOverlay.style.display = 'none';
-    subOverlay.innerHTML = '';
-    return;
-  }
-  const lines = [];
-  for (let i = 0; i < cues.length; i++) {
-    const raw = String(cues[i].text || '').replace(/<[^>]+>/g, '').trim();
-    if (raw) {
-      raw.split(/\r?\n/).forEach(l => {
-        if (l.trim()) lines.push(`<span class="video-subtitle-line">${escHtml(l.trim())}</span>`);
-      });
-    }
-  }
-  if (lines.length > 0) {
-    subOverlay.innerHTML = lines.join('');
-    subOverlay.style.display = 'flex';
-  } else {
-    subOverlay.style.display = 'none';
-    subOverlay.innerHTML = '';
-  }
-}
-
-function initWebGLVideoPipeline(canvas) {
-  if (!canvas) return null;
-  if (canvas._glPipeline) return canvas._glPipeline;
-  const opts = {
-    alpha: false,
-    antialias: false,
-    depth: false,
-    stencil: false,
-    premultipliedAlpha: false,
-    preserveDrawingBuffer: false,
-    powerPreference: 'high-performance',
-  };
-  const gl = canvas.getContext('webgl2', opts) || canvas.getContext('webgl', opts);
-  if (!gl) return null;
-
-  const vsSrc = `
-    attribute vec2 a_pos;
-    varying vec2 v_uv;
-    void main() {
-      v_uv = vec2(a_pos.x * 0.5 + 0.5, 0.5 - a_pos.y * 0.5);
-      gl_Position = vec4(a_pos, 0.0, 1.0);
-    }
-  `;
-
-  // Directional Spatial Reconstruction (1.25x / 1.5x) + AMD RCAS + Coarse-to-Fine Optical-Flow 2x Frame Interpolation
-  const fsSrc = `
-    precision highp float;
-    varying vec2 v_uv;
-    uniform sampler2D u_currTex;
-    uniform sampler2D u_prevTex;
-    uniform vec2 u_texelSize;
-    uniform float u_blend;
-    uniform float u_sharpness;
-    uniform float u_scaleFactor;
-
-    float luma(vec3 c) {
-      return dot(c, vec3(0.299, 0.587, 0.114));
-    }
-
-    vec3 sampleSpatialTex(sampler2D tex, vec2 uv) {
-      vec3 c = texture2D(tex, uv).rgb;
-      if (u_scaleFactor <= 1.05) {
-        return c;
-      }
-      vec2 d = u_texelSize * 0.65;
-      vec3 n = texture2D(tex, uv + vec2(0.0, -d.y)).rgb;
-      vec3 s = texture2D(tex, uv + vec2(0.0,  d.y)).rgb;
-      vec3 w = texture2D(tex, uv + vec2(-d.x, 0.0)).rgb;
-      vec3 e = texture2D(tex, uv + vec2( d.x, 0.0)).rgb;
-
-      vec3 min4 = min(min(n, s), min(w, e));
-      vec3 max4 = max(max(n, s), max(w, e));
-      float contrast = luma(max4 - min4);
-      float weight = -0.11 * clamp((u_scaleFactor - 1.0) * 1.8, 0.25, 1.0) * smoothstep(0.015, 0.12, contrast);
-      vec3 recon = (c + (n + s + w + e) * weight) / (1.0 + 4.0 * weight);
-      return clamp(recon, min4, max4);
-    }
-
-    vec3 sampleMotionFrame(vec2 uv) {
-      vec3 curr = sampleSpatialTex(u_currTex, uv);
-      if (u_blend <= 0.01) {
-        return curr;
-      }
-      vec3 prev = sampleSpatialTex(u_prevTex, uv);
-      float yCurr = luma(curr);
-      float yPrev = luma(prev);
-      float dt = yCurr - yPrev;
-      float absDt = abs(dt);
-
-      // True scene-cut guard: prevent ghosting across hard camera cuts
-      if (absDt > 0.36) {
-        return curr;
-      }
-
-      // Coarse scale (+/- 4.0 texels) for fast camera pans and large motion up to +/- 10px
-      vec2 cStep = u_texelSize * 4.0;
-      float gxC = (luma(texture2D(u_currTex, uv + vec2(cStep.x, 0.0)).rgb) - luma(texture2D(u_currTex, uv - vec2(cStep.x, 0.0)).rgb)) * 0.5;
-      float gyC = (luma(texture2D(u_currTex, uv + vec2(0.0, cStep.y)).rgb) - luma(texture2D(u_currTex, uv - vec2(0.0, cStep.y)).rgb)) * 0.5;
-      float dtC = (yCurr + luma(texture2D(u_currTex, uv + vec2(cStep.x, 0.0)).rgb)) * 0.5
-                - (yPrev + luma(texture2D(u_prevTex, uv + vec2(cStep.x, 0.0)).rgb)) * 0.5;
-      float gradMagSqC = gxC * gxC + gyC * gyC + 0.004;
-      vec2 flowCoarseUv = clamp(vec2(-dtC * gxC, -dtC * gyC) / gradMagSqC, vec2(-2.5), vec2(2.5)) * cStep;
-
-      // Fine scale (+/- 1.25 texels) for crisp detail motion up to +/- 4.4px
-      vec2 fStep = u_texelSize * 1.25;
-      float gxF = (luma(texture2D(u_currTex, uv + vec2(fStep.x, 0.0)).rgb) - luma(texture2D(u_currTex, uv - vec2(fStep.x, 0.0)).rgb)) * 0.5;
-      float gyF = (luma(texture2D(u_currTex, uv + vec2(0.0, fStep.y)).rgb) - luma(texture2D(u_currTex, uv - vec2(0.0, fStep.y)).rgb)) * 0.5;
-      float gradMagSqF = gxF * gxF + gyF * gyF + 0.003;
-      vec2 flowFineUv = clamp(vec2(-dt * gxF, -dt * gyF) / gradMagSqF, vec2(-3.5), vec2(3.5)) * fStep;
-
-      // Evaluate candidate warps (fine flow vs coarse flow vs zero flow) and select minimum residual error
-      vec3 prevFine = sampleSpatialTex(u_prevTex, clamp(uv + flowFineUv * 0.5, 0.0, 1.0));
-      vec3 currFine = sampleSpatialTex(u_currTex, clamp(uv - flowFineUv * 0.5, 0.0, 1.0));
-      float diffFine = abs(luma(prevFine) - luma(currFine));
-
-      vec3 prevCoarse = sampleSpatialTex(u_prevTex, clamp(uv + flowCoarseUv * 0.5, 0.0, 1.0));
-      vec3 currCoarse = sampleSpatialTex(u_currTex, clamp(uv - flowCoarseUv * 0.5, 0.0, 1.0));
-      float diffCoarse = abs(luma(prevCoarse) - luma(currCoarse));
-
-      vec3 bestPrev = prevFine;
-      vec3 bestCurr = currFine;
-      float bestDiff = diffFine;
-
-      if (diffCoarse < bestDiff) {
-        bestPrev = prevCoarse;
-        bestCurr = currCoarse;
-        bestDiff = diffCoarse;
-      }
-      if (absDt < bestDiff) {
-        bestPrev = prev;
-        bestCurr = curr;
-        bestDiff = absDt;
-      }
-
-      vec3 warpedMid = mix(bestPrev, bestCurr, 0.5);
-      vec3 temporalMid = mix(prev, curr, 0.5);
-      float flowConf = 1.0 - smoothstep(0.04, 0.22, bestDiff);
-      vec3 synthMid = mix(temporalMid, warpedMid, flowConf);
-
-      // Smooth fade near scene-cut boundary so fast flashes don't ghost
-      float cutFade = 1.0 - smoothstep(0.24, 0.36, absDt);
-      vec3 midFrame = mix(curr, synthMid, cutFade);
-      return mix(curr, midFrame, clamp(u_blend * 2.0, 0.0, 1.0));
-    }
-
-    void main() {
-      vec3 c = sampleMotionFrame(v_uv);
-      if (u_sharpness <= 0.01) {
-        gl_FragColor = vec4(c, 1.0);
-        return;
-      }
-
-      vec2 off = u_texelSize * (u_scaleFactor > 1.05 ? 0.76 : 0.85);
-      vec3 n = sampleMotionFrame(v_uv + vec2(0.0, -off.y));
-      vec3 s = sampleMotionFrame(v_uv + vec2(0.0,  off.y));
-      vec3 w = sampleMotionFrame(v_uv + vec2(-off.x, 0.0));
-      vec3 e = sampleMotionFrame(v_uv + vec2( off.x, 0.0));
-
-      vec3 minC = min(min(min(n, s), min(w, e)), c);
-      vec3 maxC = max(max(max(n, s), max(w, e)), c);
-
-      float minL = luma(minC);
-      float maxL = luma(maxC);
-      float localContrast = maxL - minL;
-      float edgeMask = smoothstep(0.01, 0.085, localContrast);
-      float rcasPeak = -0.195 * u_sharpness * edgeMask;
-
-      vec3 sharpened = (c + (n + s + w + e) * rcasPeak) / (1.0 + 4.0 * rcasPeak);
-      vec3 clamped = clamp(sharpened, minC - 0.02, maxC + 0.02);
-      gl_FragColor = vec4(clamp(clamped, 0.0, 1.0), 1.0);
-    }
-  `;
-
-  const compileShader = (type, src) => {
-    const sh = gl.createShader(type);
-    gl.shaderSource(sh, src);
-    gl.compileShader(sh);
-    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
-      gl.deleteShader(sh);
-      return null;
-    }
-    return sh;
-  };
-
-  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
-  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
-  if (!vs || !fs) return null;
-
-  const prog = gl.createProgram();
-  gl.attachShader(prog, vs);
-  gl.attachShader(prog, fs);
-  gl.linkProgram(prog);
-  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) return null;
-
-  gl.useProgram(prog);
-
-  const quadBuf = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
-  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
-    -1, -1,
-     1, -1,
-    -1,  1,
-    -1,  1,
-     1, -1,
-     1,  1,
-  ]), gl.STATIC_DRAW);
-
-  const aPos = gl.getAttribLocation(prog, 'a_pos');
-  gl.enableVertexAttribArray(aPos);
-  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
-
-  const makeTex = () => {
-    const t = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, t);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    return t;
-  };
-
-  const pipeline = {
-    gl,
-    prog,
-    texCurr: makeTex(),
-    texPrev: makeTex(),
-    hasPrev: false,
-    uCurrTex: gl.getUniformLocation(prog, 'u_currTex'),
-    uPrevTex: gl.getUniformLocation(prog, 'u_prevTex'),
-    uTexelSize: gl.getUniformLocation(prog, 'u_texelSize'),
-    uBlend: gl.getUniformLocation(prog, 'u_blend'),
-    uSharpness: gl.getUniformLocation(prog, 'u_sharpness'),
-    uScaleFactor: gl.getUniformLocation(prog, 'u_scaleFactor'),
-  };
-
-  gl.uniform1i(pipeline.uCurrTex, 0);
-  gl.uniform1i(pipeline.uPrevTex, 1);
-
-  canvas._glPipeline = pipeline;
-  return pipeline;
-}
-
-function stopLosslessPipeline() {
-  if (_lsfgRafId) {
-    cancelAnimationFrame(_lsfgRafId);
-    _lsfgRafId = null;
-  }
-  const player = document.getElementById('active-media-player');
-  if (player) {
-    if (_lsfgVfcId && typeof player.cancelVideoFrameCallback === 'function') {
-      try { player.cancelVideoFrameCallback(_lsfgVfcId); } catch (_) {}
-    }
-    _lsfgVfcId = null;
-    player.style.filter = '';
-    player.style.removeProperty('filter');
-    player.style.imageRendering = '';
-    player.style.removeProperty('image-rendering');
-  }
-  const canvas = document.getElementById('video-lsfg-canvas');
-  if (canvas) {
-    canvas.style.opacity = '0';
-    canvas.style.display = 'none';
-    canvas.style.filter = '';
-    canvas.style.removeProperty('filter');
-    if (canvas._glPipeline) {
-      canvas._glPipeline.hasPrev = false;
-    }
-  }
-  const badge = document.getElementById('video-lsfg-telemetry');
-  if (badge) {
-    badge.style.display = 'none';
-  }
-  syncSubtitleOverlayMode();
-}
-
-function applyLosslessPipelineToActivePlayer() {
-  updateLosslessButtons();
-  const player = document.getElementById('active-media-player');
-  const canvas = document.getElementById('video-lsfg-canvas');
-  const badge = document.getElementById('video-lsfg-telemetry');
-  const badgeText = document.getElementById('video-lsfg-telemetry-text');
-
-  if (!player || !_activeMediaState || !_activeMediaState.isVid) {
-    stopLosslessPipeline();
-    return;
-  }
-
-  const isActive = Boolean(_losslessConfig?.enabled);
-  if (!isActive) {
-    stopLosslessPipeline();
-    return;
-  }
-
-  if (_lsfgRafId) {
-    cancelAnimationFrame(_lsfgRafId);
-    _lsfgRafId = null;
-  }
-  if (_lsfgVfcId && typeof player.cancelVideoFrameCallback === 'function') {
-    try { player.cancelVideoFrameCallback(_lsfgVfcId); } catch (_) {}
-    _lsfgVfcId = null;
-  }
-
-  // Ensure native <video> has no CSS filter overhead while WebGL GPU canvas renders
-  player.style.filter = '';
-  player.style.removeProperty('filter');
-
-  const glPipe = initWebGLVideoPipeline(canvas);
-  if (glPipe) {
-    glPipe.hasPrev = false;
-  }
-
-  if (badge) {
-    badge.style.display = _losslessConfig.show_fps_overlay ? 'inline-flex' : 'none';
-  }
-
-  let lastFrameWallTime = performance.now();
-  let lastVideoTime = -1;
-  let newVideoFrameReady = true;
-  let measuredDecodedFps = 24;
-  let vfcCount = 0;
-  let vfcSampleStart = performance.now();
-  const hasVfcSupport = typeof player.requestVideoFrameCallback === 'function';
-  let vfcActive = false;
-  let lastPresentedFrames = -1;
-  let lastMediaTime = -1;
-
-  if (hasVfcSupport) {
-    const onVideoFrame = (now, metadata) => {
-      if (!document.getElementById('active-media-player') || !_losslessConfig?.enabled) return;
-      const presFrames = metadata && typeof metadata.presentedFrames === 'number' ? metadata.presentedFrames : -1;
-      const mediaTime = metadata && typeof metadata.mediaTime === 'number' ? metadata.mediaTime : -1;
-      const isDistinctFrame = (presFrames < 0 || presFrames !== lastPresentedFrames) &&
-                              (mediaTime < 0 || Math.abs(mediaTime - lastMediaTime) > 0.0005);
-      if (isDistinctFrame) {
-        newVideoFrameReady = true;
-        lastFrameWallTime = now;
-        lastPresentedFrames = presFrames;
-        lastMediaTime = mediaTime;
-        vfcActive = true;
-        vfcCount++;
-        const elapsed = now - vfcSampleStart;
-        if (elapsed >= 500) {
-          const inst = (vfcCount * 1000) / elapsed;
-          if (inst >= 10 && inst <= 120) {
-            measuredDecodedFps = measuredDecodedFps * 0.6 + inst * 0.4;
-          }
-          vfcCount = 0;
-          vfcSampleStart = now;
-        }
-      }
-      _lsfgVfcId = player.requestVideoFrameCallback(onVideoFrame);
-    };
-    _lsfgVfcId = player.requestVideoFrameCallback(onVideoFrame);
-  }
-
-  let webglFallbackMode = !glPipe;
-
-  const renderLoop = (now) => {
-    if (!document.getElementById('active-media-player') || !_losslessConfig?.enabled) {
-      stopLosslessPipeline();
-      return;
-    }
-
-    const scaleFactor = Number(_losslessConfig.scale_factor || 1.5);
-    const fgMult = _losslessConfig.frame_gen === '2x' ? 2 : 1;
-    const rawSharp = Math.max(0, Math.min(1, Number(_losslessConfig.sharpness ?? 0.55)));
-    const effSharp = scaleFactor > 1.05
-      ? rawSharp * (0.78 + (scaleFactor - 1.0) * 0.55)
-      : rawSharp * 0.45;
-
-    const probedFps = (_activeMediaState && _activeMediaState.probeInfo && _activeMediaState.probeInfo.video_fps > 0)
-      ? Number(_activeMediaState.probeInfo.video_fps)
-      : 0;
-    const rate = Number(_playbackRate || 1);
-    const activeBaseFps = Math.max(12, Math.min(120, (probedFps > 0 ? probedFps : measuredDecodedFps) * rate));
-    const frameIntervalMs = 1000 / activeBaseFps;
-
-    // Fallback frame-change detection ONLY when requestVideoFrameCallback is unavailable or inactive (e.g. legacy Smart TV WebViews)
-    // Using >= 0.88 / activeBaseFps prevents mid-frame double-uploads that would overwrite texPrev with texCurr!
-    if (!hasVfcSupport || !vfcActive || player.seeking) {
-      const curVidTime = player.currentTime || 0;
-      const minDelta = player.seeking ? 0.001 : (0.88 / activeBaseFps);
-      if (Math.abs(curVidTime - lastVideoTime) >= minDelta) {
-        newVideoFrameReady = true;
-        lastVideoTime = curVidTime;
-        lastFrameWallTime = now;
-      }
-    }
-
-    const vw = player.videoWidth || 0;
-    const vh = player.videoHeight || 0;
-
-    if (!webglFallbackMode && glPipe && vw > 0 && vh > 0 && player.readyState >= 2) {
-      const { gl } = glPipe;
-      const targetW = Math.min(3840, Math.max(vw, Math.round(vw * scaleFactor)));
-      const targetH = Math.max(vh, Math.round(targetW * (vh / vw)));
-
-      if (canvas.width !== targetW || canvas.height !== targetH) {
-        canvas.width = targetW;
-        canvas.height = targetH;
-        gl.viewport(0, 0, targetW, targetH);
-      }
-
-      if (newVideoFrameReady) {
-        newVideoFrameReady = false;
-        try {
-          if (glPipe.hasPrev) {
-            const tmp = glPipe.texPrev;
-            glPipe.texPrev = glPipe.texCurr;
-            glPipe.texCurr = tmp;
-          }
-          gl.activeTexture(gl.TEXTURE0);
-          gl.bindTexture(gl.TEXTURE_2D, glPipe.texCurr);
-          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, player);
-
-          if (!glPipe.hasPrev) {
-            gl.activeTexture(gl.TEXTURE1);
-            gl.bindTexture(gl.TEXTURE_2D, glPipe.texPrev);
-            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, player);
-            glPipe.hasPrev = true;
-          }
-
-          if (canvas.style.display === 'none' || canvas.style.opacity !== '1') {
-            canvas.style.display = 'block';
-            canvas.style.opacity = '1';
-            syncSubtitleOverlayMode();
-          }
-        } catch (_) {
-          // If cross-origin or DRM blocks WebGL texture upload, gracefully fall back to SVG RCAS filter
-          webglFallbackMode = true;
-          canvas.style.opacity = '0';
-          canvas.style.display = 'none';
-          syncSubtitleOverlayMode();
-        }
-      }
-
-      if (!webglFallbackMode && glPipe.hasPrev) {
-        gl.useProgram(glPipe.prog);
-        gl.activeTexture(gl.TEXTURE0);
-        gl.bindTexture(gl.TEXTURE_2D, glPipe.texCurr);
-        gl.activeTexture(gl.TEXTURE1);
-        gl.bindTexture(gl.TEXTURE_2D, glPipe.texPrev);
-
-        // Causal 2x Frame Generation cadence:
-        // First half of source frame interval [0, 0.50 * T): render motion-compensated midpoint F_{N-0.5} (u_blend = 0.5)
-        // Second half of source frame interval [0.50 * T, T): render exact decoded frame F_N (u_blend = 0.0)
-        let blendVal = 0.0;
-        if (fgMult === 2 && !player.paused && !player.seeking) {
-          const sinceFrame = now - lastFrameWallTime;
-          if (sinceFrame >= 0 && sinceFrame < frameIntervalMs * 0.50) {
-            blendVal = 0.5;
-          }
-        }
-
-        gl.uniform2f(glPipe.uTexelSize, 1.0 / vw, 1.0 / vh);
-        gl.uniform1f(glPipe.uBlend, blendVal);
-        gl.uniform1f(glPipe.uSharpness, Math.min(1.0, effSharp));
-        if (glPipe.uScaleFactor !== null) {
-          gl.uniform1f(glPipe.uScaleFactor, scaleFactor);
-        }
-        gl.drawArrays(gl.TRIANGLES, 0, 6);
-      }
-    } else if (webglFallbackMode) {
-      const convEl = document.getElementById('ls-convolve-matrix');
-      if (convEl && effSharp > 0.01) {
-        const e = -(0.08 + effSharp * 0.22);
-        const c = 1 - 4 * e;
-        convEl.setAttribute('kernelMatrix', `0 ${e.toFixed(4)} 0 ${e.toFixed(4)} ${c.toFixed(4)} ${e.toFixed(4)} 0 ${e.toFixed(4)} 0`);
-        player.style.filter = 'url(#ls-upscale-filter)';
-      } else {
-        player.style.filter = '';
-        player.style.removeProperty('filter');
-      }
-    }
-
-    if (badge && badgeText && _losslessConfig.show_fps_overlay) {
-      const baseFpsRound = player.paused ? 0 : Math.max(1, Math.min(240, Math.round(activeBaseFps)));
-      const outFpsRound = baseFpsRound * fgMult;
-      const inH = vh || 1080;
-      const outH = Math.min(2160, Math.round(inH * scaleFactor));
-      const upLabel = scaleFactor > 1.05 ? `${scaleFactor}x (${inH}p→${outH}p)` : `${inH}p Native`;
-      badgeText.textContent = fgMult > 1
-        ? `GPU ${upLabel} • 2X FG • ${baseFpsRound} → ${outFpsRound} FPS`
-        : `GPU ${upLabel} • ${baseFpsRound} FPS`;
-    }
-
-    _lsfgRafId = requestAnimationFrame(renderLoop);
-  };
-
-  _lsfgRafId = requestAnimationFrame(renderLoop);
-}
-
-async function toggleLosslessPlayback() {
-  const stage = document.getElementById('video-stage-container');
-  if (stage && stage._wakeHud) stage._wakeHud();
-
-  const nextEnabled = !_losslessConfig.enabled;
-  _losslessConfig.enabled = nextEnabled;
-  applyLosslessPipelineToActivePlayer();
-
-  try {
-    const res = await apiJSON('/api/settings/upscaling', {
-      method: 'POST',
-      json: { enabled: nextEnabled },
-    });
-    _losslessConfig = normalizeLosslessConfig(res);
-    applyLosslessPipelineToActivePlayer();
-    toast(
-      _losslessConfig.enabled
-        ? `Upscaling & Frame Gen ON (${getUpscaleSummaryLabel(_losslessConfig)})`
-        : 'Upscaling & Frame Generation disabled (Native playback)',
-      'info'
-    );
-  } catch (e) {
-    toast(e.message || 'Failed to toggle Upscaling & Frame Gen', 'error');
-  }
-}
-
-async function toggleFrameGenPlayback() {
-  const stage = document.getElementById('video-stage-container');
-  if (stage && stage._wakeHud) stage._wakeHud();
-
-  const currentlyFgOn = Boolean(_losslessConfig?.enabled && _losslessConfig?.frame_gen === '2x');
-  const nextFg = currentlyFgOn ? 'off' : '2x';
-  const nextEnabled = nextFg === '2x' ? true : Boolean(_losslessConfig?.enabled);
-
-  _losslessConfig.enabled = nextEnabled;
-  _losslessConfig.frame_gen = nextFg;
-  applyLosslessPipelineToActivePlayer();
-
-  try {
-    const res = await apiJSON('/api/settings/upscaling', {
-      method: 'POST',
-      json: { enabled: nextEnabled, frame_gen: nextFg },
-    });
-    _losslessConfig = normalizeLosslessConfig(res);
-    applyLosslessPipelineToActivePlayer();
-    toast(
-      _losslessConfig.enabled && _losslessConfig.frame_gen === '2x'
-        ? `2x Frame Generation ON (${getUpscaleSummaryLabel(_losslessConfig)})`
-        : `2x Frame Generation OFF (${getUpscaleSummaryLabel(_losslessConfig)})`,
-      'info'
-    );
-  } catch (e) {
-    toast(e.message || 'Failed to toggle 2x Frame Generation', 'error');
-  }
 }
 
 function getMediaResumeKey(f, type) {
@@ -2911,7 +2213,6 @@ function cleanupActiveMedia() {
       saveVideoProgress(_activeMediaState.f, _activeMediaState.type, curPos, _activeMediaState.totalDuration || 0);
     }
   }
-  stopLosslessPipeline();
   if (_activeMediaState && _activeMediaState.skipDebounceTimer) {
     clearTimeout(_activeMediaState.skipDebounceTimer);
   }
@@ -3045,12 +2346,8 @@ function setPlaybackRate(rate) {
 function setVideoZoom(zoom) {
   _videoZoom = zoom;
   const player = document.getElementById('active-media-player');
-  const canvas = document.getElementById('video-lsfg-canvas');
   if (player && _activeMediaState && _activeMediaState.isVid) {
     player.style.transform = zoom === 1 ? 'scale(1)' : `scale(${zoom})`;
-  }
-  if (canvas) {
-    canvas.style.transform = zoom === 1 ? 'scale(1)' : `scale(${zoom})`;
   }
   document.querySelectorAll('.zoom-btn, .hud-zoom-btn').forEach(btn => {
     btn.classList.toggle('active', Math.abs(parseFloat(btn.dataset.zoom) - zoom) < 0.001);
@@ -3358,10 +2655,6 @@ function openMedia(fJson, type) {
   var btTitle = _btAudioDelayEnabled
     ? 'Bluetooth Audio Delay: +100ms ON (Click to disable)'
     : 'Bluetooth Audio Delay: OFF (Click for +100ms audio delay)';
-  var lsfgActive = Boolean(_losslessConfig && _losslessConfig.enabled);
-  var fgActive = Boolean(lsfgActive && _losslessConfig.frame_gen === '2x');
-  var lsfgTitle = getLosslessButtonTitle();
-  var fgTitle = getFrameGenButtonTitle();
   var savedResume = isVid ? getSavedVideoProgress(f, type) : null;
 
   var mediaEl = isVid
@@ -3369,12 +2662,6 @@ function openMedia(fJson, type) {
         + '<video id="active-media-player" autoplay playsinline preload="auto" crossorigin="anonymous" '
         +   'style="transform:scale(' + _videoZoom + ')">'
         +   'Your browser cannot play this video.</video>'
-        + '<canvas id="video-lsfg-canvas" class="video-lsfg-canvas" style="transform:scale(' + _videoZoom + ')"></canvas>'
-        + '<div id="video-subtitle-overlay" class="video-subtitle-overlay"></div>'
-        + '<div id="video-lsfg-telemetry" class="video-lsfg-telemetry">'
-        +   '<span class="video-lsfg-dot"></span>'
-        +   '<span id="video-lsfg-telemetry-text">GPU 1.5x • 2X FG</span>'
-        + '</div>'
         + '<div id="video-skip-left" class="video-skip-indicator left">'
         +   '<svg data-lucide="chevrons-left" width="18" height="18"></svg>'
         +   '<span id="video-skip-left-text">15s</span>'
@@ -3422,12 +2709,6 @@ function openMedia(fJson, type) {
         +       '</button>'
         +       '<button class="hud-btn bt-delay-btn ' + (_btAudioDelayEnabled ? 'active' : '') + '" id="stage-bt-btn" onclick="toggleBtAudioDelay()" title="' + escAttr(btTitle) + '">'
         +         'BT'
-        +       '</button>'
-        +       '<button class="hud-btn lsfg-toggle-btn ' + (lsfgActive ? 'active' : '') + '" id="stage-lsfg-btn" onclick="toggleLosslessPlayback()" title="' + escAttr(lsfgTitle) + '">'
-        +         'LSFG'
-        +       '</button>'
-        +       '<button class="hud-btn fg-toggle-btn ' + (fgActive ? 'active' : '') + '" id="stage-fg-btn" onclick="toggleFrameGenPlayback()" title="' + escAttr(fgTitle) + '">'
-        +         '2x FG'
         +       '</button>'
         +     '</div>'
         +     '<div class="video-hud-right">'
@@ -3712,11 +2993,8 @@ function openMedia(fJson, type) {
     refreshSubtitles: null,
   };
   _activeMediaState = state;
-  if (isVid) {
-    applyLosslessPipelineToActivePlayer();
-    if (state.resumePromptPending) {
-      setTimeout(() => document.getElementById('video-resume-confirm-btn')?.focus(), 50);
-    }
+  if (isVid && state.resumePromptPending) {
+    setTimeout(() => document.getElementById('video-resume-confirm-btn')?.focus(), 50);
   }
 
   async function refreshSubtitles() {
@@ -3735,7 +3013,6 @@ function openMedia(fJson, type) {
       _activeSubBlobUrl = null;
     }
     if (state.subtitleTrack < 0) {
-      syncSubtitleOverlayMode();
       return;
     }
 
@@ -3757,9 +3034,7 @@ function openMedia(fJson, type) {
       const enableTrack = () => {
         try {
           if (player.textTracks && player.textTracks.length > 0) {
-            const tt = player.textTracks[player.textTracks.length - 1];
-            tt.oncuechange = () => syncSubtitleOverlayMode();
-            syncSubtitleOverlayMode();
+            player.textTracks[player.textTracks.length - 1].mode = 'showing';
           }
         } catch (_) {}
       };
@@ -5791,10 +5066,9 @@ async function renderSettings() {
   await refreshShares();
   await refreshGDStatus();
   await refreshODStatus();
-  await refreshLosslessSettings();
   try { smbProxyCreds = await apiJSON('/api/smb/proxy-credentials'); } catch(_) {}
 
-  const validTabs = ['gdrive', 'onedrive', 'smb', 'oauth', 'od_oauth', 'proxy', 'upscaling', 'themes', 'system'];
+  const validTabs = ['gdrive', 'onedrive', 'smb', 'oauth', 'od_oauth', 'proxy', 'themes', 'system'];
   if (!validTabs.includes(_settingsTab)) {
     _settingsTab = 'gdrive';
   }
@@ -5805,7 +5079,6 @@ async function renderSettings() {
   const showOAuth     = _settingsTab === 'oauth';
   const showOdOAuth   = _settingsTab === 'od_oauth';
   const showProxy     = _settingsTab === 'proxy';
-  const showUpscaling = _settingsTab === 'upscaling';
   const showThemes    = _settingsTab === 'themes';
   const showSystem    = _settingsTab === 'system';
   const oauthOpen    = true;
@@ -5908,9 +5181,6 @@ async function renderSettings() {
         </button>
         <button class="settings-tab ${_settingsTab==='proxy'?'active':''}" onclick="setSettingsTab('proxy')">
           <svg data-lucide="network"></svg> SMB Proxy
-        </button>
-        <button class="settings-tab ${_settingsTab==='upscaling'?'active':''}" onclick="setSettingsTab('upscaling')">
-          <svg data-lucide="cpu"></svg> Upscaling &amp; Frame Gen
         </button>
         <button class="settings-tab ${_settingsTab==='themes'?'active':''}" onclick="setSettingsTab('themes')">
           <svg data-lucide="palette"></svg> Themes
@@ -6488,160 +5758,8 @@ async function renderSettings() {
     </div>
     ` : ''}
 
-    ${showUpscaling ? (() => {
-      _losslessConfig = normalizeLosslessConfig(_losslessConfig);
-      const sharpPct = Math.round((Number(_losslessConfig.sharpness ?? 0.55)) * 100);
-      const curSf = Number(_losslessConfig.scale_factor || 1.5);
-      const curFg = _losslessConfig.frame_gen || '2x';
-      return `
-      <div class="settings-two-col">
-        <!-- Card 1: Upscaling (1.25x / 1.5x) & 2x Frame Generation Controls -->
-        <div class="card">
-          <div class="card-header">
-            <div style="display:flex;align-items:center;gap:var(--space-2)">
-              <svg data-lucide="sparkles" width="16" height="16" style="color:var(--color-primary)"></svg>
-              <span class="card-title">GPU Upscaling &amp; 2x Frame Generation</span>
-            </div>
-            <label class="proxy-switch-label" title="Toggle GPU Upscaling & 2x Frame Generation">
-              <input type="checkbox" class="proxy-switch-input" id="ls-cfg-enabled"
-                     ${_losslessConfig.enabled ? 'checked' : ''}
-                     onchange="saveLosslessSettings()" />
-              <span class="proxy-switch"></span>
-              <span>${_losslessConfig.enabled ? 'Enabled' : 'Off'}</span>
-            </label>
-          </div>
-          <div class="card-body" style="display:flex;flex-direction:column;gap:var(--space-4)">
-            <p style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.5">
-              Hardware-accelerated WebGL GPU shader pipeline designed for <strong>Smart TVs, Android tablets, and phones</strong>. Combines edge-directed spatial upscaling (<code>1.25x</code> / <code>1.5x</code>) with <code>2x</code> optical-flow motion interpolation. Can also be toggled anytime in the video player via the <strong>LSFG</strong> button.
-            </p>
-
-            <div class="form-row">
-              <div class="form-group">
-                <label class="form-label" for="ls-cfg-scale-factor">Spatial Upscale Factor</label>
-                <select class="form-input" id="ls-cfg-scale-factor" onchange="saveLosslessSettings()">
-                  <option value="1.5" ${curSf === 1.5 ? 'selected' : ''}>1.5x Upscale (Recommended — TV &amp; Tablet)</option>
-                  <option value="1.25" ${curSf === 1.25 ? 'selected' : ''}>1.25x Upscale (Balanced — Phone &amp; Battery)</option>
-                  <option value="1" ${curSf === 1 ? 'selected' : ''}>1.0x (Native Resolution — Frame Gen Only)</option>
-                </select>
-              </div>
-              <div class="form-group">
-                <label class="form-label" for="ls-cfg-frame-gen">Frame Generation</label>
-                <select class="form-input" id="ls-cfg-frame-gen" onchange="saveLosslessSettings()">
-                  <option value="2x" ${curFg === '2x' ? 'selected' : ''}>2x Frame Generation (24 → 48 / 30 → 60 FPS)</option>
-                  <option value="off" ${curFg === 'off' ? 'selected' : ''}>Off (Spatial Upscaling Only)</option>
-                </select>
-              </div>
-            </div>
-
-            <div class="form-group">
-              <div style="display:flex;justify-content:space-between;align-items:center">
-                <label class="form-label" for="ls-cfg-sharpness">Contrast Adaptive Edge Sharpness (<code>RCAS</code>)</label>
-                <span id="ls-cfg-sharpness-val" style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--color-primary)">${sharpPct}%</span>
-              </div>
-              <input type="range" id="ls-cfg-sharpness" min="0" max="100" step="5" value="${sharpPct}"
-                     style="width:100%;accent-color:var(--color-primary);cursor:pointer"
-                     oninput="const el=document.getElementById('ls-cfg-sharpness-val');if(el)el.textContent=this.value+'%'"
-                     onchange="saveLosslessSettings()" />
-            </div>
-
-            <div style="display:flex;flex-direction:column;gap:var(--space-2);padding-top:var(--space-1)">
-              <label class="proxy-switch-label" style="justify-content:space-between">
-                <span style="font-weight:500;color:var(--color-text-muted)">Show In-Player FPS &amp; Upscaler Badge (Auto-hides after 5s)</span>
-                <span style="display:inline-flex;align-items:center;gap:var(--space-2)">
-                  <input type="checkbox" class="proxy-switch-input" id="ls-cfg-fps-overlay"
-                         ${_losslessConfig.show_fps_overlay !== false ? 'checked' : ''}
-                         onchange="saveLosslessSettings()" />
-                  <span class="proxy-switch"></span>
-                </span>
-              </label>
-            </div>
-
-            <div style="display:flex;justify-content:flex-end;margin-top:var(--space-2)">
-              <button class="btn btn-primary btn-sm" onclick="saveLosslessSettings(true)">
-                <svg data-lucide="save" width="14" height="14"></svg> Save Upscaling &amp; Frame Gen Settings
-              </button>
-            </div>
-          </div>
-        </div>
-
-        <!-- Card 2: Architecture & TV / Android Playback Summary -->
-        <div class="card">
-          <div class="card-header">
-            <div style="display:flex;align-items:center;gap:var(--space-2)">
-              <svg data-lucide="tv" width="16" height="16" style="color:var(--color-primary)"></svg>
-              <span class="card-title">TV, Tablet &amp; Phone GPU Pipeline</span>
-            </div>
-            <span class="badge ${_losslessConfig.enabled ? 'badge-success' : 'badge-primary'}">
-              ${_losslessConfig.enabled ? 'Active' : 'Standby (Native)'}
-            </span>
-          </div>
-          <div class="card-body" style="display:flex;flex-direction:column;gap:var(--space-3);font-size:var(--text-xs);color:var(--color-text-muted)">
-            <div style="display:flex;justify-content:space-between;align-items:center;padding:var(--space-2) 0;border-bottom:1px solid var(--color-divider)">
-              <span>Active Profile</span>
-              <strong style="color:var(--color-text);font-family:var(--font-mono)">${escHtml(getUpscaleSummaryLabel(_losslessConfig))}</strong>
-            </div>
-            <div style="display:flex;justify-content:space-between;align-items:center;padding:var(--space-2) 0;border-bottom:1px solid var(--color-divider)">
-              <span>Spatial Upscaler</span>
-              <strong style="color:var(--color-text);font-family:var(--font-mono)">WebGL EASU + AMD RCAS (${curSf}x)</strong>
-            </div>
-            <div style="display:flex;justify-content:space-between;align-items:center;padding:var(--space-2) 0;border-bottom:1px solid var(--color-divider)">
-              <span>Frame Interpolation</span>
-              <strong style="color:var(--color-text);font-family:var(--font-mono)">${curFg === '2x' ? '2x Optical-Flow + Scene-Cut Guard' : 'Off (1x Native)'}</strong>
-            </div>
-            <div style="display:flex;justify-content:space-between;align-items:center;padding:var(--space-2) 0;border-bottom:1px solid var(--color-divider)">
-              <span>Bypass Mode (When Off)</span>
-              <strong style="color:var(--color-success);font-family:var(--font-mono)">100% Native Hardware Video</strong>
-            </div>
-            <div style="padding-top:var(--space-1);line-height:1.5">
-              When turned off in Settings or via the in-player <strong>LSFG</strong> button, the GPU shader canvas detaches completely so the browser renders the raw hardware-decoded video stream with zero overhead.
-            </div>
-          </div>
-        </div>
-      </div>`;
-    })() : ''}
-
   </div>`;
   lucide.createIcons();
-}
-
-async function refreshLosslessSettings() {
-  try {
-    const res = await apiJSON('/api/settings/upscaling');
-    if (res && typeof res === 'object') {
-      _losslessConfig = normalizeLosslessConfig(res);
-    }
-  } catch (_) {}
-}
-
-async function saveLosslessSettings(showToastMsg = false) {
-  const enabledEl = document.getElementById('ls-cfg-enabled');
-  const sfEl = document.getElementById('ls-cfg-scale-factor');
-  const shEl = document.getElementById('ls-cfg-sharpness');
-  const fgEl = document.getElementById('ls-cfg-frame-gen');
-  const fpsEl = document.getElementById('ls-cfg-fps-overlay');
-
-  const payload = {
-    enabled: enabledEl ? Boolean(enabledEl.checked) : Boolean(_losslessConfig.enabled),
-    scale_factor: sfEl ? parseFloat(sfEl.value) || 1.5 : _losslessConfig.scale_factor,
-    frame_gen: fgEl ? fgEl.value : _losslessConfig.frame_gen,
-    sharpness: shEl ? (parseFloat(shEl.value) || 0) / 100 : _losslessConfig.sharpness,
-    show_fps_overlay: fpsEl ? Boolean(fpsEl.checked) : Boolean(_losslessConfig.show_fps_overlay),
-  };
-
-  try {
-    const res = await apiJSON('/api/settings/upscaling', {
-      method: 'POST',
-      json: payload,
-    });
-    _losslessConfig = normalizeLosslessConfig(res);
-    applyLosslessPipelineToActivePlayer();
-    if (showToastMsg) {
-      toast('Upscaling & Frame Generation settings saved', 'success');
-    }
-    if (_view === 'settings') renderSettings();
-  } catch (e) {
-    toast(e.message || 'Failed to save Upscaling settings', 'error');
-  }
 }
 
 async function refreshShares() {

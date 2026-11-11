@@ -3182,6 +3182,64 @@ app.post('/api/smb/proxy-credentials', requireAdmin, (req, res) => {
   });
 });
 
+// ── Favorite Folders Persistence ──────────────────────────────────────────────
+const FAVORITES_FILE = path.join(DATA_DIR, 'favorites.json');
+
+function loadFavoritesList() {
+  const list = loadJson(FAVORITES_FILE, []);
+  return Array.isArray(list) ? list : [];
+}
+
+function saveFavoritesList(favs) {
+  saveJson(FAVORITES_FILE, Array.isArray(favs) ? favs : []);
+}
+
+app.get('/api/favorites', requireAuth, (req, res) => {
+  return res.json(loadFavoritesList());
+});
+
+app.post('/api/favorites', requireAuth, (req, res) => {
+  const body = req.body || {};
+  if (Array.isArray(body.favorites)) {
+    saveFavoritesList(body.favorites);
+    return res.json({ ok: true, favorites: body.favorites });
+  }
+  const favId = String(body.id || '').trim();
+  if (!favId) {
+    return res.status(400).json({ error: 'Favorite folder id is required' });
+  }
+  const entry = {
+    id: favId,
+    name: String(body.name || 'Folder').trim() || 'Folder',
+    driveType: String(body.driveType || 'smb').trim(),
+    driveId: String(body.driveId || 'default').trim(),
+    driveName: String(body.driveName || 'Drive').trim(),
+    path: String(body.path || '/').trim(),
+    folderId: String(body.folderId || 'root').trim(),
+    pathStack: Array.isArray(body.pathStack) ? body.pathStack : [],
+  };
+  const favs = loadFavoritesList();
+  const idx = favs.findIndex((item) => item && item.id === favId);
+  if (idx >= 0) {
+    favs[idx] = entry;
+  } else {
+    favs.push(entry);
+  }
+  saveFavoritesList(favs);
+  return res.json({ ok: true, favorites: favs });
+});
+
+app.delete('/api/favorites', requireAuth, (req, res) => {
+  const body = req.body || {};
+  const favId = String(req.query.id || body.id || '').trim();
+  if (!favId) {
+    return res.status(400).json({ error: 'Favorite folder id is required' });
+  }
+  const favs = loadFavoritesList().filter((item) => item && item.id !== favId);
+  saveFavoritesList(favs);
+  return res.json({ ok: true, favorites: favs });
+});
+
 // ── Static & SPA Catch-all ────────────────────────────────────────────────────
 const staticDir = path.join(__dirname, 'frontend', 'public');
 app.use(express.static(staticDir));
@@ -3194,3 +3252,4 @@ const PORT = 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`SageDrive server running on http://0.0.0.0:${PORT}`);
 });
+

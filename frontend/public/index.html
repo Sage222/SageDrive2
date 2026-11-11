@@ -382,6 +382,26 @@
                 padding:2px 6px;height:24px;cursor:pointer;outline:none;max-width:170px}
     .hud-select:hover{border-color:rgba(255,255,255,.4)}
     .hud-select option{background:#1c1b19;color:#fff}
+    .video-skip-indicator{position:absolute;top:50%;transform:translateY(-50%) scale(.9);
+                          z-index:12;pointer-events:none;opacity:0;
+                          background:rgba(10,14,18,.84);backdrop-filter:blur(8px);
+                          border:1px solid rgba(255,255,255,.22);border-radius:999px;
+                          padding:10px 18px;color:#fff;font-family:var(--font-mono);
+                          font-size:13px;font-weight:700;display:flex;align-items:center;
+                          gap:6px;box-shadow:0 8px 24px rgba(0,0,0,.55);
+                          transition:opacity 150ms ease, transform 150ms ease}
+    .video-skip-indicator.left{left:10%}
+    .video-skip-indicator.right{right:10%}
+    .video-skip-indicator.visible{opacity:1;transform:translateY(-50%) scale(1)}
+    .video-resume-overlay{position:absolute;inset:0;z-index:15;
+                          background:rgba(8,11,15,.78);backdrop-filter:blur(8px);
+                          display:none;align-items:center;justify-content:center;
+                          padding:var(--space-4)}
+    .video-resume-card{background:var(--color-surface);border:1px solid var(--color-primary);
+                       border-radius:var(--radius-lg);padding:var(--space-5);
+                       max-width:360px;width:100%;box-shadow:var(--shadow-lg);
+                       display:flex;flex-direction:column;gap:var(--space-3);
+                       text-align:center;color:var(--color-text)}
     video::cue{background:rgba(0,0,0,.78);color:#fff;font-family:var(--font-body);
                font-size:clamp(.95rem,1.8vw,1.35rem);text-shadow:0 1px 3px rgba(0,0,0,.9)}
 
@@ -631,6 +651,13 @@
         </button>
       </div>
       <div id="sidebar-drives"></div>
+      <div class="sidebar-section" style="margin-top:var(--space-4)">
+        <span>Favorites</span>
+        <button class="sidebar-section-btn" id="sidebar-fav-current-btn" onclick="toggleFavoriteCurrentFolder()" title="Add or remove current folder in Favorites" style="display:none">
+          <svg data-lucide="star" width="13" height="13"></svg>
+        </button>
+      </div>
+      <div id="sidebar-favorites"></div>
       <div class="sidebar-section" style="margin-top:var(--space-4)">App</div>
       <div class="sidebar-item" data-view="settings" onclick="setView('settings')">
         <svg data-lucide="settings"></svg>
@@ -724,6 +751,16 @@ let _mediaIndex = -1;
 let _playbackRate = 1;
 let _videoZoom = 1;
 let _autoPlayNext = true;
+let _favoriteFolders = [];
+const FAVORITES_STORAGE_KEY = 'sd_favorite_folders_v1';
+const VIDEO_RESUME_STORAGE_KEY = 'sd_video_resume_v1';
+try {
+  const rawFavs = localStorage.getItem(FAVORITES_STORAGE_KEY);
+  if (rawFavs) {
+    const parsedFavs = JSON.parse(rawFavs);
+    if (Array.isArray(parsedFavs)) _favoriteFolders = parsedFavs;
+  }
+} catch (_) {}
 let _losslessConfig = {
   enabled: false,
   scale_factor: 1.5,    // 1.0 (Off) | 1.25 (1.25x) | 1.5 (1.5x)
@@ -1099,9 +1136,267 @@ async function initApp() {
   await refreshGDStatus();
   await refreshODStatus();
   await refreshLosslessSettings();
+  await refreshFavorites();
   renderSidebar();
   setView('welcome');
   lucide.createIcons();
+}
+
+function normalizeSmbFavPath(p) {
+  let clean = '/' + String(p || '/').replace(/^\/+|\/+$/g, '');
+  return clean === '' ? '/' : clean;
+}
+
+function makeFavoriteFolderId(driveType, driveId, targetPathOrId) {
+  const dt = String(driveType || 'smb').trim();
+  const did = String(driveId || 'default').trim();
+  const tgt = dt === 'smb'
+    ? normalizeSmbFavPath(targetPathOrId)
+    : (String(targetPathOrId || 'root').trim() || 'root');
+  return `${dt}:${did}:${tgt}`;
+}
+
+function persistFavoritesLocal() {
+  try {
+    localStorage.setItem(FAVORITES_STORAGE_KEY, JSON.stringify(_favoriteFolders));
+  } catch (_) {}
+}
+
+async function refreshFavorites() {
+  try {
+    const serverFavs = await apiJSON('/api/favorites');
+    if (Array.isArray(serverFavs)) {
+      if (serverFavs.length > 0 || _favoriteFolders.length === 0) {
+        _favoriteFolders = serverFavs;
+        persistFavoritesLocal();
+      } else if (_favoriteFolders.length > 0) {
+        // Sync existing local favorites to backend if server list was empty
+        await apiJSON('/api/favorites', {
+          method: 'POST',
+          json: { favorites: _favoriteFolders },
+        }).catch(() => {});
+      }
+    }
+  } catch (_) {}
+}
+
+function isFolderFavorited(f, type) {
+  if (!f || f.type !== 'folder' || !_activeDrive) return false;
+  const target = type === 'smb'
+    ? (f.path || (_path.replace(/\/$/, '') + '/' + f.name))
+    : f.id;
+  const favId = makeFavoriteFolderId(type, _activeDrive.id, target);
+  return _favoriteFolders.some(item => item && item.id === favId);
+}
+
+function isCurrentFolderFavorited() {
+  if (_view !== 'files' || !_activeDrive) return false;
+  const target = _activeDrive.type === 'smb' ? _path : _folderId;
+  const favId = makeFavoriteFolderId(_activeDrive.type, _activeDrive.id, target);
+  return _favoriteFolders.some(item => item && item.id === favId);
+}
+
+async function toggleFavoriteFolderItem(fJson, type, ev) {
+  if (ev) {
+    ev.preventDefault();
+    ev.stopPropagation();
+  }
+  if (!_activeDrive) return;
+  const f = parseFileArg(fJson);
+  if (!f || f.type !== 'folder') return;
+  const target = type === 'smb'
+    ? normalizeSmbFavPath(f.path || (_path.replace(/\/$/, '') + '/' + f.name))
+    : (f.id || 'root');
+  const favId = makeFavoriteFolderId(type, _activeDrive.id, target);
+  const existingIdx = _favoriteFolders.findIndex(item => item && item.id === favId);
+
+  if (existingIdx >= 0) {
+    _favoriteFolders.splice(existingIdx, 1);
+    persistFavoritesLocal();
+    apiJSON(`/api/favorites?id=${encodeURIComponent(favId)}`, { method: 'DELETE' }).catch(() => {});
+    toast(`Removed "${f.name}" from Favorites`, 'info');
+  } else {
+    const stack = type === 'smb'
+      ? []
+      : [..._pathStack.map(s => ({ id: s.id, name: s.name })), { id: f.id, name: f.name }];
+    const entry = {
+      id: favId,
+      name: f.name,
+      driveType: type,
+      driveId: _activeDrive.id,
+      driveName: _activeDrive.name,
+      path: type === 'smb' ? target : '/',
+      folderId: type === 'smb' ? 'root' : target,
+      pathStack: stack,
+    };
+    _favoriteFolders.push(entry);
+    persistFavoritesLocal();
+    apiJSON('/api/favorites', { method: 'POST', json: entry }).catch(() => {});
+    toast(`Added "${f.name}" to Favorites`, 'success');
+  }
+
+  renderSidebar();
+  if (_view === 'files' && _activeDrive) {
+    setTopbarActions(fileToolbar(_activeDrive.type));
+    renderFileView(_currentFiles, _activeDrive.type, true);
+  }
+}
+
+async function toggleFavoriteCurrentFolder() {
+  if (_view !== 'files' || !_activeDrive) {
+    toast('Open a drive or folder first to bookmark it to Favorites', 'info');
+    return;
+  }
+  const type = _activeDrive.type;
+  const target = type === 'smb' ? normalizeSmbFavPath(_path) : (_folderId || 'root');
+  const favId = makeFavoriteFolderId(type, _activeDrive.id, target);
+  const existingIdx = _favoriteFolders.findIndex(item => item && item.id === favId);
+
+  let folderName = _activeDrive.name;
+  if (type === 'smb') {
+    const parts = target.split('/').filter(Boolean);
+    folderName = parts.length > 0 ? parts[parts.length - 1] : _activeDrive.name;
+  } else if (_pathStack.length > 0) {
+    folderName = _pathStack[_pathStack.length - 1].name || _activeDrive.name;
+  }
+
+  if (existingIdx >= 0) {
+    _favoriteFolders.splice(existingIdx, 1);
+    persistFavoritesLocal();
+    apiJSON(`/api/favorites?id=${encodeURIComponent(favId)}`, { method: 'DELETE' }).catch(() => {});
+    toast(`Removed "${folderName}" from Favorites`, 'info');
+  } else {
+    const entry = {
+      id: favId,
+      name: folderName,
+      driveType: type,
+      driveId: _activeDrive.id,
+      driveName: _activeDrive.name,
+      path: type === 'smb' ? target : '/',
+      folderId: type === 'smb' ? 'root' : target,
+      pathStack: type === 'smb' ? [] : _pathStack.map(s => ({ id: s.id, name: s.name })),
+    };
+    _favoriteFolders.push(entry);
+    persistFavoritesLocal();
+    apiJSON('/api/favorites', { method: 'POST', json: entry }).catch(() => {});
+    toast(`Added "${folderName}" to Favorites`, 'success');
+  }
+
+  renderSidebar();
+  setTopbarActions(fileToolbar(type));
+}
+
+function removeFavoriteById(favId, ev) {
+  if (ev) {
+    ev.preventDefault();
+    ev.stopPropagation();
+  }
+  const existing = _favoriteFolders.find(item => item && item.id === favId);
+  _favoriteFolders = _favoriteFolders.filter(item => item && item.id !== favId);
+  persistFavoritesLocal();
+  apiJSON(`/api/favorites?id=${encodeURIComponent(favId)}`, { method: 'DELETE' }).catch(() => {});
+  renderSidebar();
+  if (_view === 'files' && _activeDrive) {
+    setTopbarActions(fileToolbar(_activeDrive.type));
+    renderFileView(_currentFiles, _activeDrive.type, true);
+  }
+  if (existing) {
+    toast(`Removed "${existing.name}" from Favorites`, 'info');
+  }
+}
+
+function openFavoriteFolder(favId) {
+  const fav = _favoriteFolders.find(item => item && item.id === favId);
+  if (!fav) return;
+  _view = 'files';
+  closeMobileSidebar();
+  document.querySelectorAll('.sidebar-item[data-view]').forEach(el => el.classList.remove('active'));
+
+  if (fav.driveType === 'smb') {
+    const shareObj = _shares.find(s => s.id === fav.driveId);
+    _activeDrive = {
+      type: 'smb',
+      id: fav.driveId,
+      name: shareObj ? shareObj.name : (fav.driveName || fav.driveId),
+    };
+    _path = normalizeSmbFavPath(fav.path || '/');
+    renderSidebar();
+    loadSMBFiles();
+    return;
+  }
+
+  if (fav.driveType === 'onedrive') {
+    if (!_odStatus.authenticated || !_odAccounts.length) {
+      toast('Connect your Microsoft OneDrive account in Settings first', 'error');
+      setView('settings', 'onedrive');
+      return;
+    }
+    const acc = _odAccounts.find(a => a.id === fav.driveId) || _odAccounts[0];
+    const dispName = acc ? acc.name : (fav.driveName || 'OneDrive');
+    _activeDrive = {
+      type: 'onedrive',
+      id: acc ? acc.id : fav.driveId,
+      name: dispName,
+      email: acc?.email || '',
+    };
+    _folderId = fav.folderId || 'root';
+    if (Array.isArray(fav.pathStack) && fav.pathStack.length > 0) {
+      _pathStack = fav.pathStack.map((seg, i) => i === 0 ? { id: seg.id || 'root', name: dispName } : { id: seg.id, name: seg.name });
+    } else if (_folderId === 'root') {
+      _pathStack = [{ id: 'root', name: dispName }];
+    } else {
+      _pathStack = [{ id: 'root', name: dispName }, { id: _folderId, name: fav.name }];
+    }
+    renderSidebar();
+    loadOneDriveFiles();
+    return;
+  }
+
+  if (!_gdStatus.authenticated || !_gdAccounts.length) {
+    toast('Connect your Google Drive account in Settings first', 'error');
+    setView('settings', 'gdrive');
+    return;
+  }
+  const acc = _gdAccounts.find(a => a.id === fav.driveId) || _gdAccounts[0];
+  const dispName = acc ? acc.name : (fav.driveName || 'Google Drive');
+  _activeDrive = {
+    type: 'gdrive',
+    id: acc ? acc.id : fav.driveId,
+    name: dispName,
+    email: acc?.email || '',
+  };
+  _folderId = fav.folderId || 'root';
+  if (Array.isArray(fav.pathStack) && fav.pathStack.length > 0) {
+    _pathStack = fav.pathStack.map((seg, i) => i === 0 ? { id: seg.id || 'root', name: dispName } : { id: seg.id, name: seg.name });
+  } else if (_folderId === 'root') {
+    _pathStack = [{ id: 'root', name: dispName }];
+  } else {
+    _pathStack = [{ id: 'root', name: dispName }, { id: _folderId, name: fav.name }];
+  }
+  renderSidebar();
+  loadGDriveFiles();
+}
+
+function openFavoriteContextMenu(e, favId) {
+  e.preventDefault();
+  e.stopPropagation();
+  const fav = _favoriteFolders.find(item => item && item.id === favId);
+  if (!fav) return;
+  const menu = document.getElementById('context-menu');
+  menu.innerHTML = `
+    <button class="ctx-item" onclick="closeContextMenu();openFavoriteFolder('${escAttr(fav.id)}')">
+      <svg data-lucide="folder-open"></svg> Open "${escHtml(fav.name)}"
+    </button>
+    <div class="ctx-divider"></div>
+    <button class="ctx-item danger" onclick="closeContextMenu();removeFavoriteById('${escAttr(fav.id)}')">
+      <svg data-lucide="star-off"></svg> Remove from Favorites
+    </button>
+  `;
+  menu.style.display = 'flex';
+  lucide.createIcons();
+  const rect = menu.getBoundingClientRect();
+  menu.style.left = Math.max(8, Math.min(e.clientX, window.innerWidth - rect.width - 12)) + 'px';
+  menu.style.top = Math.max(8, Math.min(e.clientY, window.innerHeight - rect.height - 12)) + 'px';
 }
 
 function renderSidebar() {
@@ -1184,6 +1479,51 @@ function renderSidebar() {
   }
 
   el.innerHTML = html;
+
+  const favEl = document.getElementById('sidebar-favorites');
+  const favCurBtn = document.getElementById('sidebar-fav-current-btn');
+  if (favCurBtn) {
+    const canFavCur = _view === 'files' && Boolean(_activeDrive);
+    favCurBtn.style.display = canFavCur ? 'inline-flex' : 'none';
+    const curFavorited = isCurrentFolderFavorited();
+    favCurBtn.style.color = curFavorited ? 'var(--color-gold,#f59e0b)' : '';
+    favCurBtn.title = curFavorited
+      ? 'Remove current folder from Favorites'
+      : 'Add current folder to Favorites';
+  }
+  if (favEl) {
+    if (!_favoriteFolders.length) {
+      favEl.innerHTML = `<div style="padding:var(--space-2) var(--space-3);font-size:11px;color:var(--color-text-faint)">
+        No favorites — star any folder
+      </div>`;
+    } else {
+      let favHtml = '';
+      for (const fav of _favoriteFolders) {
+        if (!fav || !fav.id) continue;
+        const isAct = _view === 'files' &&
+          _activeDrive?.type === fav.driveType &&
+          _activeDrive?.id === fav.driveId &&
+          (fav.driveType === 'smb'
+            ? normalizeSmbFavPath(_path) === normalizeSmbFavPath(fav.path)
+            : _folderId === (fav.folderId || 'root'));
+        const locHint = fav.driveType === 'smb'
+          ? `${fav.driveName || fav.driveId} › ${fav.path || '/'}`
+          : `${fav.driveName || fav.driveId} › ${fav.name}`;
+        favHtml += `<div class="sidebar-item ${isAct ? 'active' : ''}"
+                         onclick="openFavoriteFolder('${escAttr(fav.id)}')"
+                         oncontextmenu="openFavoriteContextMenu(event,'${escAttr(fav.id)}')"
+                         title="${escHtml(locHint)}">
+          <svg data-lucide="folder-heart" style="color:var(--color-gold,#f59e0b)"></svg>
+          <span class="sidebar-item-label">${escHtml(fav.name)}</span>
+          <button class="sidebar-item-more" onclick="event.stopPropagation();openFavoriteContextMenu(event,'${escAttr(fav.id)}')" title="Favorite folder options">
+            <svg data-lucide="more-vertical" width="14" height="14"></svg>
+          </button>
+        </div>`;
+      }
+      favEl.innerHTML = favHtml;
+    }
+  }
+
   lucide.createIcons();
 }
 
@@ -1235,6 +1575,7 @@ function openShare(id, name) {
 async function loadSMBFiles() {
   setBreadcrumb(smbBreadcrumbs());
   setTopbarActions(fileToolbar('smb'));
+  renderSidebar();
   showLoading();
   try {
     const files = await apiJSON(`/api/smb/browse/${_activeDrive.id}?path=${encodeURIComponent(_path)}`);
@@ -1275,6 +1616,7 @@ function openGDrive(accountId = null, accountName = null) {
 async function loadGDriveFiles() {
   setBreadcrumb(gDriveBreadcrumbs());
   setTopbarActions(fileToolbar('gdrive'));
+  renderSidebar();
   showLoading();
   try {
     const accId = _activeDrive?.id || 'default';
@@ -1313,6 +1655,7 @@ function openOneDrive(accountId = null, accountName = null) {
 async function loadOneDriveFiles() {
   setBreadcrumb(gDriveBreadcrumbs());
   setTopbarActions(fileToolbar('onedrive'));
+  renderSidebar();
   showLoading();
   try {
     const accId = _activeDrive?.id || 'default';
@@ -1587,16 +1930,17 @@ function fileCardGrid(f, type) {
   const fj = encodeFileArg(f);
   const key = itemKey(f, type);
   const isSel = _selectedItems.has(key);
+  const isFav = f.type === 'folder' && isFolderFavorited(f, type);
   return `<div class="file-item-grid ${isSel ? 'selected' : ''}"
                onclick="fileClick('${fj}','${type}',event)"
                oncontextmenu="openContextMenu(event,'${fj}','${type}')">
     <input type="checkbox" class="grid-select-cb" ${isSel ? 'checked' : ''}
            onclick="toggleSelectItem('${fj}','${type}',event)" title="Select item" />
     <div class="file-icon-grid" style="${fileColorClass(f)}">
-      <svg data-lucide="${fileIcon(f)}" width="24" height="24"></svg>
+      <svg data-lucide="${isFav ? 'folder-heart' : fileIcon(f)}" width="24" height="24"></svg>
     </div>
     <span class="file-name" title="${escHtml(f.name)}">${escHtml(f.name)}</span>
-    <span class="file-meta">${f.type==='folder' ? 'Folder' : fmtSize(f.size)}</span>
+    <span class="file-meta">${f.type==='folder' ? (isFav ? '★ Favorite' : 'Folder') : fmtSize(f.size)}</span>
     <button class="btn btn-ghost btn-icon btn-sm grid-dl-btn"
         onclick="event.stopPropagation();openContextMenu(event,'${fj}','${type}')" title="More actions">
         <svg data-lucide="more-vertical" width="13" height="13"></svg>
@@ -1608,18 +1952,23 @@ function fileCardList(f, type) {
   const fj = encodeFileArg(f);
   const key = itemKey(f, type);
   const isSel = _selectedItems.has(key);
+  const isFav = f.type === 'folder' && isFolderFavorited(f, type);
   return `<div class="file-item-list ${isSel ? 'selected' : ''}"
                onclick="fileClick('${fj}','${type}',event)"
                oncontextmenu="openContextMenu(event,'${fj}','${type}')">
     <input type="checkbox" class="list-select-cb" ${isSel ? 'checked' : ''}
            onclick="toggleSelectItem('${fj}','${type}',event)" title="Select item" />
     <div class="file-icon" style="${fileColorClass(f)}">
-      <svg data-lucide="${fileIcon(f)}" width="18" height="18"></svg>
+      <svg data-lucide="${isFav ? 'folder-heart' : fileIcon(f)}" width="18" height="18"></svg>
     </div>
     <span class="file-name" style="max-width:none;flex:1" title="${escHtml(f.name)}">${escHtml(f.name)}</span>
     <span class="file-meta file-size-col" style="min-width:72px;text-align:right">${f.type==='folder' ? '—' : fmtSize(f.size)}</span>
     <span class="file-meta file-date-col" style="min-width:100px;text-align:right">${fmtDate(f.modified)}</span>
     <div class="file-actions" onclick="event.stopPropagation()">
+      ${f.type === 'folder' ? `
+      <button class="btn btn-ghost btn-icon btn-sm" onclick="toggleFavoriteFolderItem('${fj}','${type}',event)" title="${isFav ? 'Remove from Favorites' : 'Add to Favorites'}" style="${isFav ? 'color:var(--color-gold,#f59e0b)' : ''}">
+        <svg data-lucide="star" width="14" height="14"></svg></button>
+      ` : ''}
       <button class="btn btn-ghost btn-icon btn-sm" onclick="dlFile('${fj}','${type}')" title="${f.type==='folder'?'Download ZIP':'Download'}">
         <svg data-lucide="download" width="14" height="14"></svg></button>
       ${_adminMode ? `
@@ -2338,7 +2687,115 @@ async function toggleLosslessPlayback() {
   }
 }
 
+function getMediaResumeKey(f, type) {
+  if (!f) return '';
+  const driveId = _activeDrive?.id || 'default';
+  const itemId = type === 'smb'
+    ? normalizeSmbFavPath(f.path || (_path.replace(/\/$/, '') + '/' + f.name))
+    : (f.id || f.name);
+  return `${type}:${driveId}:${itemId}`;
+}
+
+function loadVideoResumeMap() {
+  try {
+    const raw = localStorage.getItem(VIDEO_RESUME_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function persistVideoResumeMap(map) {
+  try {
+    const entries = Object.entries(map || {});
+    if (entries.length > 200) {
+      entries.sort((a, b) => (Number(b[1]?.updatedAt) || 0) - (Number(a[1]?.updatedAt) || 0));
+      const trimmed = Object.fromEntries(entries.slice(0, 200));
+      localStorage.setItem(VIDEO_RESUME_STORAGE_KEY, JSON.stringify(trimmed));
+    } else {
+      localStorage.setItem(VIDEO_RESUME_STORAGE_KEY, JSON.stringify(map));
+    }
+  } catch (_) {}
+}
+
+function getSavedVideoProgress(f, type) {
+  const key = getMediaResumeKey(f, type);
+  if (!key) return null;
+  const map = loadVideoResumeMap();
+  const entry = map[key];
+  if (!entry || typeof entry.time !== 'number' || entry.time < 10) return null;
+  if (entry.duration > 30 && entry.time >= entry.duration - 15) return null;
+  return entry;
+}
+
+function saveVideoProgress(f, type, timeSec, durationSec) {
+  const key = getMediaResumeKey(f, type);
+  if (!key) return;
+  const t = Math.floor(Number(timeSec) || 0);
+  const d = Math.floor(Number(durationSec) || 0);
+  const map = loadVideoResumeMap();
+  if (d > 30 && t >= d - 15) {
+    if (map[key]) {
+      delete map[key];
+      persistVideoResumeMap(map);
+    }
+    return;
+  }
+  if (t < 10) return;
+  map[key] = {
+    time: t,
+    duration: d,
+    name: f.name || '',
+    updatedAt: Date.now(),
+  };
+  persistVideoResumeMap(map);
+}
+
+function clearVideoProgress(f, type) {
+  const key = getMediaResumeKey(f, type);
+  if (!key) return;
+  const map = loadVideoResumeMap();
+  if (map[key]) {
+    delete map[key];
+    persistVideoResumeMap(map);
+  }
+}
+
+function confirmVideoResume(shouldResume) {
+  const state = _activeMediaState;
+  const player = document.getElementById('active-media-player');
+  const promptEl = document.getElementById('video-resume-prompt');
+  if (promptEl) promptEl.style.display = 'none';
+  if (!state) return;
+
+  const targetSec = Number(state.savedResumeTime || 0);
+  state.resumePromptPending = false;
+  state.savedResumeTime = 0;
+
+  if (shouldResume && targetSec >= 10) {
+    if (state.seekTo) {
+      state.seekTo(targetSec);
+    } else if (player) {
+      try { player.currentTime = targetSec; } catch (_) {}
+      player.play().catch(() => {});
+    }
+  } else {
+    clearVideoProgress(state.f, state.type);
+    if (player) {
+      player.play().catch(() => {});
+    }
+  }
+}
+
 function cleanupActiveMedia() {
+  if (_activeMediaState && _activeMediaState.isVid && !_activeMediaState.resumePromptPending) {
+    const curPos = getMediaCurrentTime();
+    if (curPos >= 10) {
+      saveVideoProgress(_activeMediaState.f, _activeMediaState.type, curPos, _activeMediaState.totalDuration || 0);
+    }
+  }
   stopLosslessPipeline();
   if (_activeMediaState && _activeMediaState.skipDebounceTimer) {
     clearTimeout(_activeMediaState.skipDebounceTimer);
@@ -2619,16 +3076,16 @@ document.addEventListener('keydown', (e) => {
 
   if (e.key === 'ArrowLeft') {
     e.preventDefault();
-    skipMediaBy(e.shiftKey ? -30 : -10);
+    skipMediaBy(e.shiftKey ? -30 : -15);
   } else if (e.key === 'ArrowRight') {
     e.preventDefault();
-    skipMediaBy(e.shiftKey ? 30 : 10);
+    skipMediaBy(e.shiftKey ? 30 : 15);
   } else if (e.key === 'j' || e.key === 'J') {
     e.preventDefault();
-    skipMediaBy(-30);
+    skipMediaBy(-15);
   } else if (e.key === 'l' || e.key === 'L') {
     e.preventDefault();
-    skipMediaBy(30);
+    skipMediaBy(15);
   } else if ((e.key === ' ' || e.key === 'k' || e.key === 'K') && tag !== 'button') {
     e.preventDefault();
     toggleMediaPlayPause();
@@ -2763,7 +3220,10 @@ function openMedia(fJson, type) {
   var src = mediaApiUrl(f, type);
   var isVid = isVideoFile(f);
   var extBadge = (_fileExt(f) || (isVid ? 'video' : 'audio')).toUpperCase();
-  var rates = [0.5, 0.75, 1, 1.1, 1.25, 1.5, 2];
+  var rates = [1, 1.1, 1.25, 1.5, 2];
+  if (_playbackRate < 1 || !rates.some(r => Math.abs(r - _playbackRate) < 0.001)) {
+    _playbackRate = 1;
+  }
   var zooms = [
     { val: 1, label: '100%' },
     { val: 1.1, label: '110%' },
@@ -2776,11 +3236,8 @@ function openMedia(fJson, type) {
   var hudSpeedBtns = rates.map(r =>
     `<button class="hud-pill hud-speed-btn ${Math.abs(_playbackRate - r) < 0.001 ? 'active' : ''}" data-rate="${r}" onclick="event.stopPropagation();setPlaybackRate(${r})">${r}x</button>`
   ).join('');
-  var zoomBtns = zooms.map(z =>
-    `<button class="zoom-btn ${Math.abs(_videoZoom - z.val) < 0.001 ? 'active' : ''}" data-zoom="${z.val}" onclick="setVideoZoom(${z.val})" title="Zoom ${z.label}">${z.label}</button>`
-  ).join('');
   var hudZoomBtns = zooms.map(z =>
-    `<button class="hud-pill hud-zoom-btn ${Math.abs(_videoZoom - z.val) < 0.001 ? 'active' : ''}" data-zoom="${z.val}" onclick="event.stopPropagation();setVideoZoom(${z.val})" title="Fullscreen Zoom ${z.label}">${z.label}</button>`
+    `<button class="hud-pill hud-zoom-btn ${Math.abs(_videoZoom - z.val) < 0.001 ? 'active' : ''}" data-zoom="${z.val}" onclick="event.stopPropagation();setVideoZoom(${z.val})" title="Zoom ${z.label}">${z.label}</button>`
   ).join('');
 
   var btTitle = _btAudioDelayEnabled
@@ -2788,18 +3245,47 @@ function openMedia(fJson, type) {
     : 'Bluetooth Audio Delay: OFF (Click for +100ms audio delay)';
   var lsfgActive = Boolean(_losslessConfig && _losslessConfig.enabled);
   var lsfgTitle = getLosslessButtonTitle();
+  var savedResume = isVid ? getSavedVideoProgress(f, type) : null;
 
   var mediaEl = isVid
-    ? '<div id="video-stage-container" class="video-stage">'
+    ? '<div id="video-stage-container" class="video-stage" title="Double-tap left for -15s, double-tap right for +15s">'
         + '<video id="active-media-player" autoplay playsinline preload="auto" crossorigin="anonymous" '
-        +   'style="transform:scale(' + _videoZoom + ')" '
-        +   'onclick="toggleMediaPlayPause()" ondblclick="toggleVideoFullscreen()">'
+        +   'style="transform:scale(' + _videoZoom + ')">'
         +   'Your browser cannot play this video.</video>'
         + '<canvas id="video-lsfg-canvas" class="video-lsfg-canvas" style="transform:scale(' + _videoZoom + ')"></canvas>'
         + '<div id="video-subtitle-overlay" class="video-subtitle-overlay"></div>'
         + '<div id="video-lsfg-telemetry" class="video-lsfg-telemetry">'
         +   '<span class="video-lsfg-dot"></span>'
         +   '<span id="video-lsfg-telemetry-text">GPU 1.5x • 2X FG</span>'
+        + '</div>'
+        + '<div id="video-skip-left" class="video-skip-indicator left">'
+        +   '<svg data-lucide="chevrons-left" width="18" height="18"></svg>'
+        +   '<span id="video-skip-left-text">15s</span>'
+        + '</div>'
+        + '<div id="video-skip-right" class="video-skip-indicator right">'
+        +   '<span id="video-skip-right-text">15s</span>'
+        +   '<svg data-lucide="chevrons-right" width="18" height="18"></svg>'
+        + '</div>'
+        + '<div id="video-resume-prompt" class="video-resume-overlay" style="display:' + (savedResume ? 'flex' : 'none') + '" onclick="event.stopPropagation()">'
+        +   '<div class="video-resume-card">'
+        +     '<div style="display:flex;align-items:center;justify-content:center;gap:var(--space-2);color:var(--color-primary)">'
+        +       '<svg data-lucide="history" width="20" height="20"></svg>'
+        +       '<span style="font-weight:700;font-size:var(--text-base);color:var(--color-text)">Resume Video?</span>'
+        +     '</div>'
+        +     '<p style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.5;margin:0">'
+        +       'You previously stopped watching at <strong id="video-resume-time-label" style="font-family:var(--font-mono);color:var(--color-text)">'
+        +       (savedResume ? fmtMediaTime(savedResume.time) : '0:00')
+        +       '</strong>' + (savedResume && savedResume.duration > 0 ? ' of <span style="font-family:var(--font-mono)">' + fmtMediaTime(savedResume.duration) + '</span>' : '') + '.'
+        +     '</p>'
+        +     '<div style="display:flex;gap:var(--space-2);justify-content:center;flex-wrap:wrap;margin-top:var(--space-1)">'
+        +       '<button type="button" class="btn btn-primary btn-sm" id="video-resume-confirm-btn" onclick="confirmVideoResume(true)">'
+        +         '<svg data-lucide="play" width="14" height="14"></svg> Resume (' + (savedResume ? fmtMediaTime(savedResume.time) : '0:00') + ')'
+        +       '</button>'
+        +       '<button type="button" class="btn btn-secondary btn-sm" onclick="confirmVideoResume(false)">'
+        +         '<svg data-lucide="rotate-ccw" width="14" height="14"></svg> Start Over'
+        +       '</button>'
+        +     '</div>'
+        +   '</div>'
         + '</div>'
         + '<div id="video-stage-hud" class="video-stage-hud" onclick="event.stopPropagation()">'
         +   '<div style="display:flex;align-items:center;gap:var(--space-2)">'
@@ -2813,18 +3299,6 @@ function openMedia(fJson, type) {
         +     '<div class="video-hud-left">'
         +       '<button class="hud-btn media-play-toggle-btn" onclick="toggleMediaPlayPause()" title="Play / Pause (Space)">'
         +         '<svg data-lucide="pause" width="14" height="14"></svg>'
-        +       '</button>'
-        +       '<button class="hud-btn" onclick="skipMediaBy(-30)" title="Skip back 30 seconds (J or Shift+Left)">'
-        +         '<svg data-lucide="rotate-ccw" width="13" height="13"></svg> 30s'
-        +       '</button>'
-        +       '<button class="hud-btn" onclick="skipMediaBy(-10)" title="Skip back 10 seconds (Left Arrow)">'
-        +         '<svg data-lucide="rotate-ccw" width="13" height="13"></svg> 10s'
-        +       '</button>'
-        +       '<button class="hud-btn" onclick="skipMediaBy(10)" title="Skip forward 10 seconds (Right Arrow)">'
-        +         '10s <svg data-lucide="rotate-cw" width="13" height="13"></svg>'
-        +       '</button>'
-        +       '<button class="hud-btn" onclick="skipMediaBy(30)" title="Skip forward 30 seconds (L or Shift+Right)">'
-        +         '30s <svg data-lucide="rotate-cw" width="13" height="13"></svg>'
         +       '</button>'
         +       '<button class="hud-btn" id="stage-mute-btn" onclick="toggleMediaMute()" title="Mute / Unmute (M)">'
         +         '<svg data-lucide="volume-2" width="14" height="14"></svg>'
@@ -2867,6 +3341,45 @@ function openMedia(fJson, type) {
   var styleW = isVid ? 'max-width:900px' : 'max-width:560px';
   var fjEsc  = encodeFileArg(f);
 
+  var audioTimelineHtml = !isVid
+    ? '<div id="media-timeline-bar" style="display:flex;align-items:center;gap:var(--space-2);padding:6px 10px;background:var(--color-surface-offset);border:1px solid var(--color-border);border-radius:var(--radius-md)">'
+      + '<button class="btn btn-secondary btn-sm media-play-toggle-btn" onclick="toggleMediaPlayPause()" title="Play / Pause (Space)" style="padding:4px 8px">'
+      +   '<svg data-lucide="pause" width="14" height="14"></svg>'
+      + '</button>'
+      + '<span id="media-time-current" style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--color-text);min-width:46px;text-align:center">0:00</span>'
+      + '<input id="media-timeline-slider" type="range" min="0" max="100" step="0.1" value="0" '
+      +   'style="flex:1;accent-color:var(--color-primary);cursor:pointer;height:6px;min-width:80px" '
+      +   'oninput="onMediaTimelineScrubInput(this.value)" onchange="onMediaTimelineScrubChange(this.value)" title="Seek anywhere in full timeline"/>'
+      + '<span id="media-time-total" style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--color-text-muted);min-width:46px;text-align:center">0:00</span>'
+      + '<button class="btn ' + (_btAudioDelayEnabled ? 'btn-primary active' : 'btn-secondary') + ' btn-sm bt-delay-btn" onclick="toggleBtAudioDelay()" title="' + escAttr(btTitle) + '" style="padding:4px 8px;font-family:var(--font-mono)">BT</button>'
+      + '</div>'
+    : '';
+
+  var controlsBarHtml = (!isVid || _mediaPlaylist.length > 1)
+    ? '<div class="media-controls-bar">'
+      + '<div class="media-nav-group">'
+      +   '<button class="btn btn-secondary btn-sm" onclick="prevMediaTrack(\'' + type + '\')" ' + (_mediaPlaylist.length <= 1 ? 'disabled style="opacity:.45;cursor:not-allowed"' : '') + ' title="Previous track">'
+      +     '<svg data-lucide="skip-back" width="14" height="14"></svg> Prev'
+      +   '</button>'
+      +   '<span class="media-track-badge">' + (_mediaIndex + 1) + ' / ' + _mediaPlaylist.length + '</span>'
+      +   '<button class="btn btn-secondary btn-sm" onclick="nextMediaTrack(\'' + type + '\')" ' + (_mediaPlaylist.length <= 1 ? 'disabled style="opacity:.45;cursor:not-allowed"' : '') + ' title="Next track">'
+      +     'Next <svg data-lucide="skip-forward" width="14" height="14"></svg>'
+      +   '</button>'
+      +   (_mediaPlaylist.length > 1
+            ? '<label style="display:inline-flex;align-items:center;gap:4px;font-size:var(--text-xs);color:var(--color-text-muted);margin-left:var(--space-1);cursor:pointer">'
+              + '<input type="checkbox" ' + (_autoPlayNext ? 'checked' : '') + ' onchange="toggleAutoNext(this)" style="accent-color:var(--color-primary)"/> Auto-next</label>'
+            : '')
+      + '</div>'
+      + (!isVid
+          ? '<div style="display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap">'
+            + '<select id="media-audio-track-select" class="form-input" style="display:none;width:auto;padding:2px 8px;font-size:var(--text-xs);height:26px" onchange="changeMediaAudioTrack(this.value)" title="Audio track"></select>'
+            + '<span style="font-size:var(--text-xs);color:var(--color-text-muted)">Speed</span>'
+            + '<div class="speed-group">' + speedBtns + '</div>'
+            + '</div>'
+          : '<div style="font-size:11px;color:var(--color-text-faint);font-family:var(--font-mono)">Double-tap left/right: ±15s</div>')
+      + '</div>'
+    : '';
+
   showModal(
     '<div class="modal-header">'
     + '<div style="display:flex;align-items:center;gap:var(--space-2);overflow:hidden;max-width:calc(100% - 48px)">'
@@ -2882,63 +3395,13 @@ function openMedia(fJson, type) {
     +   '<div class="progress-track"><div id="media-stream-fill" class="progress-fill indeterminate"></div></div>'
     + '</div>'
     + mediaEl
-    + '<div id="media-timeline-bar" style="display:flex;align-items:center;gap:var(--space-2);padding:6px 10px;background:var(--color-surface-offset);border:1px solid var(--color-border);border-radius:var(--radius-md)">'
-    +   '<button class="btn btn-secondary btn-sm media-play-toggle-btn" onclick="toggleMediaPlayPause()" title="Play / Pause (Space)" style="padding:4px 8px">'
-    +     '<svg data-lucide="pause" width="14" height="14"></svg>'
-    +   '</button>'
-    +   '<button class="btn btn-secondary btn-sm" onclick="skipMediaBy(-30)" title="Skip backward 30s (J or Shift+Left)" style="padding:4px 7px;font-family:var(--font-mono)">'
-    +     '<svg data-lucide="rotate-ccw" width="13" height="13"></svg> 30s'
-    +   '</button>'
-    +   '<button class="btn btn-secondary btn-sm" onclick="skipMediaBy(-10)" title="Skip backward 10s (Left Arrow)" style="padding:4px 7px;font-family:var(--font-mono)">'
-    +     '<svg data-lucide="rotate-ccw" width="13" height="13"></svg> 10s'
-    +   '</button>'
-    +   '<span id="media-time-current" style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--color-text);min-width:46px;text-align:center">0:00</span>'
-    +   '<input id="media-timeline-slider" type="range" min="0" max="100" step="0.1" value="0" '
-    +     'style="flex:1;accent-color:var(--color-primary);cursor:pointer;height:6px;min-width:80px" '
-    +     'oninput="onMediaTimelineScrubInput(this.value)" onchange="onMediaTimelineScrubChange(this.value)" title="Seek anywhere in full timeline"/>'
-    +   '<span id="media-time-total" style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--color-text-muted);min-width:46px;text-align:center">0:00</span>'
-    +   '<button class="btn btn-secondary btn-sm" onclick="skipMediaBy(10)" title="Skip forward 10s (Right Arrow)" style="padding:4px 7px;font-family:var(--font-mono)">'
-    +     '10s <svg data-lucide="rotate-cw" width="13" height="13"></svg>'
-    +   '</button>'
-    +   '<button class="btn btn-secondary btn-sm" onclick="skipMediaBy(30)" title="Skip forward 30s (L or Shift+Right)" style="padding:4px 7px;font-family:var(--font-mono)">'
-    +     '30s <svg data-lucide="rotate-cw" width="13" height="13"></svg>'
-    +   '</button>'
-    +   (isVid
-          ? '<button class="btn ' + (_btAudioDelayEnabled ? 'btn-primary active' : 'btn-secondary') + ' btn-sm bt-delay-btn" onclick="toggleBtAudioDelay()" title="' + escAttr(btTitle) + '" style="padding:4px 8px;font-family:var(--font-mono)">BT</button>'
-            + '<button class="btn ' + (lsfgActive ? 'btn-primary active' : 'btn-secondary') + ' btn-sm lsfg-toggle-btn" onclick="toggleLosslessPlayback()" title="' + escAttr(lsfgTitle) + '" style="padding:4px 8px;font-family:var(--font-mono)">LSFG</button>'
-            + '<button class="btn btn-secondary btn-sm fs-toggle-btn" onclick="toggleVideoFullscreen()" title="Fullscreen (F)" style="padding:4px 8px">'
-            + '<svg data-lucide="maximize" width="14" height="14"></svg></button>'
-          : '')
-    + '</div>'
-    + '<div class="media-controls-bar">'
-    +   '<div class="media-nav-group">'
-    +     '<button class="btn btn-secondary btn-sm" onclick="prevMediaTrack(\'' + type + '\')" ' + (_mediaPlaylist.length <= 1 ? 'disabled style="opacity:.45;cursor:not-allowed"' : '') + ' title="Previous track">'
-    +       '<svg data-lucide="skip-back" width="14" height="14"></svg> Prev'
-    +     '</button>'
-    +     '<span class="media-track-badge">' + (_mediaIndex + 1) + ' / ' + _mediaPlaylist.length + '</span>'
-    +     '<button class="btn btn-secondary btn-sm" onclick="nextMediaTrack(\'' + type + '\')" ' + (_mediaPlaylist.length <= 1 ? 'disabled style="opacity:.45;cursor:not-allowed"' : '') + ' title="Next track">'
-    +       'Next <svg data-lucide="skip-forward" width="14" height="14"></svg>'
-    +     '</button>'
-    +     (_mediaPlaylist.length > 1
-            ? '<label style="display:inline-flex;align-items:center;gap:4px;font-size:var(--text-xs);color:var(--color-text-muted);margin-left:var(--space-1);cursor:pointer">'
-              + '<input type="checkbox" ' + (_autoPlayNext ? 'checked' : '') + ' onchange="toggleAutoNext(this)" style="accent-color:var(--color-primary)"/> Auto-next</label>'
-            : '')
-    +   '</div>'
-    +   '<div style="display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap">'
-    +     '<select id="media-audio-track-select" class="form-input" style="display:none;width:auto;padding:2px 8px;font-size:var(--text-xs);height:26px" onchange="changeMediaAudioTrack(this.value)" title="Audio track"></select>'
-    +     '<select id="media-subtitle-track-select" class="form-input" style="display:none;width:auto;padding:2px 8px;font-size:var(--text-xs);height:26px" onchange="changeMediaSubtitleTrack(this.value)" title="Embedded Subtitles (CC)"></select>'
-    +     (isVid
-            ? '<span style="font-size:var(--text-xs);color:var(--color-text-muted)">Zoom</span>'
-              + '<div class="zoom-group">' + zoomBtns + '</div>'
-            : '')
-    +     '<span style="font-size:var(--text-xs);color:var(--color-text-muted)">Speed</span>'
-    +     '<div class="speed-group">' + speedBtns + '</div>'
-    +   '</div>'
-    + '</div>'
+    + audioTimelineHtml
+    + controlsBarHtml
     + '<div style="display:flex;justify-content:space-between;align-items:center;gap:var(--space-2);flex-wrap:wrap">'
     +   '<div style="display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap">'
     +     '<span style="font-size:var(--text-xs);color:var(--color-text-muted);font-family:var(--font-mono)">' + fmtSize(f.size) + '</span>'
     +     '<span id="media-codec-badge" class="badge badge-primary" style="font-family:var(--font-mono);font-size:11px">' + escHtml(extBadge) + '</span>'
+    +     (isVid && _mediaPlaylist.length <= 1 ? '<span style="font-size:11px;color:var(--color-text-faint);font-family:var(--font-mono)">Double-tap left/right: ±15s</span>' : '')
     +   '</div>'
     +   '<div style="display:flex;align-items:center;gap:var(--space-2)">'
     +     '<button id="media-compat-btn" class="btn btn-secondary btn-sm" onclick="forceMediaCompatMode()" title="Convert unsupported audio (EAC3/AC3/DTS) to stereo AAC">'
@@ -2984,12 +3447,81 @@ function openMedia(fJson, type) {
   if (stageContainer) {
     let lastMouseX = -1;
     let lastMouseY = -1;
+    let lastTapWall = 0;
+    let lastTapSide = null;
+    let singleTapTimer = null;
+    let lastTouchEndWall = 0;
+    let accumSkipSec = 0;
+    let skipIndTimer = null;
+
+    const showSkipBadge = (side, totalDeltaSec) => {
+      const leftEl = document.getElementById('video-skip-left');
+      const rightEl = document.getElementById('video-skip-right');
+      const leftTxt = document.getElementById('video-skip-left-text');
+      const rightTxt = document.getElementById('video-skip-right-text');
+      const absSec = Math.abs(Math.round(totalDeltaSec));
+      if (side === 'left') {
+        if (rightEl) rightEl.classList.remove('visible');
+        if (leftTxt) leftTxt.textContent = `-${absSec}s`;
+        if (leftEl) leftEl.classList.add('visible');
+      } else {
+        if (leftEl) leftEl.classList.remove('visible');
+        if (rightTxt) rightTxt.textContent = `+${absSec}s`;
+        if (rightEl) rightEl.classList.add('visible');
+      }
+      if (skipIndTimer) clearTimeout(skipIndTimer);
+      skipIndTimer = setTimeout(() => {
+        skipIndTimer = null;
+        accumSkipSec = 0;
+        if (leftEl) leftEl.classList.remove('visible');
+        if (rightEl) rightEl.classList.remove('visible');
+      }, 650);
+    };
+
+    const handleStageTapOrClick = (clientX, targetEl, isTouch) => {
+      if (!targetEl) return;
+      if (targetEl.closest('#video-stage-hud, #video-resume-prompt, button, select, input, a, label')) {
+        return;
+      }
+      const rect = stageContainer.getBoundingClientRect();
+      if (!rect || rect.width <= 0) return;
+      const relX = (clientX - rect.left) / rect.width;
+      const side = relX < 0.5 ? 'left' : 'right';
+      const now = performance.now();
+
+      if (now - lastTapWall <= 320 && lastTapSide === side) {
+        if (singleTapTimer) {
+          clearTimeout(singleTapTimer);
+          singleTapTimer = null;
+        }
+        lastTapWall = now;
+        const delta = side === 'left' ? -15 : 15;
+        accumSkipSec = skipIndTimer ? (accumSkipSec + delta) : delta;
+        skipMediaBy(delta);
+        showSkipBadge(side, accumSkipSec);
+        return;
+      }
+
+      lastTapWall = now;
+      lastTapSide = side;
+      if (singleTapTimer) clearTimeout(singleTapTimer);
+      singleTapTimer = setTimeout(() => {
+        singleTapTimer = null;
+        if (_activeMediaState?.resumePromptPending) return;
+        if (!isTouch) {
+          toggleMediaPlayPause();
+        } else {
+          wakeHud();
+        }
+      }, 260);
+    };
+
     const wakeHud = () => {
       stageContainer.classList.remove('hud-hidden');
       if (_hudIdleTimer) clearTimeout(_hudIdleTimer);
       _hudIdleTimer = setTimeout(() => {
         if (!stageContainer) return;
-        if (_activeMediaState?.isScrubbing) {
+        if (_activeMediaState?.isScrubbing || _activeMediaState?.resumePromptPending) {
           wakeHud();
           return;
         }
@@ -3009,11 +3541,23 @@ function openMedia(fJson, type) {
       wakeHud();
     });
     stageContainer.addEventListener('mousedown', wakeHud);
-    stageContainer.addEventListener('click', wakeHud);
+    stageContainer.addEventListener('click', (e) => {
+      wakeHud();
+      if (performance.now() - lastTouchEndWall < 450) return;
+      handleStageTapOrClick(e.clientX, e.target, false);
+    });
     stageContainer.addEventListener('touchstart', wakeHud, { passive: true });
+    stageContainer.addEventListener('touchend', (e) => {
+      const touch = e.changedTouches && e.changedTouches[0];
+      if (!touch) return;
+      if (e.target && !e.target.closest('#video-stage-hud, #video-resume-prompt, button, select, input, a, label')) {
+        lastTouchEndWall = performance.now();
+        handleStageTapOrClick(touch.clientX, e.target, true);
+      }
+    }, { passive: true });
     stageContainer.addEventListener('mouseleave', () => {
       const isFs = Boolean(document.fullscreenElement || document.webkitFullscreenElement);
-      if (player && !player.paused && !_activeMediaState?.isScrubbing && !isFs) {
+      if (player && !player.paused && !_activeMediaState?.isScrubbing && !_activeMediaState?.resumePromptPending && !isFs) {
         stageContainer.classList.add('hud-hidden');
       }
     });
@@ -3031,7 +3575,7 @@ function openMedia(fJson, type) {
     subReqId: 0,
     canRemux: true,
     probeInfo: null,
-    totalDuration: 0,
+    totalDuration: (savedResume && savedResume.duration > 0) ? savedResume.duration : 0,
     seekOffset: 0,
     awaitingMetadata: false,
     pendingSeekTarget: null,
@@ -3040,6 +3584,9 @@ function openMedia(fJson, type) {
     ignoreNextSeeking: false,
     triedFallback: false,
     silentCheckDone: false,
+    resumePromptPending: Boolean(savedResume && savedResume.time >= 10),
+    savedResumeTime: (savedResume && savedResume.time >= 10) ? savedResume.time : 0,
+    lastProgressSaveWall: 0,
     switchMode: null,
     seekTo: null,
     refreshSubtitles: null,
@@ -3047,6 +3594,9 @@ function openMedia(fJson, type) {
   _activeMediaState = state;
   if (isVid) {
     applyLosslessPipelineToActivePlayer();
+    if (state.resumePromptPending) {
+      setTimeout(() => document.getElementById('video-resume-confirm-btn')?.focus(), 50);
+    }
   }
 
   async function refreshSubtitles() {
@@ -3229,7 +3779,11 @@ function openMedia(fJson, type) {
     if (isVid && state.subtitleTrack >= 0) {
       refreshSubtitles();
     }
-    player.play().catch(() => {});
+    if (!state.resumePromptPending) {
+      player.play().catch(() => {});
+    } else {
+      player.pause();
+    }
   }
   state.switchMode = switchMode;
 
@@ -3280,6 +3834,10 @@ function openMedia(fJson, type) {
 
   player.playbackRate = _playbackRate;
   player.onplay = () => {
+    if (state.resumePromptPending) {
+      player.pause();
+      return;
+    }
     if (_btAudioDelayEnabled) applyBtAudioDelayToPlayer(player);
     updatePlayPauseIcons();
     if (stageContainer && stageContainer._wakeHud) stageContainer._wakeHud();
@@ -3287,10 +3845,19 @@ function openMedia(fJson, type) {
   player.onpause = () => {
     updatePlayPauseIcons();
     if (stageContainer) stageContainer.classList.remove('hud-hidden');
+    if (isVid && !state.resumePromptPending) {
+      const curPos = getMediaCurrentTime();
+      if (curPos >= 10) {
+        saveVideoProgress(state.f, state.type, curPos, state.totalDuration || 0);
+      }
+    }
   };
   player.onloadedmetadata = () => {
     state.awaitingMetadata = false;
     player.playbackRate = _playbackRate;
+    if (state.resumePromptPending) {
+      player.pause();
+    }
     syncTimelineUi();
     updateCodecUi();
   };
@@ -3303,6 +3870,9 @@ function openMedia(fJson, type) {
     player.playbackRate = _playbackRate;
     state.ignoreNextSeeking = false;
     if (statusWrap) statusWrap.style.display = 'none';
+    if (state.resumePromptPending) {
+      player.pause();
+    }
     syncTimelineUi();
     updatePlayPauseIcons();
   };
@@ -3311,6 +3881,9 @@ function openMedia(fJson, type) {
     player.playbackRate = _playbackRate;
     state.ignoreNextSeeking = false;
     if (statusWrap) statusWrap.style.display = 'none';
+    if (state.resumePromptPending) {
+      player.pause();
+    }
     syncTimelineUi();
     updatePlayPauseIcons();
   };
@@ -3322,6 +3895,10 @@ function openMedia(fJson, type) {
     }
   };
   player.onplaying = () => {
+    if (state.resumePromptPending) {
+      player.pause();
+      return;
+    }
     state.awaitingMetadata = false;
     state.ignoreNextSeeking = false;
     if (_btAudioDelayEnabled) applyBtAudioDelayToPlayer(player);
@@ -3348,6 +3925,9 @@ function openMedia(fJson, type) {
       syncTimelineUi();
       updateCodecUi();
     }
+    if (isVid) {
+      clearVideoProgress(state.f, state.type);
+    }
     if (_autoPlayNext && _mediaPlaylist.length > 1) {
       nextMediaTrack(type);
     }
@@ -3356,6 +3936,17 @@ function openMedia(fJson, type) {
   player.ontimeupdate = () => {
     if (_activeMediaState !== state) return;
     syncTimelineUi();
+
+    if (isVid && !state.resumePromptPending && !state.isScrubbing) {
+      const nowWall = performance.now();
+      if (nowWall - (state.lastProgressSaveWall || 0) >= 2000) {
+        state.lastProgressSaveWall = nowWall;
+        const curPos = getMediaCurrentTime();
+        if (curPos >= 10) {
+          saveVideoProgress(state.f, state.type, curPos, state.totalDuration || 0);
+        }
+      }
+    }
 
     if (!isVid || state.mode !== 'direct' || state.silentCheckDone) return;
     if (player.currentTime < 1.5) return;
@@ -4147,8 +4738,12 @@ function openContextMenu(e, fJson, type) {
 
   let html = '';
   if (f.type === 'folder') {
+    const isFav = isFolderFavorited(f, type);
     html += `<button class="ctx-item" onclick="closeContextMenu();fileClick('${fJson}','${type}')">
       <svg data-lucide="folder-open"></svg> Open Folder
+    </button>`;
+    html += `<button class="ctx-item" onclick="closeContextMenu();toggleFavoriteFolderItem('${fJson}','${type}',event)">
+      <svg data-lucide="${isFav ? 'star-off' : 'star'}"></svg> ${isFav ? 'Remove from Favorites' : 'Add to Favorites'}
     </button>`;
   } else if (isMedia) {
     html += `<button class="ctx-item" onclick="closeContextMenu();openMedia('${fJson}','${type}')">
@@ -4812,7 +5407,11 @@ async function rmFile(fJson, type) {
 function fileToolbar(type) {
   const dirIcon = _sortDir === 'asc' ? 'arrow-up-narrow-wide' : 'arrow-down-wide-narrow';
   const dirTitle = _sortDir === 'asc' ? 'Sort ascending (click to sort descending)' : 'Sort descending (click to sort ascending)';
+  const curFavorited = isCurrentFolderFavorited();
   return `
+    <button class="btn ${curFavorited ? 'btn-primary' : 'btn-secondary'} btn-sm" onclick="toggleFavoriteCurrentFolder()" title="${curFavorited ? 'Remove current folder from Favorites' : 'Add current folder to Favorites'}">
+      <svg data-lucide="star" width="14" height="14"></svg> <span class="btn-label">${curFavorited ? 'Favorited' : 'Favorite'}</span>
+    </button>
     ${_adminMode ? `
     <button class="btn btn-secondary btn-sm" onclick="showMkdirModal('${type}')" title="New Folder">
       <svg data-lucide="folder-plus" width="14" height="14"></svg> <span class="btn-label">New Folder</span>

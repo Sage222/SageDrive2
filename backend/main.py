@@ -3575,8 +3575,83 @@ def set_smb_proxy_creds():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ── Favorite Folders Persistence ──────────────────────────────────────────────
+_FAVORITES_FILE = Path(os.environ.get("DATA_DIR", "/app/data")) / "favorites.json"
+_favorites_lock = threading.Lock()
+
+
+def _load_favorites_list() -> list:
+    if not _FAVORITES_FILE.exists():
+        return []
+    try:
+        data = json.loads(_FAVORITES_FILE.read_text())
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_favorites_list(favs: list):
+    _FAVORITES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _FAVORITES_FILE.write_text(json.dumps(favs, indent=2))
+
+
+@app.get("/api/favorites")
+@auth.require_auth
+def get_favorite_folders():
+    with _favorites_lock:
+        return jsonify(_load_favorites_list())
+
+
+@app.post("/api/favorites")
+@auth.require_auth
+def save_favorite_folder():
+    body = request.get_json(force=True) or {}
+    if isinstance(body.get("favorites"), list):
+        with _favorites_lock:
+            _save_favorites_list(body["favorites"])
+            return jsonify({"ok": True, "favorites": body["favorites"]})
+
+    fav_id = str(body.get("id") or "").strip()
+    if not fav_id:
+        return jsonify({"error": "Favorite folder id is required"}), 400
+
+    entry = {
+        "id": fav_id,
+        "name": str(body.get("name") or "Folder").strip() or "Folder",
+        "driveType": str(body.get("driveType") or "smb").strip(),
+        "driveId": str(body.get("driveId") or "default").strip(),
+        "driveName": str(body.get("driveName") or "Drive").strip(),
+        "path": str(body.get("path") or "/").strip(),
+        "folderId": str(body.get("folderId") or "root").strip(),
+        "pathStack": body.get("pathStack") if isinstance(body.get("pathStack"), list) else [],
+    }
+    with _favorites_lock:
+        favs = _load_favorites_list()
+        idx = next((i for i, item in enumerate(favs) if item.get("id") == fav_id), -1)
+        if idx >= 0:
+            favs[idx] = entry
+        else:
+            favs.append(entry)
+        _save_favorites_list(favs)
+        return jsonify({"ok": True, "favorites": favs})
+
+
+@app.delete("/api/favorites")
+@auth.require_auth
+def delete_favorite_folder():
+    body = request.get_json(silent=True) or {}
+    fav_id = (request.args.get("id") or body.get("id") or "").strip()
+    if not fav_id:
+        return jsonify({"error": "Favorite folder id is required"}), 400
+    with _favorites_lock:
+        favs = [item for item in _load_favorites_list() if item.get("id") != fav_id]
+        _save_favorites_list(favs)
+        return jsonify({"ok": True, "favorites": favs})
+
+
 # Trigger initial multi-drive SMB proxy reconciliation in background on startup
 threading.Thread(target=lambda: _reconcile_smb_proxy(), daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080, debug=False, threaded=True)
+

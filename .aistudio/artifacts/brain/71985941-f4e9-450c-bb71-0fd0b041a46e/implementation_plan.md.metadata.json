@@ -1,6 +1,6 @@
 {
-  "summary":  "Plan to fix 3 Lossless.dll playback issues: (1) accurate 24fps base frame rate detection instead of 120Hz monitor refresh rate, (2) 100% untouched native video quality when LSFG is turned off (and zero downscaling/ghosting when active), and (3) 5-second auto-hide for the top Lossless.dll watermark alongside the bottom HUD menu.",
-  "updatedAt":  "2026-10-29T03:38:56.019220478Z",
+  "summary":  "Plan to fix 2x Frame Generation motion smoothness (fixing mid-frame texture overwrites and upgrading the optical-flow + temporal midpoint shader), enhance 1.25x/1.5x spatial upscaling, and add a dedicated '2x FG' toggle button in the video HUD.",
+  "updatedAt":  "2026-11-11T02:16:05.675813429Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

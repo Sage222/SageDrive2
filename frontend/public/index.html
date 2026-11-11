@@ -2187,9 +2187,18 @@ function getLosslessButtonTitle() {
     : `GPU Upscaling & Frame Gen OFF (${summary}) — Click to enable`;
 }
 
+function getFrameGenButtonTitle() {
+  const isFgOn = Boolean(_losslessConfig?.enabled && _losslessConfig?.frame_gen === '2x');
+  return isFgOn
+    ? '2x Frame Generation ON — Click to disable 2x motion interpolation'
+    : '2x Frame Generation OFF — Click to enable 2x motion interpolation';
+}
+
 function updateLosslessButtons() {
   const isAct = Boolean(_losslessConfig?.enabled);
+  const isFgOn = Boolean(isAct && _losslessConfig?.frame_gen === '2x');
   const titleStr = getLosslessButtonTitle();
+  const fgTitleStr = getFrameGenButtonTitle();
   document.querySelectorAll('.lsfg-toggle-btn').forEach(btn => {
     btn.classList.toggle('active', isAct);
     if (btn.classList.contains('btn')) {
@@ -2197,6 +2206,10 @@ function updateLosslessButtons() {
       btn.classList.toggle('btn-secondary', !isAct);
     }
     btn.title = titleStr;
+  });
+  document.querySelectorAll('.fg-toggle-btn').forEach(btn => {
+    btn.classList.toggle('active', isFgOn);
+    btn.title = fgTitleStr;
   });
 }
 
@@ -2285,7 +2298,7 @@ function initWebGLVideoPipeline(canvas) {
     }
   `;
 
-  // Directional EASU + AMD RCAS (Robust Contrast Adaptive Sharpening) + 1-Step Optical-Flow 2x Frame Interpolation
+  // Directional Spatial Reconstruction (1.25x / 1.5x) + AMD RCAS + Coarse-to-Fine Optical-Flow 2x Frame Interpolation
   const fsSrc = `
     precision highp float;
     varying vec2 v_uv;
@@ -2294,43 +2307,96 @@ function initWebGLVideoPipeline(canvas) {
     uniform vec2 u_texelSize;
     uniform float u_blend;
     uniform float u_sharpness;
+    uniform float u_scaleFactor;
 
     float luma(vec3 c) {
       return dot(c, vec3(0.299, 0.587, 0.114));
     }
 
+    vec3 sampleSpatialTex(sampler2D tex, vec2 uv) {
+      vec3 c = texture2D(tex, uv).rgb;
+      if (u_scaleFactor <= 1.05) {
+        return c;
+      }
+      vec2 d = u_texelSize * 0.65;
+      vec3 n = texture2D(tex, uv + vec2(0.0, -d.y)).rgb;
+      vec3 s = texture2D(tex, uv + vec2(0.0,  d.y)).rgb;
+      vec3 w = texture2D(tex, uv + vec2(-d.x, 0.0)).rgb;
+      vec3 e = texture2D(tex, uv + vec2( d.x, 0.0)).rgb;
+
+      vec3 min4 = min(min(n, s), min(w, e));
+      vec3 max4 = max(max(n, s), max(w, e));
+      float contrast = luma(max4 - min4);
+      float weight = -0.11 * clamp((u_scaleFactor - 1.0) * 1.8, 0.25, 1.0) * smoothstep(0.015, 0.12, contrast);
+      vec3 recon = (c + (n + s + w + e) * weight) / (1.0 + 4.0 * weight);
+      return clamp(recon, min4, max4);
+    }
+
     vec3 sampleMotionFrame(vec2 uv) {
-      vec3 curr = texture2D(u_currTex, uv).rgb;
+      vec3 curr = sampleSpatialTex(u_currTex, uv);
       if (u_blend <= 0.01) {
         return curr;
       }
-      vec3 prev = texture2D(u_prevTex, uv).rgb;
+      vec3 prev = sampleSpatialTex(u_prevTex, uv);
       float yCurr = luma(curr);
       float yPrev = luma(prev);
       float dt = yCurr - yPrev;
       float absDt = abs(dt);
 
-      // Scene-cut & fast-occlusion guard: prevent ghosting across cuts
-      if (absDt > 0.20) {
+      // True scene-cut guard: prevent ghosting across hard camera cuts
+      if (absDt > 0.36) {
         return curr;
       }
 
-      vec2 dx = vec2(u_texelSize.x, 0.0);
-      vec2 dy = vec2(0.0, u_texelSize.y);
-      float gx = (luma(texture2D(u_currTex, uv + dx).rgb) - luma(texture2D(u_currTex, uv - dx).rgb)) * 0.5;
-      float gy = (luma(texture2D(u_currTex, uv + dy).rgb) - luma(texture2D(u_currTex, uv - dy).rgb)) * 0.5;
-      float gradMagSq = gx * gx + gy * gy + 0.008;
+      // Coarse scale (+/- 4.0 texels) for fast camera pans and large motion up to +/- 10px
+      vec2 cStep = u_texelSize * 4.0;
+      float gxC = (luma(texture2D(u_currTex, uv + vec2(cStep.x, 0.0)).rgb) - luma(texture2D(u_currTex, uv - vec2(cStep.x, 0.0)).rgb)) * 0.5;
+      float gyC = (luma(texture2D(u_currTex, uv + vec2(0.0, cStep.y)).rgb) - luma(texture2D(u_currTex, uv - vec2(0.0, cStep.y)).rgb)) * 0.5;
+      float dtC = (yCurr + luma(texture2D(u_currTex, uv + vec2(cStep.x, 0.0)).rgb)) * 0.5
+                - (yPrev + luma(texture2D(u_prevTex, uv + vec2(cStep.x, 0.0)).rgb)) * 0.5;
+      float gradMagSqC = gxC * gxC + gyC * gyC + 0.004;
+      vec2 flowCoarseUv = clamp(vec2(-dtC * gxC, -dtC * gyC) / gradMagSqC, vec2(-2.5), vec2(2.5)) * cStep;
 
-      vec2 flowPx = clamp(vec2(-dt * gx, -dt * gy) / gradMagSq, vec2(-2.0), vec2(2.0));
-      vec2 flowUv = flowPx * u_texelSize;
+      // Fine scale (+/- 1.25 texels) for crisp detail motion up to +/- 4.4px
+      vec2 fStep = u_texelSize * 1.25;
+      float gxF = (luma(texture2D(u_currTex, uv + vec2(fStep.x, 0.0)).rgb) - luma(texture2D(u_currTex, uv - vec2(fStep.x, 0.0)).rgb)) * 0.5;
+      float gyF = (luma(texture2D(u_currTex, uv + vec2(0.0, fStep.y)).rgb) - luma(texture2D(u_currTex, uv - vec2(0.0, fStep.y)).rgb)) * 0.5;
+      float gradMagSqF = gxF * gxF + gyF * gyF + 0.003;
+      vec2 flowFineUv = clamp(vec2(-dt * gxF, -dt * gyF) / gradMagSqF, vec2(-3.5), vec2(3.5)) * fStep;
 
-      vec3 prevWarped = texture2D(u_prevTex, clamp(uv + flowUv * 0.5, 0.0, 1.0)).rgb;
-      vec3 currWarped = texture2D(u_currTex, clamp(uv - flowUv * 0.5, 0.0, 1.0)).rgb;
-      vec3 interp = mix(prevWarped, currWarped, 0.5);
+      // Evaluate candidate warps (fine flow vs coarse flow vs zero flow) and select minimum residual error
+      vec3 prevFine = sampleSpatialTex(u_prevTex, clamp(uv + flowFineUv * 0.5, 0.0, 1.0));
+      vec3 currFine = sampleSpatialTex(u_currTex, clamp(uv - flowFineUv * 0.5, 0.0, 1.0));
+      float diffFine = abs(luma(prevFine) - luma(currFine));
 
-      float warpDiff = abs(luma(prevWarped) - luma(currWarped));
-      float conf = 1.0 - smoothstep(0.06, 0.18, warpDiff);
-      return mix(curr, interp, conf * min(1.0, u_blend * 2.0));
+      vec3 prevCoarse = sampleSpatialTex(u_prevTex, clamp(uv + flowCoarseUv * 0.5, 0.0, 1.0));
+      vec3 currCoarse = sampleSpatialTex(u_currTex, clamp(uv - flowCoarseUv * 0.5, 0.0, 1.0));
+      float diffCoarse = abs(luma(prevCoarse) - luma(currCoarse));
+
+      vec3 bestPrev = prevFine;
+      vec3 bestCurr = currFine;
+      float bestDiff = diffFine;
+
+      if (diffCoarse < bestDiff) {
+        bestPrev = prevCoarse;
+        bestCurr = currCoarse;
+        bestDiff = diffCoarse;
+      }
+      if (absDt < bestDiff) {
+        bestPrev = prev;
+        bestCurr = curr;
+        bestDiff = absDt;
+      }
+
+      vec3 warpedMid = mix(bestPrev, bestCurr, 0.5);
+      vec3 temporalMid = mix(prev, curr, 0.5);
+      float flowConf = 1.0 - smoothstep(0.04, 0.22, bestDiff);
+      vec3 synthMid = mix(temporalMid, warpedMid, flowConf);
+
+      // Smooth fade near scene-cut boundary so fast flashes don't ghost
+      float cutFade = 1.0 - smoothstep(0.24, 0.36, absDt);
+      vec3 midFrame = mix(curr, synthMid, cutFade);
+      return mix(curr, midFrame, clamp(u_blend * 2.0, 0.0, 1.0));
     }
 
     void main() {
@@ -2340,7 +2406,7 @@ function initWebGLVideoPipeline(canvas) {
         return;
       }
 
-      vec2 off = u_texelSize * 0.82;
+      vec2 off = u_texelSize * (u_scaleFactor > 1.05 ? 0.76 : 0.85);
       vec3 n = sampleMotionFrame(v_uv + vec2(0.0, -off.y));
       vec3 s = sampleMotionFrame(v_uv + vec2(0.0,  off.y));
       vec3 w = sampleMotionFrame(v_uv + vec2(-off.x, 0.0));
@@ -2352,8 +2418,8 @@ function initWebGLVideoPipeline(canvas) {
       float minL = luma(minC);
       float maxL = luma(maxC);
       float localContrast = maxL - minL;
-      float edgeMask = smoothstep(0.012, 0.09, localContrast);
-      float rcasPeak = -0.185 * u_sharpness * edgeMask;
+      float edgeMask = smoothstep(0.01, 0.085, localContrast);
+      float rcasPeak = -0.195 * u_sharpness * edgeMask;
 
       vec3 sharpened = (c + (n + s + w + e) * rcasPeak) / (1.0 + 4.0 * rcasPeak);
       vec3 clamped = clamp(sharpened, minC - 0.02, maxC + 0.02);
@@ -2420,6 +2486,7 @@ function initWebGLVideoPipeline(canvas) {
     uTexelSize: gl.getUniformLocation(prog, 'u_texelSize'),
     uBlend: gl.getUniformLocation(prog, 'u_blend'),
     uSharpness: gl.getUniformLocation(prog, 'u_sharpness'),
+    uScaleFactor: gl.getUniformLocation(prog, 'u_scaleFactor'),
   };
 
   gl.uniform1i(pipeline.uCurrTex, 0);
@@ -2508,21 +2575,34 @@ function applyLosslessPipelineToActivePlayer() {
   let measuredDecodedFps = 24;
   let vfcCount = 0;
   let vfcSampleStart = performance.now();
+  const hasVfcSupport = typeof player.requestVideoFrameCallback === 'function';
+  let vfcActive = false;
+  let lastPresentedFrames = -1;
+  let lastMediaTime = -1;
 
-  if (typeof player.requestVideoFrameCallback === 'function') {
-    const onVideoFrame = (now) => {
+  if (hasVfcSupport) {
+    const onVideoFrame = (now, metadata) => {
       if (!document.getElementById('active-media-player') || !_losslessConfig?.enabled) return;
-      newVideoFrameReady = true;
-      lastFrameWallTime = now;
-      vfcCount++;
-      const elapsed = now - vfcSampleStart;
-      if (elapsed >= 500) {
-        const inst = (vfcCount * 1000) / elapsed;
-        if (inst >= 10 && inst <= 120) {
-          measuredDecodedFps = measuredDecodedFps * 0.6 + inst * 0.4;
+      const presFrames = metadata && typeof metadata.presentedFrames === 'number' ? metadata.presentedFrames : -1;
+      const mediaTime = metadata && typeof metadata.mediaTime === 'number' ? metadata.mediaTime : -1;
+      const isDistinctFrame = (presFrames < 0 || presFrames !== lastPresentedFrames) &&
+                              (mediaTime < 0 || Math.abs(mediaTime - lastMediaTime) > 0.0005);
+      if (isDistinctFrame) {
+        newVideoFrameReady = true;
+        lastFrameWallTime = now;
+        lastPresentedFrames = presFrames;
+        lastMediaTime = mediaTime;
+        vfcActive = true;
+        vfcCount++;
+        const elapsed = now - vfcSampleStart;
+        if (elapsed >= 500) {
+          const inst = (vfcCount * 1000) / elapsed;
+          if (inst >= 10 && inst <= 120) {
+            measuredDecodedFps = measuredDecodedFps * 0.6 + inst * 0.4;
+          }
+          vfcCount = 0;
+          vfcSampleStart = now;
         }
-        vfcCount = 0;
-        vfcSampleStart = now;
       }
       _lsfgVfcId = player.requestVideoFrameCallback(onVideoFrame);
     };
@@ -2541,8 +2621,8 @@ function applyLosslessPipelineToActivePlayer() {
     const fgMult = _losslessConfig.frame_gen === '2x' ? 2 : 1;
     const rawSharp = Math.max(0, Math.min(1, Number(_losslessConfig.sharpness ?? 0.55)));
     const effSharp = scaleFactor > 1.05
-      ? rawSharp * (0.75 + (scaleFactor - 1.0) * 0.5)
-      : rawSharp * 0.4;
+      ? rawSharp * (0.78 + (scaleFactor - 1.0) * 0.55)
+      : rawSharp * 0.45;
 
     const probedFps = (_activeMediaState && _activeMediaState.probeInfo && _activeMediaState.probeInfo.video_fps > 0)
       ? Number(_activeMediaState.probeInfo.video_fps)
@@ -2551,12 +2631,14 @@ function applyLosslessPipelineToActivePlayer() {
     const activeBaseFps = Math.max(12, Math.min(120, (probedFps > 0 ? probedFps : measuredDecodedFps) * rate));
     const frameIntervalMs = 1000 / activeBaseFps;
 
-    // Fallback frame-change detection for Smart TV browsers without requestVideoFrameCallback
-    const curVidTime = player.currentTime || 0;
-    if (Math.abs(curVidTime - lastVideoTime) >= (1 / (activeBaseFps * 1.8))) {
-      newVideoFrameReady = true;
-      lastVideoTime = curVidTime;
-      if (!_lsfgVfcId) {
+    // Fallback frame-change detection ONLY when requestVideoFrameCallback is unavailable or inactive (e.g. legacy Smart TV WebViews)
+    // Using >= 0.88 / activeBaseFps prevents mid-frame double-uploads that would overwrite texPrev with texCurr!
+    if (!hasVfcSupport || !vfcActive || player.seeking) {
+      const curVidTime = player.currentTime || 0;
+      const minDelta = player.seeking ? 0.001 : (0.88 / activeBaseFps);
+      if (Math.abs(curVidTime - lastVideoTime) >= minDelta) {
+        newVideoFrameReady = true;
+        lastVideoTime = curVidTime;
         lastFrameWallTime = now;
       }
     }
@@ -2616,12 +2698,12 @@ function applyLosslessPipelineToActivePlayer() {
         gl.bindTexture(gl.TEXTURE_2D, glPipe.texPrev);
 
         // Causal 2x Frame Generation cadence:
-        // First half of source frame interval [0, 0.48 * T): render motion-compensated midpoint F_{N-0.5} (u_blend = 0.5)
-        // Second half of source frame interval [0.48 * T, T): render exact decoded frame F_N (u_blend = 0.0)
+        // First half of source frame interval [0, 0.50 * T): render motion-compensated midpoint F_{N-0.5} (u_blend = 0.5)
+        // Second half of source frame interval [0.50 * T, T): render exact decoded frame F_N (u_blend = 0.0)
         let blendVal = 0.0;
         if (fgMult === 2 && !player.paused && !player.seeking) {
           const sinceFrame = now - lastFrameWallTime;
-          if (sinceFrame >= 0 && sinceFrame < frameIntervalMs * 0.48) {
+          if (sinceFrame >= 0 && sinceFrame < frameIntervalMs * 0.50) {
             blendVal = 0.5;
           }
         }
@@ -2629,6 +2711,9 @@ function applyLosslessPipelineToActivePlayer() {
         gl.uniform2f(glPipe.uTexelSize, 1.0 / vw, 1.0 / vh);
         gl.uniform1f(glPipe.uBlend, blendVal);
         gl.uniform1f(glPipe.uSharpness, Math.min(1.0, effSharp));
+        if (glPipe.uScaleFactor !== null) {
+          gl.uniform1f(glPipe.uScaleFactor, scaleFactor);
+        }
         gl.drawArrays(gl.TRIANGLES, 0, 6);
       }
     } else if (webglFallbackMode) {
@@ -2684,6 +2769,36 @@ async function toggleLosslessPlayback() {
     );
   } catch (e) {
     toast(e.message || 'Failed to toggle Upscaling & Frame Gen', 'error');
+  }
+}
+
+async function toggleFrameGenPlayback() {
+  const stage = document.getElementById('video-stage-container');
+  if (stage && stage._wakeHud) stage._wakeHud();
+
+  const currentlyFgOn = Boolean(_losslessConfig?.enabled && _losslessConfig?.frame_gen === '2x');
+  const nextFg = currentlyFgOn ? 'off' : '2x';
+  const nextEnabled = nextFg === '2x' ? true : Boolean(_losslessConfig?.enabled);
+
+  _losslessConfig.enabled = nextEnabled;
+  _losslessConfig.frame_gen = nextFg;
+  applyLosslessPipelineToActivePlayer();
+
+  try {
+    const res = await apiJSON('/api/settings/upscaling', {
+      method: 'POST',
+      json: { enabled: nextEnabled, frame_gen: nextFg },
+    });
+    _losslessConfig = normalizeLosslessConfig(res);
+    applyLosslessPipelineToActivePlayer();
+    toast(
+      _losslessConfig.enabled && _losslessConfig.frame_gen === '2x'
+        ? `2x Frame Generation ON (${getUpscaleSummaryLabel(_losslessConfig)})`
+        : `2x Frame Generation OFF (${getUpscaleSummaryLabel(_losslessConfig)})`,
+      'info'
+    );
+  } catch (e) {
+    toast(e.message || 'Failed to toggle 2x Frame Generation', 'error');
   }
 }
 
@@ -3244,7 +3359,9 @@ function openMedia(fJson, type) {
     ? 'Bluetooth Audio Delay: +100ms ON (Click to disable)'
     : 'Bluetooth Audio Delay: OFF (Click for +100ms audio delay)';
   var lsfgActive = Boolean(_losslessConfig && _losslessConfig.enabled);
+  var fgActive = Boolean(lsfgActive && _losslessConfig.frame_gen === '2x');
   var lsfgTitle = getLosslessButtonTitle();
+  var fgTitle = getFrameGenButtonTitle();
   var savedResume = isVid ? getSavedVideoProgress(f, type) : null;
 
   var mediaEl = isVid
@@ -3308,6 +3425,9 @@ function openMedia(fJson, type) {
         +       '</button>'
         +       '<button class="hud-btn lsfg-toggle-btn ' + (lsfgActive ? 'active' : '') + '" id="stage-lsfg-btn" onclick="toggleLosslessPlayback()" title="' + escAttr(lsfgTitle) + '">'
         +         'LSFG'
+        +       '</button>'
+        +       '<button class="hud-btn fg-toggle-btn ' + (fgActive ? 'active' : '') + '" id="stage-fg-btn" onclick="toggleFrameGenPlayback()" title="' + escAttr(fgTitle) + '">'
+        +         '2x FG'
         +       '</button>'
         +     '</div>'
         +     '<div class="video-hud-right">'

@@ -1,6 +1,0 @@
-{
-  "summary":  "Plan to fix 2x Frame Generation motion smoothness (fixing mid-frame texture overwrites and upgrading the optical-flow + temporal midpoint shader), enhance 1.25x/1.5x spatial upscaling, and add a dedicated '2x FG' toggle button in the video HUD.",
-  "updatedAt":  "2026-11-11T02:16:05.675813429Z",
-  "requestFeedback":  true,
-  "userFacing":  true
-}

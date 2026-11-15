@@ -4,9 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SageDrive</title>
-  <meta name="description" content="Self-hosted browser-based file manager providing unified access to SMB/NAS shares, Google Drive, and Microsoft OneDrive from a single interface." />
+  <meta name="description" content="Self-hosted browser-based file manager providing unified access to SMB/NAS shares, Google Drive, Microsoft OneDrive, and FileJump with resumable upload/download queues." />
   <meta property="og:title" content="SageDrive" />
-  <meta property="og:description" content="Self-hosted browser-based file manager providing unified access to SMB/NAS shares, Google Drive, and Microsoft OneDrive from a single interface." />
+  <meta property="og:description" content="Self-hosted browser-based file manager providing unified access to SMB/NAS shares, Google Drive, Microsoft OneDrive, and FileJump with resumable upload/download queues." />
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' fill='none'%3E%3Crect width='64' height='64' rx='16' fill='%2301696f'/%3E%3Crect x='4' y='4' width='56' height='56' rx='13' stroke='%234f98a3' stroke-opacity='0.35' stroke-width='2'/%3E%3Cpath d='M14 45L25.5 19L32.5 35L39.5 23.5L51 45' stroke='%23ffffff' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='49' cy='19' r='4.5' fill='%237fd8e6'/%3E%3C/svg%3E" />
   <link rel="alternate icon" href="/favicon.svg" />
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -575,6 +575,69 @@
       .login-card{padding:var(--space-6)}
       .card-header,.card-body{padding:var(--space-4)}
       .share-item{flex-wrap:wrap;gap:var(--space-2)}
+      .transfer-queue-drawer{left:var(--space-3);right:var(--space-3);bottom:var(--space-3);width:auto;max-width:none}
+    }
+
+    /* ── Resumable Transfer Queue Drawer & Topbar Pill ── */
+    .transfer-pill-btn{
+      display:inline-flex;align-items:center;gap:6px;
+      padding:5px 10px;border-radius:var(--radius-md);
+      font-size:var(--text-xs);font-weight:600;
+      font-family:var(--font-mono);font-variant-numeric:tabular-nums;
+      background:var(--color-surface-offset);color:var(--color-text);
+      border:1px solid var(--color-border);cursor:pointer;
+      transition:all var(--transition);flex-shrink:0
+    }
+    .transfer-pill-btn:hover{border-color:var(--color-primary);background:var(--color-surface-dynamic)}
+    .transfer-pill-btn.active{
+      border-color:var(--color-primary);
+      background:color-mix(in oklab, var(--color-primary) 16%, var(--color-surface-offset));
+      color:var(--color-primary)
+    }
+    .transfer-queue-drawer{
+      position:fixed;right:var(--space-5);bottom:var(--space-5);
+      width:440px;max-width:calc(100vw - 24px);max-height:72vh;
+      background:var(--color-surface);border:1px solid var(--color-border);
+      border-radius:var(--radius-lg);box-shadow:var(--shadow-lg);
+      display:flex;flex-direction:column;z-index:180;overflow:hidden
+    }
+    .transfer-queue-header{
+      display:flex;align-items:center;justify-content:space-between;gap:var(--space-2);
+      padding:var(--space-3) var(--space-4);background:var(--color-surface-2);
+      border-bottom:1px solid var(--color-divider)
+    }
+    .transfer-queue-title{
+      display:flex;align-items:center;gap:var(--space-2);
+      font-size:var(--text-sm);font-weight:600;color:var(--color-text)
+    }
+    .transfer-queue-list{
+      display:flex;flex-direction:column;overflow-y:auto;
+      max-height:54vh;divide-y:1px solid var(--color-divider)
+    }
+    .transfer-job-row{
+      display:flex;flex-direction:column;gap:6px;
+      padding:var(--space-3) var(--space-4);
+      border-bottom:1px solid var(--color-divider);
+      background:var(--color-surface);transition:background var(--transition)
+    }
+    .transfer-job-row:hover{background:var(--color-surface-2)}
+    .transfer-job-top{
+      display:flex;align-items:center;justify-content:space-between;gap:var(--space-2)
+    }
+    .transfer-job-name{
+      display:flex;align-items:center;gap:6px;min-width:0;flex:1;
+      font-size:var(--text-xs);font-weight:600;color:var(--color-text)
+    }
+    .transfer-job-name span{
+      overflow:hidden;text-overflow:ellipsis;white-space:nowrap
+    }
+    .transfer-job-actions{
+      display:flex;align-items:center;gap:4px;flex-shrink:0
+    }
+    .transfer-job-meta{
+      display:flex;align-items:center;justify-content:space-between;gap:var(--space-2);
+      font-size:11px;color:var(--color-text-muted);
+      font-family:var(--font-mono);font-variant-numeric:tabular-nums
     }
   </style>
 </head>
@@ -676,13 +739,20 @@
         </button>
         <nav class="breadcrumb" id="breadcrumb"></nav>
       </div>
-      <div class="topbar-right" id="topbar-actions"></div>
+      <div class="topbar-right">
+        <div id="topbar-actions" style="display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap"></div>
+        <button type="button" class="transfer-pill-btn" id="topbar-transfer-pill" onclick="toggleTransferDrawer()" title="Open Resumable Upload &amp; Download Queue">
+          <svg data-lucide="arrow-up-down" width="13" height="13"></svg>
+          <span id="topbar-transfer-pill-label">Queue (0)</span>
+        </button>
+      </div>
     </div>
     <div class="content-area" id="content-area"></div>
   </div>
 </div>
 
 <div class="toast-container" id="toasts"></div>
+<div id="transfer-queue-drawer" class="transfer-queue-drawer" style="display:none"></div>
 <div id="modal-root"></div>
 <div class="context-menu" id="context-menu"></div>
 
@@ -707,6 +777,8 @@ let _gdConfig  = {client_id:'', client_secret:'', redirect_uri:''};
 let _odStatus  = {configured:false, authenticated:false, accounts:[]};
 let _odAccounts = [];
 let _odConfig  = {client_id:'', client_secret:'', redirect_uri:'', tenant_id:'common'};
+let _fjStatus  = {configured:true, authenticated:false, accounts:[]};
+let _fjAccounts = [];
 let smbProxyCreds = {username:'sagedrive', configured:false, shares:[]};
 let _settingsTab = 'gdrive';
 let _oauthFormExpanded = false;
@@ -1095,8 +1167,10 @@ async function initApp() {
   await refreshShares();
   await refreshGDStatus();
   await refreshODStatus();
+  await refreshFJStatus();
   await refreshFavorites();
   renderSidebar();
+  renderTransferQueueUI();
   setView('welcome');
   lucide.createIcons();
 }
@@ -1311,6 +1385,33 @@ function openFavoriteFolder(favId) {
     return;
   }
 
+  if (fav.driveType === 'filejump') {
+    if (!_fjStatus.authenticated || !_fjAccounts.length) {
+      toast('Connect your FileJump account in Settings first', 'error');
+      setView('settings', 'filejump');
+      return;
+    }
+    const acc = _fjAccounts.find(a => a.id === fav.driveId) || _fjAccounts[0];
+    const dispName = acc ? acc.name : (fav.driveName || 'FileJump');
+    _activeDrive = {
+      type: 'filejump',
+      id: acc ? acc.id : fav.driveId,
+      name: dispName,
+      email: acc?.email || '',
+    };
+    _folderId = fav.folderId || 'root';
+    if (Array.isArray(fav.pathStack) && fav.pathStack.length > 0) {
+      _pathStack = fav.pathStack.map((seg, i) => i === 0 ? { id: seg.id || 'root', name: dispName } : { id: seg.id, name: seg.name });
+    } else if (_folderId === 'root') {
+      _pathStack = [{ id: 'root', name: dispName }];
+    } else {
+      _pathStack = [{ id: 'root', name: dispName }, { id: _folderId, name: fav.name }];
+    }
+    renderSidebar();
+    loadFileJumpFiles();
+    return;
+  }
+
   if (!_gdStatus.authenticated || !_gdAccounts.length) {
     toast('Connect your Google Drive account in Settings first', 'error');
     setView('settings', 'gdrive');
@@ -1416,6 +1517,33 @@ function renderSidebar() {
     </div>`;
   }
 
+  if (_fjAccounts.length > 0) {
+    for (const acc of _fjAccounts) {
+      const isAct = _activeDrive?.type === 'filejump' && _activeDrive?.id === acc.id && _view === 'files';
+      const accJson = encodeFileArg(acc);
+      const subHint = acc.email ? ` (${acc.email})` : '';
+      html += `<div class="sidebar-item ${isAct ? 'active' : ''}"
+                    onclick="openFileJump('${escAttr(acc.id)}','${escAttr(acc.name)}')"
+                    oncontextmenu="openDriveContextMenu(event,'filejump','${accJson}')"
+                    title="${escHtml(acc.name)}${escHtml(subHint)}">
+        <svg data-lucide="zap"></svg>
+        <span class="sidebar-item-label">${escHtml(acc.name)}</span>
+        <button class="sidebar-item-more" onclick="event.stopPropagation();openDriveContextMenu(event,'filejump','${accJson}')" title="FileJump options">
+          <svg data-lucide="more-vertical" width="14" height="14"></svg>
+        </button>
+      </div>`;
+    }
+  } else {
+    html += `<div class="sidebar-item"
+                  onclick="openFileJump()"
+                  oncontextmenu="openDriveContextMenu(event,'filejump_off','')"
+                  title="Connect FileJump in Settings">
+      <svg data-lucide="cloud-off"></svg>
+      <span class="sidebar-item-label">FileJump</span>
+      <span class="badge badge-error" style="margin-left:auto;font-size:10px">off</span>
+    </div>`;
+  }
+
   for (const s of _shares) {
     const isAct = _activeDrive?.type === 'smb' && _activeDrive?.id === s.id && _view === 'files';
     const sJson = encodeFileArg(s);
@@ -1431,7 +1559,7 @@ function renderSidebar() {
     </div>`;
   }
 
-  if (!_shares.length && !_gdAccounts.length && !_odAccounts.length) {
+  if (!_shares.length && !_gdAccounts.length && !_odAccounts.length && !_fjAccounts.length) {
     html += `<div style="padding:var(--space-3);font-size:var(--text-xs);color:var(--color-text-faint)">
       No drives — add one in Settings
     </div>`;
@@ -1623,10 +1751,42 @@ async function loadOneDriveFiles() {
   } catch(e) { showError(e.message); }
 }
 
+function openFileJump(accountId = null, accountName = null) {
+  if (!_fjStatus.authenticated || !_fjAccounts.length) {
+    toast('Connect a FileJump account in Settings first', 'error');
+    setView('settings', 'filejump');
+    return;
+  }
+  _view = 'files';
+  const acc = (accountId && _fjAccounts.find(a => a.id === accountId)) || _fjAccounts[0];
+  const dispName = acc ? acc.name : (accountName || 'FileJump');
+  const resolvedId = acc ? acc.id : (accountId || 'default');
+  _activeDrive = {type:'filejump', id: resolvedId, name: dispName, email: acc?.email || ''};
+  _folderId = 'root';
+  _pathStack = [{id:'root', name: dispName}];
+  closeMobileSidebar();
+  document.querySelectorAll('.sidebar-item[data-view]').forEach(el => el.classList.remove('active'));
+  renderSidebar();
+  loadFileJumpFiles();
+}
+
+async function loadFileJumpFiles() {
+  setBreadcrumb(gDriveBreadcrumbs());
+  setTopbarActions(fileToolbar('filejump'));
+  renderSidebar();
+  showLoading();
+  try {
+    const accId = _activeDrive?.id || 'default';
+    const files = await apiJSON(`/api/filejump/files?folder=${encodeURIComponent(_folderId)}&account_id=${encodeURIComponent(accId)}`);
+    renderFileView(files, 'filejump');
+  } catch(e) { showError(e.message); }
+}
+
 function reloadActiveDriveFiles() {
   if (!_activeDrive) return;
   if (_activeDrive.type === 'smb') loadSMBFiles();
   else if (_activeDrive.type === 'onedrive') loadOneDriveFiles();
+  else if (_activeDrive.type === 'filejump') loadFileJumpFiles();
   else loadGDriveFiles();
 }
 
@@ -1690,6 +1850,9 @@ function updateBatchBar() {
         </button>
       </div>
       <div class="batch-bar-actions">
+        <button class="btn btn-primary btn-sm" onclick="queueSelectedDownloads('${type}')">
+          <svg data-lucide="download" width="14" height="14"></svg> Queue Downloads
+        </button>
         <button class="btn btn-secondary btn-sm" onclick="downloadSelectedZip('${type}')">
           <svg data-lucide="archive" width="14" height="14"></svg> Download ZIP
         </button>
@@ -2010,6 +2173,9 @@ function mediaApiUrl(f, type) {
   if (type === 'onedrive') {
     return '/api/onedrive/download/' + encodeURIComponent(f.id) + '?account_id=' + accId + '&token=' + t;
   }
+  if (type === 'filejump') {
+    return '/api/filejump/download/' + encodeURIComponent(f.id) + '?account_id=' + accId + '&token=' + t;
+  }
   return '/api/gdrive/download/' + encodeURIComponent(f.id) + '?account_id=' + accId + '&token=' + t;
 }
 function mediaProbeUrl(f, type) {
@@ -2019,6 +2185,9 @@ function mediaProbeUrl(f, type) {
   var accId = encodeURIComponent(_activeDrive?.id || 'default');
   if (type === 'onedrive') {
     return '/api/onedrive/probe/' + encodeURIComponent(f.id) + '?account_id=' + accId;
+  }
+  if (type === 'filejump') {
+    return '/api/filejump/probe/' + encodeURIComponent(f.id) + '?account_id=' + accId;
   }
   return '/api/gdrive/probe/' + encodeURIComponent(f.id) + '?account_id=' + accId;
 }
@@ -2031,6 +2200,9 @@ function mediaSubtitleUrl(f, type, trackIdx, startSec) {
   var accId = encodeURIComponent(_activeDrive?.id || 'default');
   if (type === 'onedrive') {
     return '/api/onedrive/subtitles/' + encodeURIComponent(f.id) + '?account_id=' + accId + '&track=' + trk + '&ss=' + ss;
+  }
+  if (type === 'filejump') {
+    return '/api/filejump/subtitles/' + encodeURIComponent(f.id) + '?account_id=' + accId + '&track=' + trk + '&ss=' + ss;
   }
   return '/api/gdrive/subtitles/' + encodeURIComponent(f.id) + '?account_id=' + accId + '&track=' + trk + '&ss=' + ss;
 }
@@ -3736,6 +3908,12 @@ async function saveEditedTextFile(fJson, type) {
         method: 'PUT',
         json: { content: newContent, account_id: accId }
       });
+    } else if (type === 'filejump') {
+      const accId = _activeDrive?.id || 'default';
+      res = await apiJSON(`/api/filejump/content/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}`, {
+        method: 'PUT',
+        json: { content: newContent, account_id: accId }
+      });
     } else {
       const accId = _activeDrive?.id || 'default';
       res = await apiJSON(`/api/gdrive/content/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}`, {
@@ -3928,11 +4106,29 @@ function fileClick(fJson, type, ev) {
     _pathStack.push({id:f.id, name:f.name});
     _folderId = f.id;
     loadOneDriveFiles();
+  } else if (type==='filejump') {
+    _pathStack.push({id:f.id, name:f.name});
+    _folderId = f.id;
+    loadFileJumpFiles();
   } else {
     _pathStack.push({id:f.id, name:f.name});
     _folderId = f.id;
     loadGDriveFiles();
   }
+}
+
+function buildFileDownloadUrl(f, type, driveId = null) {
+  const accId = driveId || _activeDrive?.id || 'default';
+  if (type === 'smb') {
+    return `/api/smb/download/${encodeURIComponent(accId)}?path=${encodeURIComponent(f.path || f.name)}&dl=1`;
+  }
+  if (type === 'onedrive') {
+    return `/api/onedrive/download/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}&dl=1`;
+  }
+  if (type === 'filejump') {
+    return `/api/filejump/download/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}&dl=1`;
+  }
+  return `/api/gdrive/download/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}&dl=1`;
 }
 
 function dlFile(fJson, type) {
@@ -3953,6 +4149,13 @@ function dlFile(fJson, type) {
         0,
         { method: 'POST', json: { ids: [f.id], name: `${f.name}.zip`, account_id: accId } }
       );
+    } else if (type === 'filejump') {
+      authedDownload(
+        `/api/filejump/zip?account_id=${encodeURIComponent(accId)}`,
+        `${f.name}.zip`,
+        0,
+        { method: 'POST', json: { ids: [f.id], name: `${f.name}.zip`, account_id: accId } }
+      );
     } else {
       authedDownload(
         `/api/gdrive/zip?account_id=${encodeURIComponent(accId)}`,
@@ -3963,13 +4166,551 @@ function dlFile(fJson, type) {
     }
     return;
   }
-  if (type==='smb') {
-    authedDownload(`/api/smb/download/${_activeDrive.id}?path=${encodeURIComponent(f.path)}&dl=1`, f.name, f.size);
-  } else if (type==='onedrive') {
-    authedDownload(`/api/onedrive/download/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}&dl=1`, f.name, f.size);
-  } else {
-    authedDownload(`/api/gdrive/download/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}&dl=1`, f.name, f.size);
+  // Enqueue single file into the Resumable Transfer Queue Manager
+  enqueueDownloadFile(f, type, _activeDrive?.id || 'default', _activeDrive?.name || type);
+}
+
+function queueSelectedDownloads(type) {
+  const items = Array.from(_selectedItems.values());
+  if (!items.length) return;
+  const filesOnly = items.filter(it => it.type !== 'folder');
+  const foldersOnly = items.filter(it => it.type === 'folder');
+  for (const f of filesOnly) {
+    enqueueDownloadFile(f, type, _activeDrive?.id || 'default', _activeDrive?.name || type);
   }
+  if (foldersOnly.length > 0 && filesOnly.length === 0) {
+    downloadSelectedZip(type);
+  } else if (foldersOnly.length > 0) {
+    toast(`Queued ${filesOnly.length} file(s); use Download ZIP for folders`, 'info');
+  }
+  clearSelection();
+}
+
+// ── Resumable Upload & Download Transfer Queue Manager ─────────────────────────
+const _transferQueue = [];
+let _transferDrawerOpen = false;
+let _transferWorkerRunning = false;
+const UPLOAD_CHUNK_SIZE = 2 * 1024 * 1024; // 2 MiB chunks for byte-offset resume
+
+function toggleTransferDrawer(forceState = null) {
+  _transferDrawerOpen = typeof forceState === 'boolean' ? forceState : !_transferDrawerOpen;
+  renderTransferQueueUI();
+}
+
+function renderTransferQueueUI() {
+  const pillBtn = document.getElementById('topbar-transfer-pill');
+  const pillLabel = document.getElementById('topbar-transfer-pill-label');
+  const drawer = document.getElementById('transfer-queue-drawer');
+
+  const activeJobs = _transferQueue.filter(j => j.status === 'active' || j.status === 'queued');
+  const pausedJobs = _transferQueue.filter(j => j.status === 'paused');
+
+  if (pillBtn && pillLabel) {
+    if (activeJobs.length > 0) {
+      const cur = _transferQueue.find(j => j.status === 'active') || activeJobs[0];
+      const pct = cur.totalBytes > 0 ? Math.min(100, Math.floor((cur.transferredBytes / cur.totalBytes) * 100)) : 0;
+      pillBtn.classList.add('active');
+      pillLabel.textContent = `${activeJobs.length} Active · ${pct}%`;
+    } else if (pausedJobs.length > 0) {
+      pillBtn.classList.add('active');
+      pillLabel.textContent = `${pausedJobs.length} Paused`;
+    } else {
+      pillBtn.classList.remove('active');
+      pillLabel.textContent = `Queue (${_transferQueue.length})`;
+    }
+  }
+
+  if (!drawer) return;
+  if (!_transferDrawerOpen) {
+    drawer.style.display = 'none';
+    return;
+  }
+  drawer.style.display = 'flex';
+
+  const hasFinished = _transferQueue.some(j => j.status === 'completed' || j.status === 'cancelled' || j.status === 'error');
+  const hasPausable = _transferQueue.some(j => j.status === 'active' || j.status === 'queued');
+  const hasResumable = _transferQueue.some(j => j.status === 'paused' || j.status === 'error');
+
+  drawer.innerHTML = `
+    <div class="transfer-queue-header">
+      <div class="transfer-queue-title">
+        <svg data-lucide="arrow-up-down" width="15" height="15" style="color:var(--color-primary)"></svg>
+        <span>Transfer Queue (${_transferQueue.length})</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:4px">
+        ${hasPausable ? `
+          <button class="btn btn-secondary btn-sm" onclick="pauseAllTransfers()" title="Pause all active transfers" style="padding:3px 7px;font-size:11px">
+            <svg data-lucide="pause" width="12" height="12"></svg> Pause All
+          </button>
+        ` : ''}
+        ${hasResumable ? `
+          <button class="btn btn-secondary btn-sm" onclick="resumeAllTransfers()" title="Resume all paused transfers" style="padding:3px 7px;font-size:11px">
+            <svg data-lucide="play" width="12" height="12"></svg> Resume All
+          </button>
+        ` : ''}
+        ${hasFinished ? `
+          <button class="btn btn-ghost btn-sm" onclick="clearCompletedTransfers()" title="Clear completed transfers" style="padding:3px 7px;font-size:11px">
+            Clear Done
+          </button>
+        ` : ''}
+        <button class="btn btn-ghost btn-icon btn-sm" onclick="toggleTransferDrawer(false)" title="Minimize queue">
+          <svg data-lucide="chevron-down" width="15" height="15"></svg>
+        </button>
+      </div>
+    </div>
+    <div class="transfer-queue-list">
+      ${_transferQueue.length === 0 ? `
+        <div style="padding:var(--space-6) var(--space-4);text-align:center;color:var(--color-text-muted);font-size:var(--text-xs)">
+          No transfers in queue. Upload or download files from any drive to track and resume progress here.
+        </div>
+      ` : _transferQueue.map(job => {
+        const pct = job.totalBytes > 0
+          ? Math.min(100, Math.floor((job.transferredBytes / job.totalBytes) * 100))
+          : (job.status === 'completed' ? 100 : 0);
+        const dirIcon = job.direction === 'upload' ? 'upload' : 'download';
+        const statusColor = job.status === 'completed'
+          ? 'var(--color-success)'
+          : (job.status === 'error' ? 'var(--color-error)' : (job.status === 'paused' ? 'var(--color-warning)' : 'var(--color-primary)'));
+        const fillClass = job.status === 'completed' ? 'done' : (job.status === 'error' ? 'error' : '');
+        const speedInfo = job.status === 'active' && job.speedBps > 0 ? ` · ${fmtSize(job.speedBps)}/s` : '';
+        const statusLabel = job.status === 'active'
+          ? `${pct}%${speedInfo}`
+          : (job.status === 'paused'
+              ? `Paused at ${pct}%`
+              : (job.status === 'queued'
+                  ? 'Queued'
+                  : (job.status === 'completed' ? 'Completed' : (job.errorMsg || 'Failed'))));
+        return `
+          <div class="transfer-job-row" id="tjob_${job.id}">
+            <div class="transfer-job-top">
+              <div class="transfer-job-name" title="${escHtml(job.driveName + ' › ' + job.name)}">
+                <svg data-lucide="${dirIcon}" width="13" height="13" style="color:${statusColor};flex-shrink:0"></svg>
+                <span>${escHtml(job.name)}</span>
+              </div>
+              <div class="transfer-job-actions">
+                ${job.status === 'completed' && job.blobUrl ? `
+                  <a href="${job.blobUrl}" download="${escAttr(job.name)}" class="btn btn-primary btn-sm" style="text-decoration:none;padding:2px 8px;font-size:11px">Save</a>
+                ` : ''}
+                ${job.status === 'active' || job.status === 'queued' ? `
+                  <button class="btn btn-ghost btn-icon btn-sm" onclick="pauseTransferJob('${job.id}')" title="Pause transfer">
+                    <svg data-lucide="pause" width="13" height="13"></svg>
+                  </button>
+                ` : ''}
+                ${job.status === 'paused' ? `
+                  <button class="btn btn-ghost btn-icon btn-sm" onclick="resumeTransferJob('${job.id}')" title="Resume transfer from byte offset">
+                    <svg data-lucide="play" width="13" height="13" style="color:var(--color-success)"></svg>
+                  </button>
+                ` : ''}
+                ${job.status === 'error' ? `
+                  <button class="btn btn-ghost btn-icon btn-sm" onclick="retryTransferJob('${job.id}')" title="Retry / Resume transfer">
+                    <svg data-lucide="rotate-cw" width="13" height="13" style="color:var(--color-primary)"></svg>
+                  </button>
+                ` : ''}
+                <button class="btn btn-ghost btn-icon btn-sm" onclick="cancelTransferJob('${job.id}')" title="${job.status === 'completed' ? 'Remove from list' : 'Cancel transfer'}">
+                  <svg data-lucide="x" width="13" height="13"></svg>
+                </button>
+              </div>
+            </div>
+            <div class="progress-track">
+              <div class="progress-fill ${fillClass}" id="tjob_fill_${job.id}" style="width:${pct}%"></div>
+            </div>
+            <div class="transfer-job-meta">
+              <span id="tjob_bytes_${job.id}">${fmtSize(job.transferredBytes)} / ${job.totalBytes ? fmtSize(job.totalBytes) : '…'} · ${escHtml(job.driveName)}</span>
+              <span id="tjob_status_${job.id}" style="color:${statusColor}">${escHtml(statusLabel)}</span>
+            </div>
+          </div>
+        `;
+      }).join('')}
+    </div>
+  `;
+  lucide.createIcons();
+}
+
+function updateTransferJobProgressDOM(job) {
+  const pct = job.totalBytes > 0
+    ? Math.min(100, Math.floor((job.transferredBytes / job.totalBytes) * 100))
+    : 0;
+  const fillEl = document.getElementById(`tjob_fill_${job.id}`);
+  const bytesEl = document.getElementById(`tjob_bytes_${job.id}`);
+  const statusEl = document.getElementById(`tjob_status_${job.id}`);
+  if (fillEl) fillEl.style.width = `${pct}%`;
+  if (bytesEl) bytesEl.textContent = `${fmtSize(job.transferredBytes)} / ${job.totalBytes ? fmtSize(job.totalBytes) : '…'} · ${job.driveName}`;
+  if (statusEl && job.status === 'active') {
+    const speedInfo = job.speedBps > 0 ? ` · ${fmtSize(job.speedBps)}/s` : '';
+    statusEl.textContent = `${pct}%${speedInfo}`;
+  }
+  const pillBtn = document.getElementById('topbar-transfer-pill');
+  const pillLabel = document.getElementById('topbar-transfer-pill-label');
+  if (pillBtn && pillLabel) {
+    const activeCount = _transferQueue.filter(j => j.status === 'active' || j.status === 'queued').length;
+    if (activeCount > 0) {
+      pillBtn.classList.add('active');
+      pillLabel.textContent = `${activeCount} Active · ${pct}%`;
+    }
+  }
+}
+
+function enqueueDownloadFile(f, driveType, driveId, driveName) {
+  const jobId = 'tq_dl_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+  const url = buildFileDownloadUrl(f, driveType, driveId);
+  const job = {
+    id: jobId,
+    direction: 'download',
+    name: f.name,
+    fileObj: f,
+    driveType,
+    driveId,
+    driveName: driveName || driveType,
+    url,
+    totalBytes: Number(f.size) || 0,
+    transferredBytes: 0,
+    speedBps: 0,
+    status: 'queued', // 'queued' | 'active' | 'paused' | 'completed' | 'error' | 'cancelled'
+    chunks: [],
+    abortCtrl: null,
+    blobUrl: null,
+    errorMsg: '',
+  };
+  _transferQueue.unshift(job);
+  _transferDrawerOpen = true;
+  renderTransferQueueUI();
+  processTransferQueue();
+}
+
+function enqueueUploadEntries(entries, driveType) {
+  if (!entries || !entries.length) return;
+  const driveId = _activeDrive?.id || 'default';
+  const driveName = _activeDrive?.name || driveType;
+  const targetFolder = driveType === 'smb' ? _path : _folderId;
+
+  for (const item of entries) {
+    const file = item.file;
+    const relativePath = item.relativePath || file.webkitRelativePath || file.name;
+    const jobId = 'tq_ul_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+    _transferQueue.unshift({
+      id: jobId,
+      direction: 'upload',
+      name: relativePath || file.name,
+      file,
+      relativePath,
+      driveType,
+      driveId,
+      driveName,
+      targetFolder,
+      uploadId: null,
+      totalBytes: Number(file.size) || 0,
+      transferredBytes: 0,
+      speedBps: 0,
+      status: 'queued',
+      abortCtrl: null,
+      errorMsg: '',
+    });
+  }
+  _transferDrawerOpen = true;
+  renderTransferQueueUI();
+  processTransferQueue();
+}
+
+async function processTransferQueue() {
+  if (_transferWorkerRunning) return;
+  _transferWorkerRunning = true;
+  try {
+    while (true) {
+      const nextJob = _transferQueue.find(j => j.status === 'queued');
+      if (!nextJob) break;
+      if (nextJob.direction === 'upload') {
+        await runResumableUploadJob(nextJob);
+      } else {
+        await runResumableDownloadJob(nextJob);
+      }
+    }
+  } finally {
+    _transferWorkerRunning = false;
+    renderTransferQueueUI();
+  }
+}
+
+async function runResumableUploadJob(job) {
+  job.status = 'active';
+  job.errorMsg = '';
+  renderTransferQueueUI();
+
+  try {
+    if (!job.uploadId) {
+      const initRes = await apiJSON('/api/transfers/upload/init', {
+        method: 'POST',
+        json: {
+          drive_type: job.driveType,
+          drive_id: job.driveId,
+          folder: job.targetFolder,
+          path: job.targetFolder,
+          filename: job.file.name,
+          relative_path: job.relativePath || job.file.name,
+          total_size: job.totalBytes,
+        }
+      });
+      job.uploadId = initRes.upload_id;
+      job.transferredBytes = Number(initRes.offset) || 0;
+    } else {
+      const stRes = await apiJSON(`/api/transfers/upload/status?upload_id=${encodeURIComponent(job.uploadId)}`).catch(() => null);
+      if (stRes && typeof stRes.offset === 'number') {
+        job.transferredBytes = stRes.offset;
+      } else {
+        job.uploadId = null;
+        job.transferredBytes = 0;
+        return await runResumableUploadJob(job);
+      }
+    }
+
+    const startWall = performance.now();
+    const startBytes = job.transferredBytes;
+
+    while (job.transferredBytes < job.totalBytes) {
+      if (job.status !== 'active') return;
+      const chunkStart = job.transferredBytes;
+      const chunkEnd = Math.min(job.totalBytes, chunkStart + UPLOAD_CHUNK_SIZE);
+      const blobSlice = job.file.slice(chunkStart, chunkEnd);
+
+      const ctrl = new AbortController();
+      job.abortCtrl = ctrl;
+
+      const r = await apiFetch(
+        `/api/transfers/upload/chunk?upload_id=${encodeURIComponent(job.uploadId)}&offset=${chunkStart}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: blobSlice,
+          signal: ctrl.signal,
+        }
+      );
+
+      if (!r.ok) {
+        const errData = await r.json().catch(() => ({}));
+        if (r.status === 409 && typeof errData.offset === 'number') {
+          job.transferredBytes = errData.offset;
+          continue;
+        }
+        throw new Error(errData.error || `Upload chunk failed (HTTP ${r.status})`);
+      }
+
+      const chunkRes = await r.json();
+      job.transferredBytes = typeof chunkRes.offset === 'number' ? chunkRes.offset : chunkEnd;
+      const elapsedSec = Math.max(0.05, (performance.now() - startWall) / 1000);
+      job.speedBps = Math.max(0, Math.round((job.transferredBytes - startBytes) / elapsedSec));
+      updateTransferJobProgressDOM(job);
+    }
+
+    if (job.status !== 'active') return;
+    await apiJSON('/api/transfers/upload/complete', {
+      method: 'POST',
+      json: { upload_id: job.uploadId }
+    });
+
+    job.status = 'completed';
+    job.transferredBytes = job.totalBytes;
+    job.speedBps = 0;
+    job.abortCtrl = null;
+    renderTransferQueueUI();
+    if (_view === 'files' && _activeDrive && _activeDrive.type === job.driveType && _activeDrive.id === job.driveId) {
+      reloadActiveDriveFiles();
+    }
+  } catch (e) {
+    job.abortCtrl = null;
+    if (e.name === 'AbortError' || job.status === 'paused' || job.status === 'cancelled') {
+      renderTransferQueueUI();
+      return;
+    }
+    job.status = 'error';
+    job.errorMsg = e.message || 'Upload failed';
+    renderTransferQueueUI();
+  }
+}
+
+async function runResumableDownloadJob(job) {
+  job.status = 'active';
+  job.errorMsg = '';
+  renderTransferQueueUI();
+
+  const ctrl = new AbortController();
+  job.abortCtrl = ctrl;
+
+  try {
+    const startOffset = job.transferredBytes || 0;
+    const headers = {};
+    if (startOffset > 0) {
+      headers['Range'] = `bytes=${startOffset}-`;
+    }
+
+    const startWall = performance.now();
+    const r = await apiFetch(job.url, { headers, signal: ctrl.signal });
+    if (!r.ok && r.status !== 206) {
+      const err = await r.json().catch(() => ({ error: `Download failed (${r.status})` }));
+      throw new Error(err.error || 'Download failed');
+    }
+
+    // If server returned 200 OK instead of 206 Partial Content when resuming, reset buffer
+    if (startOffset > 0 && r.status === 200) {
+      job.chunks = [];
+      job.transferredBytes = 0;
+    }
+
+    const contentRange = r.headers.get('Content-Range');
+    if (contentRange && contentRange.includes('/')) {
+      const totalPart = parseInt(contentRange.split('/').pop(), 10);
+      if (totalPart > 0) job.totalBytes = totalPart;
+    } else {
+      const lenHeader = parseInt(r.headers.get('Content-Length') || '0', 10);
+      if (lenHeader > 0 && job.transferredBytes === 0) {
+        job.totalBytes = lenHeader;
+      }
+    }
+
+    const initialBytes = job.transferredBytes;
+
+    if (r.body && r.body.getReader) {
+      const reader = r.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (job.status !== 'active') {
+          try { reader.cancel(); } catch (_) {}
+          return;
+        }
+        job.chunks.push(value);
+        job.transferredBytes += value.byteLength;
+        const elapsedSec = Math.max(0.05, (performance.now() - startWall) / 1000);
+        job.speedBps = Math.max(0, Math.round((job.transferredBytes - initialBytes) / elapsedSec));
+        updateTransferJobProgressDOM(job);
+      }
+    } else {
+      const blob = await r.blob();
+      const buf = new Uint8Array(await blob.arrayBuffer());
+      job.chunks = [buf];
+      job.transferredBytes = buf.byteLength;
+      job.totalBytes = buf.byteLength;
+    }
+
+    if (job.status !== 'active') return;
+    const finalBlob = new Blob(job.chunks, { type: 'application/octet-stream' });
+    job.chunks = []; // release chunk array after building Blob
+    job.totalBytes = finalBlob.size;
+    job.transferredBytes = finalBlob.size;
+    job.speedBps = 0;
+    job.status = 'completed';
+    job.abortCtrl = null;
+
+    const objUrl = URL.createObjectURL(finalBlob);
+    job.blobUrl = objUrl;
+
+    const a = document.createElement('a');
+    a.href = objUrl;
+    a.download = job.name;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { try { a.remove(); } catch (_) {} }, 2000);
+
+    renderTransferQueueUI();
+  } catch (e) {
+    job.abortCtrl = null;
+    if (e.name === 'AbortError' || job.status === 'paused' || job.status === 'cancelled') {
+      renderTransferQueueUI();
+      return;
+    }
+    job.status = 'error';
+    job.errorMsg = e.message || 'Download failed';
+    renderTransferQueueUI();
+  }
+}
+
+function pauseTransferJob(jobId) {
+  const job = _transferQueue.find(j => j.id === jobId);
+  if (!job) return;
+  if (job.status === 'active' || job.status === 'queued') {
+    job.status = 'paused';
+    job.speedBps = 0;
+    if (job.abortCtrl) {
+      try { job.abortCtrl.abort(); } catch (_) {}
+      job.abortCtrl = null;
+    }
+    renderTransferQueueUI();
+  }
+}
+
+function resumeTransferJob(jobId) {
+  const job = _transferQueue.find(j => j.id === jobId);
+  if (!job) return;
+  if (job.status === 'paused' || job.status === 'error') {
+    job.status = 'queued';
+    job.errorMsg = '';
+    renderTransferQueueUI();
+    processTransferQueue();
+  }
+}
+
+function retryTransferJob(jobId) {
+  resumeTransferJob(jobId);
+}
+
+async function cancelTransferJob(jobId) {
+  const idx = _transferQueue.findIndex(j => j.id === jobId);
+  if (idx < 0) return;
+  const job = _transferQueue[idx];
+  job.status = 'cancelled';
+  if (job.abortCtrl) {
+    try { job.abortCtrl.abort(); } catch (_) {}
+    job.abortCtrl = null;
+  }
+  if (job.blobUrl) {
+    try { URL.revokeObjectURL(job.blobUrl); } catch (_) {}
+  }
+  if (job.direction === 'upload' && job.uploadId) {
+    apiJSON('/api/transfers/upload/cancel', {
+      method: 'POST',
+      json: { upload_id: job.uploadId }
+    }).catch(() => {});
+  }
+  job.chunks = [];
+  _transferQueue.splice(idx, 1);
+  renderTransferQueueUI();
+}
+
+function pauseAllTransfers() {
+  for (const job of _transferQueue) {
+    if (job.status === 'active' || job.status === 'queued') {
+      job.status = 'paused';
+      job.speedBps = 0;
+      if (job.abortCtrl) {
+        try { job.abortCtrl.abort(); } catch (_) {}
+        job.abortCtrl = null;
+      }
+    }
+  }
+  renderTransferQueueUI();
+}
+
+function resumeAllTransfers() {
+  for (const job of _transferQueue) {
+    if (job.status === 'paused' || job.status === 'error') {
+      job.status = 'queued';
+      job.errorMsg = '';
+    }
+  }
+  renderTransferQueueUI();
+  processTransferQueue();
+}
+
+function clearCompletedTransfers() {
+  for (let i = _transferQueue.length - 1; i >= 0; i--) {
+    const j = _transferQueue[i];
+    if (j.status === 'completed' || j.status === 'cancelled' || j.status === 'error') {
+      if (j.blobUrl) {
+        try { URL.revokeObjectURL(j.blobUrl); } catch (_) {}
+      }
+      _transferQueue.splice(i, 1);
+    }
+  }
+  renderTransferQueueUI();
 }
 
 const _activeDownloads = new Map();
@@ -4079,7 +4820,6 @@ async function authedDownload(path, name, knownSize = 0, fetchOpts = {}) {
     document.body.appendChild(a);
     a.click();
 
-    // Provide a direct Save button on the completed card in case browser popup/activation rules suppressed auto-save after a long transfer
     if (cancelBtn) {
       cancelBtn.outerHTML = `<a href="${objUrl}" download="${escHtml(name)}" class="btn btn-primary btn-sm" style="text-decoration:none;padding:2px 8px;font-size:11px" onclick="setTimeout(()=>document.getElementById('${dlId}')?.remove(), 500)">Save</a>`;
     }
@@ -4267,24 +5007,51 @@ function openDriveContextMenu(e, driveType, dJson) {
     return;
   }
 
+  if (driveType === 'filejump_off') {
+    menu.innerHTML = `
+      <button class="ctx-item" onclick="closeContextMenu();setView('settings','filejump')">
+        <svg data-lucide="link"></svg> Connect FileJump…
+      </button>
+    `;
+    menu.style.display = 'flex';
+    lucide.createIcons();
+    const rect = menu.getBoundingClientRect();
+    menu.style.left = Math.max(8, Math.min(e.clientX, window.innerWidth - rect.width - 12)) + 'px';
+    menu.style.top = Math.max(8, Math.min(e.clientY, window.innerHeight - rect.height - 12)) + 'px';
+    return;
+  }
+
   const d = parseFileArg(dJson);
   const isSmb = driveType === 'smb';
   const isOd = driveType === 'onedrive';
+  const isFj = driveType === 'filejump';
   let html = '';
 
   const openCall = isSmb
     ? `openShare('${escAttr(d.id)}','${escAttr(d.name)}')`
-    : (isOd ? `openOneDrive('${escAttr(d.id)}','${escAttr(d.name)}')` : `openGDrive('${escAttr(d.id)}','${escAttr(d.name)}')`);
+    : (isOd
+        ? `openOneDrive('${escAttr(d.id)}','${escAttr(d.name)}')`
+        : (isFj
+            ? `openFileJump('${escAttr(d.id)}','${escAttr(d.name)}')`
+            : `openGDrive('${escAttr(d.id)}','${escAttr(d.name)}')`));
   const addCall = isSmb
     ? 'showAddShareModal()'
-    : (isOd ? 'showAddOneDriveModal()' : 'showAddGDriveModal()');
+    : (isOd
+        ? 'showAddOneDriveModal()'
+        : (isFj ? 'showAddFileJumpModal()' : 'showAddGDriveModal()'));
   const addLabel = isSmb
     ? 'Add Another SMB Share…'
-    : (isOd ? 'Add Another OneDrive…' : 'Add Another Google Drive…');
-  const settingsTab = isSmb ? 'smb' : (isOd ? 'onedrive' : 'gdrive');
+    : (isOd
+        ? 'Add Another OneDrive…'
+        : (isFj ? 'Add Another FileJump…' : 'Add Another Google Drive…'));
+  const settingsTab = isSmb ? 'smb' : (isOd ? 'onedrive' : (isFj ? 'filejump' : 'gdrive'));
   const removeCall = isSmb
     ? `deleteShare('${escAttr(d.id)}')`
-    : (isOd ? `disconnectOneDrive('${escAttr(d.id)}','${escAttr(d.name)}')` : `disconnectGDrive('${escAttr(d.id)}','${escAttr(d.name)}')`);
+    : (isOd
+        ? `disconnectOneDrive('${escAttr(d.id)}','${escAttr(d.name)}')`
+        : (isFj
+            ? `disconnectFileJump('${escAttr(d.id)}','${escAttr(d.name)}')`
+            : `disconnectGDrive('${escAttr(d.id)}','${escAttr(d.name)}')`));
 
   html += `<button class="ctx-item" onclick="closeContextMenu();${openCall}">
     <svg data-lucide="folder-open"></svg> Open ${escHtml(d.name)}
@@ -4327,8 +5094,9 @@ function showDriveCustomNameModal(driveType, dJson) {
   const d = parseFileArg(dJson);
   const isSmb = driveType === 'smb';
   const isOd = driveType === 'onedrive';
-  const typeTitle = isSmb ? 'SMB / NAS Share' : (isOd ? 'Microsoft OneDrive' : 'Google Drive');
-  const typeIcon = isSmb ? 'server' : (isOd ? 'cloud' : 'hard-drive');
+  const isFj = driveType === 'filejump';
+  const typeTitle = isSmb ? 'SMB / NAS Share' : (isOd ? 'Microsoft OneDrive' : (isFj ? 'FileJump Cloud' : 'Google Drive'));
+  const typeIcon = isSmb ? 'server' : (isOd ? 'cloud' : (isFj ? 'zap' : 'hard-drive'));
   const subInfo = isSmb
     ? `${d.host}:${d.port || 445} › ${d.share}`
     : (d.email || d.original_name || typeTitle);
@@ -4402,6 +5170,17 @@ async function doSaveDriveCustomName(driveType, driveId) {
         if (_pathStack.length > 0) _pathStack[0].name = newName;
         if (_view === 'files') setBreadcrumb(gDriveBreadcrumbs());
       }
+    } else if (driveType === 'filejump') {
+      await apiJSON(`/api/filejump/accounts/${encodeURIComponent(driveId)}/rename`, {
+        method: 'POST',
+        json: { name: newName }
+      });
+      await refreshFJStatus();
+      if (_activeDrive?.type === 'filejump' && _activeDrive?.id === driveId) {
+        _activeDrive.name = newName;
+        if (_pathStack.length > 0) _pathStack[0].name = newName;
+        if (_view === 'files') setBreadcrumb(gDriveBreadcrumbs());
+      }
     } else {
       await apiJSON(`/api/gdrive/accounts/${encodeURIComponent(driveId)}/rename`, {
         method: 'POST',
@@ -4448,6 +5227,15 @@ async function doRename(fJson, type) {
       closeModal();
       toast(`Renamed to "${newName}"`, 'success');
       loadOneDriveFiles();
+    } else if (type === 'filejump') {
+      const accId = _activeDrive?.id || 'default';
+      await apiJSON(`/api/filejump/rename/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}`, {
+        method: 'POST',
+        json: { name: newName, account_id: accId }
+      });
+      closeModal();
+      toast(`Renamed to "${newName}"`, 'success');
+      loadFileJumpFiles();
     } else {
       const accId = _activeDrive?.id || 'default';
       await apiJSON(`/api/gdrive/rename/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}`, {
@@ -4484,6 +5272,13 @@ function downloadSelectedZip(type) {
       method: 'POST',
       json: { ids, name: archiveName, account_id: accId }
     });
+  } else if (type === 'filejump') {
+    const accId = _activeDrive?.id || 'default';
+    const ids = items.map(it => it.id);
+    authedDownload(`/api/filejump/zip?account_id=${encodeURIComponent(accId)}`, archiveName, 0, {
+      method: 'POST',
+      json: { ids, name: archiveName, account_id: accId }
+    });
   } else {
     const accId = _activeDrive?.id || 'default';
     const ids = items.map(it => it.id);
@@ -4510,6 +5305,8 @@ async function deleteSelectedItems(type) {
         });
       } else if (type === 'onedrive') {
         await apiJSON(`/api/onedrive/delete/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}`, { method: 'DELETE' });
+      } else if (type === 'filejump') {
+        await apiJSON(`/api/filejump/delete/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}`, { method: 'DELETE' });
       } else {
         await apiJSON(`/api/gdrive/delete/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}`, { method: 'DELETE' });
       }
@@ -4569,6 +5366,7 @@ async function showTransferModal(srcType, singleItemJson = null, mode = 'copy') 
   await refreshShares();
   await refreshGDStatus();
   await refreshODStatus();
+  await refreshFJStatus();
 
   const destOptions = [];
   for (const acc of _gdAccounts) {
@@ -4576,6 +5374,9 @@ async function showTransferModal(srcType, singleItemJson = null, mode = 'copy') 
   }
   for (const acc of _odAccounts) {
     destOptions.push({ key: `onedrive:${acc.id}`, type: 'onedrive', id: acc.id, name: `OneDrive: ${acc.name}` });
+  }
+  for (const acc of _fjAccounts) {
+    destOptions.push({ key: `filejump:${acc.id}`, type: 'filejump', id: acc.id, name: `FileJump: ${acc.name}` });
   }
   for (const s of _shares) {
     destOptions.push({ key: `smb:${s.id}`, type: 'smb', id: s.id, name: `SMB: ${s.name}` });
@@ -4651,6 +5452,8 @@ function onTransferDriveChange(val) {
     label = _gdAccounts.find(a => a.id === id)?.name || 'Google Drive';
   } else if (type === 'onedrive') {
     label = _odAccounts.find(a => a.id === id)?.name || 'OneDrive';
+  } else if (type === 'filejump') {
+    label = _fjAccounts.find(a => a.id === id)?.name || 'FileJump';
   } else {
     label = _shares.find(s => s.id === id)?.name || id;
   }
@@ -4678,6 +5481,8 @@ async function loadTransferFolders() {
       items = await apiJSON(`/api/smb/browse/${_transferDestDrive.id}?path=${encodeURIComponent(_transferDestFolder)}`);
     } else if (_transferDestDrive.type === 'onedrive') {
       items = await apiJSON(`/api/onedrive/files?folder=${encodeURIComponent(_transferDestFolder)}&account_id=${encodeURIComponent(_transferDestDrive.id)}`);
+    } else if (_transferDestDrive.type === 'filejump') {
+      items = await apiJSON(`/api/filejump/files?folder=${encodeURIComponent(_transferDestFolder)}&account_id=${encodeURIComponent(_transferDestDrive.id)}`);
     } else {
       items = await apiJSON(`/api/gdrive/files?folder=${encodeURIComponent(_transferDestFolder)}&account_id=${encodeURIComponent(_transferDestDrive.id)}`);
     }
@@ -4790,6 +5595,10 @@ async function rmFile(fJson, type) {
       const accId = _activeDrive?.id || 'default';
       await apiJSON(`/api/onedrive/delete/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}`, {method:'DELETE'});
       loadOneDriveFiles();
+    } else if (type==='filejump') {
+      const accId = _activeDrive?.id || 'default';
+      await apiJSON(`/api/filejump/delete/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}`, {method:'DELETE'});
+      loadFileJumpFiles();
     } else {
       const accId = _activeDrive?.id || 'default';
       await apiJSON(`/api/gdrive/delete/${encodeURIComponent(f.id)}?account_id=${encodeURIComponent(accId)}`, {method:'DELETE'});
@@ -4966,36 +5775,9 @@ async function uploadFiles(fileList, type) {
 
 async function uploadFileEntries(entries, type) {
   if (!entries.length) return;
-  const prog = document.getElementById('upload-progress');
-  const statusText = document.getElementById('upload-status-text');
-  const statusPct = document.getElementById('upload-status-pct');
-  const fillEl = document.getElementById('upload-progress-fill');
-  if (prog) prog.style.display = 'flex';
-  let ok = 0;
-  for (let i = 0; i < entries.length; i++) {
-    const { file, relativePath } = entries[i];
-    const displayLabel = relativePath || file.name;
-    if (statusText) statusText.textContent = `Uploading (${i + 1}/${entries.length}): ${displayLabel}`;
-    if (statusPct) statusPct.textContent = '0%';
-    if (fillEl) fillEl.style.width = '0%';
-    try {
-      const accId = _activeDrive?.id || 'default';
-      const targetUrl = type === 'smb'
-        ? `/api/smb/upload/${_activeDrive.id}?path=${encodeURIComponent(_path)}`
-        : (type === 'onedrive'
-            ? `/api/onedrive/upload?folder=${encodeURIComponent(_folderId)}&account_id=${encodeURIComponent(accId)}`
-            : `/api/gdrive/upload?folder=${encodeURIComponent(_folderId)}&account_id=${encodeURIComponent(accId)}`);
-      await uploadFileWithProgress(targetUrl, file, relativePath, (loaded, total) => {
-        const pct = Math.min(100, Math.round((loaded / total) * 100));
-        if (fillEl) fillEl.style.width = pct + '%';
-        if (statusPct) statusPct.textContent = `${pct}% (${fmtSize(loaded)} / ${fmtSize(total)})`;
-      });
-      ok++;
-    } catch(e) { toast(`Failed: ${displayLabel} – ${e.message}`, 'error'); }
-  }
   closeModal();
-  if (ok) toast(`Uploaded ${ok} file${ok>1?'s':''}`, 'success');
-  reloadActiveDriveFiles();
+  enqueueUploadEntries(entries, type);
+  toast(`Queued ${entries.length} file${entries.length > 1 ? 's' : ''} for resumable upload`, 'success');
 }
 
 function showMkdirModal(type) {
@@ -5034,6 +5816,10 @@ async function doMkdir(type) {
       const accId = _activeDrive?.id || 'default';
       await apiJSON(`/api/onedrive/mkdir?account_id=${encodeURIComponent(accId)}`, {method:'POST', json:{parent:_folderId, name, account_id: accId}});
       loadOneDriveFiles();
+    } else if (type==='filejump') {
+      const accId = _activeDrive?.id || 'default';
+      await apiJSON(`/api/filejump/mkdir?account_id=${encodeURIComponent(accId)}`, {method:'POST', json:{parent:_folderId, name, account_id: accId}});
+      loadFileJumpFiles();
     } else {
       const accId = _activeDrive?.id || 'default';
       await apiJSON(`/api/gdrive/mkdir?account_id=${encodeURIComponent(accId)}`, {method:'POST', json:{parent:_folderId, name, account_id: accId}});
@@ -5066,15 +5852,17 @@ async function renderSettings() {
   await refreshShares();
   await refreshGDStatus();
   await refreshODStatus();
+  await refreshFJStatus();
   try { smbProxyCreds = await apiJSON('/api/smb/proxy-credentials'); } catch(_) {}
 
-  const validTabs = ['gdrive', 'onedrive', 'smb', 'oauth', 'od_oauth', 'proxy', 'themes', 'system'];
+  const validTabs = ['gdrive', 'onedrive', 'filejump', 'smb', 'oauth', 'od_oauth', 'proxy', 'themes', 'system'];
   if (!validTabs.includes(_settingsTab)) {
     _settingsTab = 'gdrive';
   }
 
   const showGDrive    = _settingsTab === 'gdrive';
   const showOneDrive  = _settingsTab === 'onedrive';
+  const showFileJump  = _settingsTab === 'filejump';
   const showSmb       = _settingsTab === 'smb';
   const showOAuth     = _settingsTab === 'oauth';
   const showOdOAuth   = _settingsTab === 'od_oauth';
@@ -5106,6 +5894,15 @@ async function renderSettings() {
       smb_share_name: acc.smb_share_name || 'OneDrive',
       mounted: acc.smb_enabled !== false,
     })),
+    ..._fjAccounts.map(acc => ({
+      provider: 'filejump',
+      account_id: acc.id,
+      account_name: acc.name,
+      email: acc.email || '',
+      smb_enabled: acc.smb_enabled !== false,
+      smb_share_name: acc.smb_share_name || 'FileJump',
+      mounted: acc.smb_enabled !== false,
+    })),
   ];
   const proxyShares = Array.isArray(smbProxyCreds.shares) && smbProxyCreds.shares.length
     ? smbProxyCreds.shares
@@ -5119,7 +5916,7 @@ async function renderSettings() {
       <div>
         <h2 style="font-size:var(--text-lg);font-weight:700;letter-spacing:-.01em">Settings &amp; Connections</h2>
         <p style="font-size:var(--text-xs);color:var(--color-text-muted);margin-top:2px">
-          Manage Google Drive &amp; OneDrive accounts, SMB shares, network credentials, dark themes, and administrator functions.
+          Manage Google Drive, OneDrive &amp; FileJump accounts, SMB shares, network credentials, dark themes, and administrator functions.
         </p>
       </div>
 
@@ -5169,6 +5966,9 @@ async function renderSettings() {
         </button>
         <button class="settings-tab ${_settingsTab==='onedrive'?'active':''}" onclick="setSettingsTab('onedrive')">
           <svg data-lucide="cloud"></svg> OneDrive (${_odAccounts.length})
+        </button>
+        <button class="settings-tab ${_settingsTab==='filejump'?'active':''}" onclick="setSettingsTab('filejump')">
+          <svg data-lucide="zap"></svg> FileJump (${_fjAccounts.length})
         </button>
         <button class="settings-tab ${_settingsTab==='smb'?'active':''}" onclick="setSettingsTab('smb')">
           <svg data-lucide="server"></svg> SMB (${_shares.length})
@@ -5315,6 +6115,67 @@ async function renderSettings() {
                   ${_odStatus.configured
                     ? 'Unlock Administrator Functions and click "Add OneDrive" to connect one or more Personal or Work/School OneDrive accounts.'
                     : 'Configure your Azure App Registration Client ID &amp; Secret in the OneDrive OAuth tab first, then connect your drives.'}
+                </p>
+              </div>`}
+          </div>
+        </div>
+      </div>
+    ` : ''}
+
+    ${showFileJump ? `
+      <!-- FileJump Accounts Card -->
+      <div class="card">
+        <div class="card-header">
+          <div style="display:flex;align-items:center;gap:var(--space-2)">
+            <svg data-lucide="zap" width="16" height="16" style="color:var(--color-primary)"></svg>
+            <span class="card-title">FileJump Accounts (API Token &amp; WebDAV)</span>
+            <span class="badge ${_fjAccounts.length ? 'badge-success' : 'badge-error'}">
+              ${_fjAccounts.length ? `${_fjAccounts.length} Connected` : 'None'}
+            </span>
+          </div>
+          ${_adminMode ? `
+          <button class="btn btn-primary btn-sm" onclick="showAddFileJumpModal()">
+            <svg data-lucide="plus" width="14" height="14"></svg> Add FileJump Account
+          </button>
+          ` : ''}
+        </div>
+        <div class="card-body" style="display:flex;flex-direction:column;gap:var(--space-3)">
+          <div class="share-list">
+            ${_fjAccounts.length ? _fjAccounts.map(acc => {
+              const accJson = encodeFileArg(acc);
+              return `
+              <div class="share-item">
+                <div class="share-icon-box">
+                  <svg data-lucide="zap" width="18" height="18"></svg>
+                </div>
+                <div class="share-info">
+                  <div class="share-title-row">
+                    <span class="share-name">${escHtml(acc.name)}</span>
+                    <span class="badge badge-success" style="font-size:10px">Connected</span>
+                    <span class="badge badge-primary" style="font-size:10px">${acc.auth_type === 'webdav' ? 'WebDAV' : 'REST API'}</span>
+                  </div>
+                  <div class="share-host">${escHtml(acc.email || acc.base_url || `Account ID: ${acc.id}`)}</div>
+                </div>
+                <div class="share-actions">
+                  <button class="btn btn-secondary btn-sm" onclick="openFileJump('${escAttr(acc.id)}','${escAttr(acc.name)}')" title="Browse FileJump">
+                    <svg data-lucide="folder-open" width="13" height="13"></svg>
+                  </button>
+                  ${_adminMode ? `
+                  <button class="btn btn-secondary btn-sm" onclick="showDriveCustomNameModal('filejump','${accJson}')" title="Set custom display name">
+                    <svg data-lucide="edit-3" width="13" height="13"></svg>
+                  </button>
+                  <button class="btn btn-danger btn-sm" onclick="disconnectFileJump('${escAttr(acc.id)}','${escAttr(acc.name)}')" title="Disconnect account">
+                    <svg data-lucide="unlink" width="13" height="13"></svg>
+                  </button>
+                  ` : ''}
+                </div>
+              </div>`;
+            }).join('') : `
+              <div class="empty-state" style="padding:var(--space-6) var(--space-4)">
+                <svg data-lucide="zap-off" width="28" height="28"></svg>
+                <h3 style="font-size:var(--text-sm)">No FileJump accounts connected</h3>
+                <p style="font-size:var(--text-xs);margin-bottom:0">
+                  Unlock Administrator Functions and click "Add FileJump Account" to connect via FileJump REST API Access Token or WebDAV credentials.
                 </p>
               </div>`}
           </div>
@@ -5503,9 +6364,9 @@ async function renderSettings() {
         <div style="display:flex;flex-direction:column;gap:var(--space-3)">
           <div style="display:flex;align-items:center;justify-content:space-between;gap:var(--space-2);flex-wrap:wrap">
             <div>
-              <div style="font-size:var(--text-xs);font-weight:600;color:var(--color-text)">Per-Drive SMB Shares (Google Drive &amp; Microsoft OneDrive)</div>
+              <div style="font-size:var(--text-xs);font-weight:600;color:var(--color-text)">Per-Drive SMB Shares (Google Drive, Microsoft OneDrive &amp; FileJump)</div>
               <div style="font-size:var(--text-xs);color:var(--color-text-muted);margin-top:2px">
-                Toggle the SMB Proxy on or off for each connected Google Drive or OneDrive account and assign a custom network share name (<code style="font-family:var(--font-mono)">\\\\${escHtml(proxyHost)}\\&lt;ShareName&gt;</code>).
+                Toggle the SMB Proxy on or off for each connected Google Drive, OneDrive, or FileJump account and assign a custom network share name (<code style="font-family:var(--font-mono)">\\\\${escHtml(proxyHost)}\\&lt;ShareName&gt;</code>).
               </div>
             </div>
           </div>
@@ -5514,9 +6375,9 @@ async function renderSettings() {
           <div class="share-list">
             ${proxyShares.map((ps, idx) => {
               const prov = ps.provider || 'gdrive';
-              const provLabel = prov === 'onedrive' ? 'OneDrive' : 'Google Drive';
-              const provIcon  = prov === 'onedrive' ? 'cloud' : 'hard-drive';
-              const defaultShare = prov === 'onedrive' ? 'OneDrive' : 'GoogleDrive';
+              const provLabel = prov === 'onedrive' ? 'OneDrive' : (prov === 'filejump' ? 'FileJump' : 'Google Drive');
+              const provIcon  = prov === 'onedrive' ? 'cloud' : (prov === 'filejump' ? 'zap' : 'hard-drive');
+              const defaultShare = prov === 'onedrive' ? 'OneDrive' : (prov === 'filejump' ? 'FileJump' : 'GoogleDrive');
               const inputDomId = `smb-share-name-${prov}-${ps.account_id}`;
               const uncPath = `\\\\${proxyHost}\\${ps.smb_share_name || defaultShare}`;
               const driveLetter = String.fromCharCode(71 + (idx % 15)); // G:, H:, I:, ...
@@ -5557,7 +6418,7 @@ async function renderSettings() {
                     <div class="proxy-share-controls">
                       <input class="form-input" id="${escAttr(inputDomId)}" type="text"
                              value="${escHtml(ps.smb_share_name || defaultShare)}"
-                             placeholder="e.g. PersonalDrive, WorkOneDrive"
+                             placeholder="e.g. PersonalDrive, WorkOneDrive, FileJumpCloud"
                              style="font-family:var(--font-mono)"
                              onkeydown="if(event.key==='Enter'){event.preventDefault();saveDriveSmbShareName('${escAttr(ps.account_id)}','${escAttr(prov)}')}" />
                       <button class="btn btn-secondary btn-sm" onclick="saveDriveSmbShareName('${escAttr(ps.account_id)}','${escAttr(prov)}')">
@@ -5588,13 +6449,16 @@ async function renderSettings() {
           <div class="empty-state" style="padding:var(--space-6) var(--space-4);border:1px dashed var(--color-border);border-radius:var(--radius-lg)">
             <svg data-lucide="cloud-off" width="28" height="28"></svg>
             <h3 style="font-size:var(--text-sm)">No Cloud Drives connected yet</h3>
-            <p style="font-size:var(--text-xs);margin-bottom:var(--space-3)">Connect one or more Google Drive or Microsoft OneDrive accounts first to expose them as individual SMB network shares.</p>
+            <p style="font-size:var(--text-xs);margin-bottom:var(--space-3)">Connect one or more Google Drive, Microsoft OneDrive, or FileJump accounts first to expose them as individual SMB network shares.</p>
             <div style="display:flex;gap:var(--space-2);flex-wrap:wrap;justify-content:center">
               <button class="btn btn-primary btn-sm" onclick="showAddGDriveModal()">
                 <svg data-lucide="plus" width="14" height="14"></svg> Connect Google Drive
               </button>
               <button class="btn btn-secondary btn-sm" onclick="showAddOneDriveModal()">
                 <svg data-lucide="plus" width="14" height="14"></svg> Connect OneDrive
+              </button>
+              <button class="btn btn-secondary btn-sm" onclick="showAddFileJumpModal()">
+                <svg data-lucide="plus" width="14" height="14"></svg> Connect FileJump
               </button>
             </div>
           </div>
@@ -5784,6 +6648,15 @@ async function refreshODStatus() {
     _odAccounts = [];
   }
   try { _odConfig = await apiJSON('/api/onedrive/config'); } catch(_) {}
+}
+
+async function refreshFJStatus() {
+  try {
+    _fjStatus = await apiJSON('/api/filejump/status');
+    _fjAccounts = Array.isArray(_fjStatus.accounts) ? _fjStatus.accounts : [];
+  } catch(_) {
+    _fjAccounts = [];
+  }
 }
 
 function showAddShareModal() {
@@ -6141,6 +7014,151 @@ async function disconnectOneDrive(accountId = '', accountName = 'OneDrive') {
   } catch(e) { toast('Failed: '+e.message, 'error'); }
 }
 
+let _fjModalAuthType = 'token';
+
+function showAddFileJumpModal() {
+  if (!requireAdminFrontend('connect FileJump accounts')) return;
+  _fjModalAuthType = 'token';
+  const nextNum = _fjAccounts.length + 1;
+  const suggested = nextNum === 1 ? 'FileJump Cloud' : `FileJump ${nextNum}`;
+  showModal(`
+    <div class="modal-header">
+      <span class="modal-title">Connect FileJump Account</span>
+      <button class="btn btn-ghost btn-icon" onclick="closeModal()">
+        <svg data-lucide="x" width="16" height="16"></svg></button>
+    </div>
+    <div class="modal-body">
+      <div class="settings-tabs" style="margin-bottom:var(--space-1)">
+        <button type="button" class="settings-tab active" id="fj-mode-token" onclick="setFileJumpAuthMode('token')">
+          <svg data-lucide="key-round" width="14" height="14"></svg> API Access Token
+        </button>
+        <button type="button" class="settings-tab" id="fj-mode-webdav" onclick="setFileJumpAuthMode('webdav')">
+          <svg data-lucide="globe" width="14" height="14"></svg> WebDAV
+        </button>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="fj-custom-name">Custom Display Name</label>
+        <input class="form-input" id="fj-custom-name" type="text"
+               value="${escHtml(suggested)}"
+               placeholder="e.g. FileJump Cloud, Backup FileJump" />
+      </div>
+      <div id="fj-token-fields" style="display:flex;flex-direction:column;gap:var(--space-3)">
+        <div class="form-group">
+          <label class="form-label" for="fj-api-token">FileJump API Access Token (Bearer Token)</label>
+          <input class="form-input" id="fj-api-token" type="password"
+                 placeholder="Paste your FileJump API Access Token" />
+          <span style="font-size:var(--text-xs);color:var(--color-text-muted)">
+            Generate an API Access Token from your FileJump Account Settings → Developers / API Tokens.
+          </span>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="fj-base-url">FileJump Server URL</label>
+          <input class="form-input" id="fj-base-url" type="text"
+                 value="https://drive.filejump.com"
+                 placeholder="https://drive.filejump.com (or https://app.filejump.com)" />
+        </div>
+      </div>
+      <div id="fj-webdav-fields" style="display:none;flex-direction:column;gap:var(--space-3)">
+        <div class="form-group">
+          <label class="form-label" for="fj-webdav-url">FileJump WebDAV URL</label>
+          <input class="form-input" id="fj-webdav-url" type="text"
+                 value="https://uploads.filejump.com/dav"
+                 placeholder="https://uploads.filejump.com/dav" />
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label" for="fj-webdav-user">WebDAV Email / Username</label>
+            <input class="form-input" id="fj-webdav-user" type="text"
+                   placeholder="you@example.com" />
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="fj-webdav-pass">WebDAV Password</label>
+            <input class="form-input" id="fj-webdav-pass" type="password"
+                   placeholder="FileJump password or WebDAV key" />
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="fj-connect-btn" onclick="doConnectFileJump()">
+        <svg data-lucide="zap" width="14" height="14"></svg> Connect FileJump
+      </button>
+    </div>
+  `);
+  lucide.createIcons();
+  setTimeout(() => document.getElementById('fj-api-token')?.focus(), 40);
+}
+
+function setFileJumpAuthMode(mode) {
+  _fjModalAuthType = mode === 'webdav' ? 'webdav' : 'token';
+  const isWebdav = _fjModalAuthType === 'webdav';
+  document.getElementById('fj-mode-token')?.classList.toggle('active', !isWebdav);
+  document.getElementById('fj-mode-webdav')?.classList.toggle('active', isWebdav);
+  const tf = document.getElementById('fj-token-fields');
+  const wf = document.getElementById('fj-webdav-fields');
+  if (tf) tf.style.display = isWebdav ? 'none' : 'flex';
+  if (wf) wf.style.display = isWebdav ? 'flex' : 'none';
+}
+
+async function doConnectFileJump() {
+  if (!requireAdminFrontend('connect FileJump accounts')) return;
+  const name = (document.getElementById('fj-custom-name')?.value || '').trim() || 'FileJump';
+  const btn = document.getElementById('fj-connect-btn');
+  const body = {
+    name,
+    custom_name: name,
+    auth_type: _fjModalAuthType,
+  };
+  if (_fjModalAuthType === 'webdav') {
+    body.webdav_url = (document.getElementById('fj-webdav-url')?.value || 'https://uploads.filejump.com/dav').trim();
+    body.username = (document.getElementById('fj-webdav-user')?.value || '').trim();
+    body.password = document.getElementById('fj-webdav-pass')?.value || '';
+  } else {
+    body.api_token = (document.getElementById('fj-api-token')?.value || '').trim();
+    body.base_url = (document.getElementById('fj-base-url')?.value || 'https://drive.filejump.com').trim();
+  }
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Connecting…';
+  }
+  try {
+    await apiJSON('/api/filejump/connect', { method: 'POST', json: body });
+    closeModal();
+    await refreshFJStatus();
+    renderSidebar();
+    if (_view === 'settings') renderSettings();
+    toast(`FileJump "${name}" connected`, 'success');
+  } catch (e) {
+    toast('FileJump connection failed: ' + e.message, 'error');
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = `<svg data-lucide="zap" width="14" height="14"></svg> Connect FileJump`;
+      lucide.createIcons();
+    }
+  }
+}
+
+async function disconnectFileJump(accountId = '', accountName = 'FileJump') {
+  if (!requireAdminFrontend('disconnect FileJump accounts')) return;
+  if (!confirm(`Disconnect "${accountName}"?`)) return;
+  try {
+    if (accountId) {
+      await apiJSON(`/api/filejump/accounts/${encodeURIComponent(accountId)}`, {method:'DELETE'});
+    } else {
+      await apiJSON('/api/filejump/revoke', {method:'DELETE'});
+    }
+    toast(`Disconnected "${accountName}"`, 'success');
+    if (_activeDrive?.type === 'filejump' && (!accountId || _activeDrive?.id === accountId)) {
+      _activeDrive = null;
+      setView('welcome');
+    }
+    await refreshFJStatus();
+    renderSidebar();
+    if (_view === 'settings') renderSettings();
+  } catch(e) { toast('Failed: '+e.message, 'error'); }
+}
+
 function showLoading() {
   document.getElementById('content-area').innerHTML =
     `<div class="loading-state"><div class="spinner"></div></div>`;
@@ -6173,6 +7191,10 @@ function bcGo(i) {
     _pathStack = _pathStack.slice(0, c.index + 1);
     _folderId = c.id || (c.name==='OneDrive'?'root':_pathStack[_pathStack.length-1].id);
     loadOneDriveFiles();
+  } else if (_activeDrive?.type === 'filejump') {
+    _pathStack = _pathStack.slice(0, c.index + 1);
+    _folderId = c.id || (c.name==='FileJump'?'root':_pathStack[_pathStack.length-1].id);
+    loadFileJumpFiles();
   } else if (_activeDrive?.type === 'gdrive') {
     _pathStack = _pathStack.slice(0, c.index + 1);
     _folderId = c.id || (c.name==='Google Drive'?'root':_pathStack[_pathStack.length-1].id);

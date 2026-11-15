@@ -1,8 +1,8 @@
 # SageDrive (v1.0)
 
-SageDrive is a self-hosted, browser-based file manager that gives you unified access to multiple SMB/NAS shares, multiple Google Drive accounts, and multiple Microsoft OneDrive accounts from a single clean, responsive interface.
+SageDrive is a self-hosted, browser-based file manager that gives you unified access to multiple SMB/NAS shares, multiple Google Drive accounts, multiple Microsoft OneDrive accounts, and multiple FileJump (`https://filejump.com`) accounts from a single clean, responsive interface.
 
-It also allows you to create individual SMB network shares for your connected Google Drive and Microsoft OneDrive accounts (`rclone` + Samba) for consumption from other devices on your network.
+It also allows you to create individual SMB network shares for your connected Google Drive, Microsoft OneDrive, and FileJump accounts (`rclone` + Samba) for consumption from other devices on your network.
 
 Repository: [https://github.com/Sage222/SageDrive2](https://github.com/Sage222/SageDrive2)
 
@@ -14,29 +14,33 @@ Repository: [https://github.com/Sage222/SageDrive2](https://github.com/Sage222/S
 - **Multiple SMB Shares:** Add, browse, and manage any number of SMB/NAS shares simultaneously with automatic unique ID generation.
 - **Multiple Google Drives:** Connect and switch between multiple Google Drive accounts simultaneously (`gdrive_accounts.json`), with automatic migration from single-account tokens.
 - **Multiple Microsoft OneDrive Accounts:** Connect and switch between multiple Personal and Work/School Microsoft OneDrive accounts simultaneously (`onedrive_accounts.json`) via Microsoft Graph API v1.0.
-- **Right-Click Custom Names:** Right-click (or tap `⋯` on mobile/tablet) any SMB share, Google Drive, or OneDrive account in the sidebar to set a custom display name, open it, or manage/disconnect it. Custom names appear across the sidebar, header, transfer modal, and Settings while preserving the underlying host/share path or account email as a subtitle.
+- **Multiple FileJump Accounts (REST API Token & WebDAV):** Connect and switch between multiple FileJump (`https://filejump.com`) accounts simultaneously (`filejump_accounts.json`) using either a **FileJump API Access Token** (Bearer token against `drive.filejump.com` / `app.filejump.com` / `filejump.com`) or **FileJump WebDAV credentials** (`https://uploads.filejump.com/dav`).
+- **Right-Click Custom Names:** Right-click (or tap `⋯` on mobile/tablet) any SMB share, Google Drive, OneDrive, or FileJump account in the sidebar to set a custom display name, open it, or manage/disconnect it. Custom names appear across the sidebar, header, transfer modal, and Settings while preserving the underlying host/share path or account email as a subtitle.
 
 ### File Browsing & Responsive UI
-- **Unified Sidebar:** Browse all connected SMB shares, Google Drives, and Microsoft OneDrive accounts from a collapsible sidebar (`[` shortcut or toggle button).
-- **Favorite Folders Sub-Menu:** Bookmark any folder across your SMB shares, Google Drives, or OneDrive accounts so it appears in the **Favorites** sub-menu directly under **Drives** and above **App** in the sidebar. Add or remove favorite folders via the folder right-click context menu (`Add to Favorites` / `Remove from Favorites`), the star action icon in list view, the topbar **Favorite** button, or the star button in the sidebar Favorites header.
+- **Unified Sidebar:** Browse all connected SMB shares, Google Drives, Microsoft OneDrive, and FileJump accounts from a collapsible sidebar (`[` shortcut or toggle button).
+- **Favorite Folders Sub-Menu:** Bookmark any folder across your SMB shares, Google Drives, OneDrive, or FileJump accounts so it appears in the **Favorites** sub-menu directly under **Drives** and above **App** in the sidebar. Add or remove favorite folders via the folder right-click context menu (`Add to Favorites` / `Remove from Favorites`), the star action icon in list view, the topbar **Favorite** button, or the star button in the sidebar Favorites header.
 - **Tablet & Mobile Ready:** Slide-over navigation drawer, touch-friendly controls, and adaptive layouts for phones, tablets, and desktops.
 - **List & Grid Views with Sorting:** Switch between detailed list view and visual grid view, and sort files and folders by **Name**, **Date**, or **Size** (ascending or descending) using either the topbar sort controls or clickable column headers (`Name`, `Size`, `Modified`) in list view (folders always stay grouped at the top).
-- **Breadcrumb Navigation:** Clickable path breadcrumbs for instant directory jumping across SMB shares, Google Drive, and OneDrive.
+- **Breadcrumb Navigation:** Clickable path breadcrumbs for instant directory jumping across SMB shares, Google Drive, OneDrive, and FileJump.
+
+### Resumable Upload & Download Transfer Queue Manager
+- **Persistent Queue Drawer & Topbar Pill:** Queue multiple files and folders to upload or download across **all connected drives and shares** (FileJump, SMB, Google Drive, and OneDrive). Click the topbar **Queue** button at any time to inspect active, queued, paused, or completed transfers.
+- **Pause & Byte-Offset Resume for Uploads:** Uploads stream in `2 MiB` slices via server-side resumable upload sessions (`/api/transfers/upload/init`, `/api/transfers/upload/chunk`, `/api/transfers/upload/status`, `/api/transfers/upload/complete`). Pausing an active upload immediately aborts the in-flight chunk while preserving the exact byte offset on disk; clicking **Resume** queries the server's recorded byte offset and continues uploading from that exact byte before committing to SMB, Google Drive, OneDrive, or FileJump.
+- **Pause & HTTP Range Resume for Downloads:** Single and batch file downloads stream through `ReadableStream` with `AbortController`. Pausing a download retains all received byte chunks in memory; clicking **Resume** issues an authenticated `Range: bytes=<received>-` request (`HTTP 206 Partial Content`) to append the remaining bytes seamlessly and trigger the browser save prompt upon completion.
 
 ### Advanced File Management
 - **Right-Click Context Menus:** Right-click any file or folder for quick actions (Open/Preview, Add/Remove Favorite Folder, Edit Text/Config, Download, Rename, Copy to…, Move to…, Delete).
-- **In-Browser Text & Config File Editor:** View, edit, and save text, code, and configuration files (`.txt`, `.md`, `.json`, `.yaml`, `.yml`, `.xml`, `.csv`, `.ini`, `.conf`, `.toml`, `.py`, `.sh`, `.js`, `.ts`, `.css`, `.html`, `.env`, `.log`, etc.) directly in the browser on SMB shares, Google Drive, and Microsoft OneDrive, complete with `Ctrl+S` / `Cmd+S` save shortcut, `Tab` indentation, word-wrap toggle, and unsaved change indicators.
-- **In-Place Rename:** Rename files and folders directly on SMB shares, Google Drive, and Microsoft OneDrive.
+- **In-Browser Text & Config File Editor:** View, edit, and save text, code, and configuration files (`.txt`, `.md`, `.json`, `.yaml`, `.yml`, `.xml`, `.csv`, `.ini`, `.conf`, `.toml`, `.py`, `.sh`, `.js`, `.ts`, `.css`, `.html`, `.env`, `.log`, etc.) directly in the browser on SMB shares, Google Drive, Microsoft OneDrive, and FileJump, complete with `Ctrl+S` / `Cmd+S` save shortcut, `Tab` indentation, word-wrap toggle, and unsaved change indicators.
+- **In-Place Rename:** Rename files and folders directly on SMB shares, Google Drive, Microsoft OneDrive, and FileJump.
 - **Copy & Move Files/Folders (Same-Drive & Cross-Drive):**
-  - **Move Within the Same Drive:** Instant server-side move across folders on the same SMB share (`c.rename`), the same Google Drive account (`addParents`/`removeParents`), or the same OneDrive account (`PATCH parentReference`).
-  - **Cross-Drive Copy & Move (`SMB ↔ Google Drive ↔ OneDrive`):** Copy or move files and entire nested folders between any SMB share, Google Drive account, or Microsoft OneDrive account right from the UI.
-- **Multi-Select & Batch Operations:** Select multiple items with checkboxes or `Select All` to perform **Batch Copy**, **Batch Move**, **Batch Delete**, or **Batch ZIP Download** (streams a dynamically created `.zip` archive of selected files and folders).
-- **Zero-RAM Streaming Uploads & Drag-and-Drop Folders:** Drag and drop individual files or entire nested folder structures directly into the browser; uploads stream directly from the request stream to SMB (`storeFile`), Google Drive resumable upload chunks (`8MB` chunks), or Microsoft Graph `createUploadSession` chunks (`3.2 MiB` aligned chunks) without buffering the full file in container RAM.
-- **Progress Tracking:** Real-time upload and download progress bar with transfer speeds and automatic browser save prompts.
+  - **Move Within the Same Drive:** Instant server-side move across folders on the same SMB share (`c.rename`), the same Google Drive account (`addParents`/`removeParents`), the same OneDrive account (`PATCH parentReference`), or the same FileJump account.
+  - **Cross-Drive Copy & Move (`SMB ↔ Google Drive ↔ OneDrive ↔ FileJump`):** Copy or move files and entire nested folders between any SMB share, Google Drive account, Microsoft OneDrive account, or FileJump account right from the UI.
+- **Multi-Select & Batch Operations:** Select multiple items with checkboxes or `Select All` to perform **Queue Downloads**, **Batch Copy**, **Batch Move**, **Batch Delete**, or **Batch ZIP Download** (streams a dynamically created `.zip` archive of selected files and folders).
 
 ### Media Playback, Multi-Audio & Embedded Subtitles
 - **Default Inline Open:** Clicking any supported video, audio, image, PDF, or text/code file opens it directly in the browser without forcing a download.
-- **Video & Audio Streaming:** Stream full-length video (`mp4`, `webm`, `mkv`, `mov`, `m4v`, `avi`, `ts`, `ogg`) and audio (`mp3`, `wav`, `flac`, `m4a`, `aac`, `opus`, `ogg`) with HTTP Range request seeking and automatic byte-accurate stream resume across SMB (`timeout=14400` with reconnect-at-offset), Google Drive, and Microsoft OneDrive.
+- **Video & Audio Streaming:** Stream full-length video (`mp4`, `webm`, `mkv`, `mov`, `m4v`, `avi`, `ts`, `ogg`) and audio (`mp3`, `wav`, `flac`, `m4a`, `aac`, `opus`, `ogg`) with HTTP Range request seeking and automatic byte-accurate stream resume across SMB (`timeout=14400` with reconnect-at-offset), Google Drive, Microsoft OneDrive, and FileJump.
 - **Automatic Audio Transcoding (EAC3 / AC3 / DTS / TrueHD) with Accurate Duration & Seeking:** Built-in FFmpeg stream remuxing automatically detects browser-incompatible audio codecs (such as Dolby Digital Plus `eac3`, `ac3`, `dts`) and live-transcodes the selected audio track to stereo AAC on the fly while copying the H.264/HEVC video stream untouched (`-c:v copy -c:a aac`). Video duration probing prioritizes the primary video and audio stream durations (ignoring stray subtitle cues or inflated container headers) and keeps the timeline duration locked across server-side seeks (`?ss=`).
 - **Embedded MKV & MP4 Subtitle Support (CC):** Automatically detects embedded text-based subtitle streams (`subrip`/`srt`, `ass`/`ssa`, `webvtt`, `mov_text`) via `ffprobe` and converts the selected track on the fly to WebVTT via FFmpeg (`-map 0:s:<track> -c:s webvtt -f webvtt`), keeping subtitle timestamps synchronized even when performing server-side seeks (`?ss=`) in remuxed streams.
 - **Media Player Controls, Resume Playback Prompt, Double-Tap `±15s` Skip, Bluetooth Audio Delay (`BT` `+100ms`), `1x–2x` Speed & 5s Auto-Hiding HUD:**
@@ -55,18 +59,17 @@ Repository: [https://github.com/Sage222/SageDrive2](https://github.com/Sage222/S
 - **Hardened Session Management:** Username/password authentication with `bcrypt` hashed passwords, `HttpOnly` + `SameSite=Lax` session cookies, Bearer token sessions, full session revocation on logout, and configurable session TTL.
 
 ### Tidied Settings Page, Themes & Multi-Drive SMB Proxy
-- **Dedicated Category Tabs:** Organized into **Google Drives**, **OneDrive**, **SMB**, **Google OAuth**, **OneDrive OAuth**, **SMB Proxy**, **Themes**, and **Security & About** tabs for clean, focused configuration.
+- **Dedicated Category Tabs:** Organized into **Google Drives**, **OneDrive**, **FileJump**, **SMB**, **Google OAuth**, **OneDrive OAuth**, **SMB Proxy**, **Themes**, and **Security & About** tabs for clean, focused configuration.
 - **5 Modern Dark Themes (Persistent Across Logins):** Choose between **Obsidian Teal**, **Midnight Cobalt**, **Nebula Violet**, **Forest Matrix**, and **Crimson Ember** in **Settings → Themes** (or cycle themes from the sidebar palette button). Your selected theme is saved both locally and in your server-side user profile (`users.json`) so it persists across logins and devices.
-- **Dedicated Cloud & SMB Tabs:** Manage connected Google Drive accounts, Microsoft OneDrive accounts, and SMB/NAS shares in their own dedicated tabs with inline custom name editing, status badges, and quick **+ Add** buttons.
-- **Google & Microsoft OAuth Credentials:** Configure and copy your Google OAuth and Microsoft Azure App Registration credentials and Authorized Redirect URIs in their dedicated tabs.
-- **Multi-Drive Cloud SMB Proxy (Google Drive & OneDrive):**
-  - **Separate Network Share per Cloud Drive:** Expose each connected Google Drive and Microsoft OneDrive account as its own independent Samba network share (`\\<host>\<ShareName>`) on port `445` via `rclone` FUSE mounts (`/mnt/gdrive_mounts/<account_id>`).
-  - **Per-Drive Enable/Disable Toggle:** Turn the SMB Proxy share on or off individually for each connected Google Drive or OneDrive account in **Settings → SMB Proxy**.
-  - **Custom SMB Share Names:** Assign a custom network share name (e.g. `GoogleDrive`, `PersonalOneDrive`, `WorkDrive`) per cloud drive in **Settings → SMB Proxy**, complete with per-drive one-click UNC path and PowerShell `net use` command copy buttons.
-  - **Live Mount, Memory Tuning & Samba Reload:** Adding, toggling, or renaming a Google Drive or OneDrive SMB share dynamically reconciles `rclone` mounts (`/mnt/gdrive_mounts/<account_id>` with bounded `--buffer-size 16M` and `--vfs-read-chunk-size 32M`), unmounts any legacy single-drive `/mnt/gdrive` mount at startup, rewrites `/etc/samba/smb.conf`, and reloads Samba (`smbd`) on the fly without requiring a Docker image rebuild or container restart.
+- **Dedicated Cloud & SMB Tabs:** Manage connected Google Drive accounts, Microsoft OneDrive accounts, FileJump accounts, and SMB/NAS shares in their own dedicated tabs with inline custom name editing, status badges, and quick **+ Add** buttons.
+- **Multi-Drive Cloud SMB Proxy (Google Drive, OneDrive & FileJump):**
+  - **Separate Network Share per Cloud Drive:** Expose each connected Google Drive, Microsoft OneDrive, and FileJump account as its own independent Samba network share (`\\<host>\<ShareName>`) on port `445` via `rclone` FUSE mounts (`/mnt/gdrive_mounts/<account_id>`).
+  - **Per-Drive Enable/Disable Toggle:** Turn the SMB Proxy share on or off individually for each connected Google Drive, OneDrive, or FileJump account in **Settings → SMB Proxy**.
+  - **Custom SMB Share Names:** Assign a custom network share name (e.g. `GoogleDrive`, `PersonalOneDrive`, `FileJumpCloud`) per cloud drive in **Settings → SMB Proxy**, complete with per-drive one-click UNC path and PowerShell `net use` command copy buttons.
+  - **Live Mount, Memory Tuning & Samba Reload:** Adding, toggling, or renaming a cloud drive SMB share dynamically reconciles `rclone` mounts (`/mnt/gdrive_mounts/<account_id>` with bounded `--buffer-size 16M` and `--vfs-read-chunk-size 32M`), unmounts any legacy single-drive `/mnt/gdrive` mount at startup, rewrites `/etc/samba/smb.conf`, and reloads Samba (`smbd`) on the fly without requiring a Docker image rebuild or container restart.
 
 ### Tech Stack
-- **Backend:** Python, Flask, `pysmb`, Google Drive API v3, Microsoft Graph API v1.0 (OneDrive), `ffmpeg` (live audio remuxing & WebVTT subtitle extraction), `rclone` + Samba
+- **Backend:** Python, Flask, `pysmb`, Google Drive API v3, Microsoft Graph API v1.0 (OneDrive), FileJump REST API v1 & WebDAV (`filejump_manager.py`), `ffmpeg` (live audio remuxing & WebVTT subtitle extraction), `rclone` + Samba
 - **Frontend:** Single-file vanilla JS SPA, Lucide icons, responsive CSS with 5 modern dark themes (`Obsidian Teal`, `Midnight Cobalt`, `Nebula Violet`, `Forest Matrix`, `Crimson Ember`)
 - **Deployment:** Docker & Docker Compose (`1G` container memory limit tuned for multi-drive FUSE & FFmpeg remuxing)
 
@@ -128,6 +131,18 @@ Use the `ADMIN_USER` and `ADMIN_PASS` values from your `.env` file.
    - **Port** — default is `445`
 4. Click **Add Share** — the share appears in the sidebar immediately.
 5. **Custom Rename:** Right-click any SMB share in the sidebar (or click the edit icon on its card in **Settings**) at any time to give it a custom display name.
+
+---
+
+## Connecting Multiple FileJump Accounts
+
+SageDrive supports connecting multiple FileJump (`https://filejump.com`) accounts via either **API Access Token** or **WebDAV Credentials**:
+
+1. Go to **Settings → FileJump** and click **+ Add FileJump Account**.
+2. Choose your connection mode:
+   - **API Access Token:** Paste the Bearer token generated from your FileJump Account Settings → Developers / API Tokens, and confirm the server URL (`https://drive.filejump.com` or `https://app.filejump.com`).
+   - **WebDAV:** Enter the FileJump WebDAV endpoint (`https://uploads.filejump.com/dav`) along with your FileJump email/username and WebDAV password/key.
+3. Give the drive a custom display name (e.g. `FileJump Cloud`) and click **Connect FileJump**.
 
 ---
 
@@ -199,14 +214,14 @@ Microsoft OneDrive access uses OAuth2 (Microsoft Graph API v1.0) with your own A
 
 ---
 
-## Multi-Drive SMB Proxy Setup (Google Drive & OneDrive)
+## Multi-Drive SMB Proxy Setup (Google Drive, OneDrive & FileJump)
 
-Each connected Google Drive and Microsoft OneDrive account can be exposed on your local network as its own SMB share on port `445`:
+Each connected Google Drive, Microsoft OneDrive, and FileJump account can be exposed on your local network as its own SMB share on port `445`:
 
 1. Go to **Settings → SMB Proxy**
-2. For each connected Google Drive or OneDrive account:
+2. For each connected Google Drive, OneDrive, or FileJump account:
    - Use the **SMB Enabled** toggle switch to turn network sharing on or off for that specific drive.
-   - Set a **Custom SMB Share Name** (e.g. `PersonalDrive`, `WorkOneDrive`, `GoogleDrive`) and click **Apply Name**.
+   - Set a **Custom SMB Share Name** (e.g. `PersonalDrive`, `WorkOneDrive`, `FileJumpCloud`) and click **Apply Name**.
    - Click **UNC** or **PowerShell** to copy the exact `\\<host>\<ShareName>` path or `net use` command for that drive.
 3. Under **Samba Authentication Credentials**, set the Windows SMB username and password used to authenticate when mapping your drives.
 
@@ -224,7 +239,7 @@ docker compose down && docker compose up -d --build
 
 ## Data & Persistence
 
-All application data (`users.json`, `smb_shares.json`, `gdrive_accounts.json`, `gdrive_config.json`, `onedrive_accounts.json`, `onedrive_client.json`, and SMB proxy state) is stored in the `sagedrive-data` Docker named volume (`/data`), which persists across container restarts and rebuilds.
+All application data (`users.json`, `smb_shares.json`, `gdrive_accounts.json`, `gdrive_config.json`, `onedrive_accounts.json`, `onedrive_client.json`, `filejump_accounts.json`, and SMB proxy state) is stored in the `sagedrive-data` Docker named volume (`/data`), which persists across container restarts and rebuilds.
 
 To back it up:
 ```bash
@@ -235,4 +250,5 @@ To restore:
 ```bash
 docker run --rm -v sagedrive-data:/data -v $(pwd):/backup alpine tar xzf /backup/sagedrive-backup.tar.gz -C /
 ```
+
 

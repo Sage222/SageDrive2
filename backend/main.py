@@ -10,7 +10,7 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
-import auth, smb_manager, gdrive_manager, onedrive_manager
+import auth, smb_manager, gdrive_manager, onedrive_manager, filejump_manager
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 CORS(app, supports_credentials=True, expose_headers=["Content-Length", "Content-Range", "Accept-Ranges", "Content-Disposition"])
@@ -990,6 +990,12 @@ class _InternalMediaRangeHandler(BaseHTTPRequestHandler):
                 meta = onedrive_manager.get_file_meta(file_id, account_id=account_id)
                 file_size = meta["size"]
                 kind = "onedrive"
+            elif parsed.path.startswith("/filejump/"):
+                file_id = unquote(parsed.path[len("/filejump/"):])
+                account_id = qs.get("account_id", [None])[0]
+                meta = filejump_manager.get_file_meta(file_id, account_id=account_id)
+                file_size = meta["size"]
+                kind = "filejump"
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -1043,6 +1049,9 @@ class _InternalMediaRangeHandler(BaseHTTPRequestHandler):
             elif kind == "onedrive":
                 end_byte = (start + fetch_len - 1) if fetch_len > 0 else None
                 gen = onedrive_manager.stream_file_range(file_id, start=start, end=end_byte, account_id=account_id)
+            elif kind == "filejump":
+                end_byte = (start + fetch_len - 1) if fetch_len > 0 else None
+                gen = filejump_manager.stream_file_range(file_id, start=start, end=end_byte, account_id=account_id)
             else:
                 end_byte = (start + fetch_len - 1) if fetch_len > 0 else None
                 gen = gdrive_manager.stream_file_range(file_id, start=start, end=end_byte, account_id=account_id)
@@ -1087,6 +1096,12 @@ def _internal_gdrive_url(file_id, account_id=None):
 
 def _internal_onedrive_url(file_id, account_id=None):
     base = f"http://127.0.0.1:{_INTERNAL_MEDIA_PORT}/onedrive/{quote(str(file_id))}"
+    if account_id:
+        return f"{base}?account_id={quote(str(account_id))}"
+    return base
+
+def _internal_filejump_url(file_id, account_id=None):
+    base = f"http://127.0.0.1:{_INTERNAL_MEDIA_PORT}/filejump/{quote(str(file_id))}"
     if account_id:
         return f"{base}?account_id={quote(str(account_id))}"
     return base
@@ -2953,7 +2968,554 @@ def onedrive_mkdir():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ── Cross-Drive Transfer & Move (SMB <-> Google Drive <-> OneDrive) ───────────
+# ── FileJump Routes (Multi-Account: API Token + WebDAV) ───────────────────────
+@app.get("/api/filejump/status")
+@auth.require_auth
+def filejump_status():
+    return jsonify({
+        "configured": filejump_manager.is_configured(),
+        "authenticated": filejump_manager.is_authenticated(),
+        "accounts": filejump_manager.list_accounts(),
+    })
+
+@app.get("/api/filejump/accounts")
+@auth.require_auth
+def filejump_accounts():
+    return jsonify(filejump_manager.list_accounts())
+
+@app.post("/api/filejump/accounts/<account_id>/rename")
+@auth.require_admin
+def filejump_rename_account(account_id):
+    b = request.get_json(force=True) or {}
+    new_name = (b.get("name") or b.get("custom_name") or "").strip()
+    if not new_name:
+        return jsonify({"error": "Custom name cannot be empty"}), 400
+    try:
+        updated = filejump_manager.rename_account(account_id, new_name)
+        return jsonify(updated)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.delete("/api/filejump/accounts/<account_id>")
+@auth.require_admin
+def filejump_remove_account(account_id):
+    try:
+        filejump_manager.remove_account(account_id)
+        try:
+            _reconcile_smb_proxy()
+        except Exception:
+            pass
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.post("/api/filejump/connect")
+@auth.require_admin
+def filejump_connect():
+    b = request.get_json(force=True) or {}
+    auth_type = (b.get("auth_type") or "token").strip().lower()
+    api_token = (b.get("api_token") or b.get("password") or b.get("token") or "").strip()
+    email = (b.get("email") or b.get("username") or "").strip()
+    api_url = (b.get("api_url") or b.get("webdav_url") or "").strip()
+    custom_name = (b.get("name") or b.get("custom_name") or "").strip()
+    account_id = (b.get("account_id") or "").strip() or None
+    try:
+        acc = filejump_manager.add_account(
+            auth_type=auth_type,
+            api_token=api_token,
+            email=email,
+            api_url=api_url,
+            custom_name=custom_name,
+            account_id=account_id,
+        )
+        try:
+            _reconcile_smb_proxy()
+        except Exception:
+            pass
+        return jsonify({"ok": True, "account": acc, "accounts": filejump_manager.list_accounts()})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.delete("/api/filejump/revoke")
+@auth.require_admin
+def filejump_revoke():
+    account_id = request.args.get("account_id", "").strip() or None
+    filejump_manager.revoke(account_id=account_id)
+    try:
+        _reconcile_smb_proxy()
+    except Exception:
+        pass
+    return jsonify({"ok": True})
+
+@app.get("/api/filejump/files")
+@auth.require_auth
+def filejump_files():
+    folder_id = request.args.get("folder", "root")
+    account_id = request.args.get("account_id", "").strip() or None
+    try:
+        return jsonify(filejump_manager.list_files(folder_id, account_id=account_id))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.get("/api/filejump/probe/<path:file_id>")
+@auth.require_auth
+def filejump_probe(file_id):
+    account_id = request.args.get("account_id", "").strip() or None
+    try:
+        meta = filejump_manager.get_file_meta(file_id, account_id=account_id)
+        filename = meta["name"]
+        file_size = meta["size"]
+        internal_url = _internal_filejump_url(file_id, account_id=account_id)
+        end_byte = min(file_size - 1, 4 * 1024 * 1024 - 1) if file_size > 0 else 4 * 1024 * 1024 - 1
+        info = probe_media_info(
+            cache_key=f"filejump:{account_id or 'default'}:{file_id}",
+            internal_url=internal_url,
+            filename=filename,
+            fallback_gen_fn=lambda: filejump_manager.stream_file_range(file_id, start=0, end=end_byte, account_id=account_id),
+        )
+        return jsonify(info)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.get("/api/filejump/subtitles/<path:file_id>")
+@auth.require_auth
+def filejump_subtitles(file_id):
+    account_id = request.args.get("account_id", "").strip() or None
+    try:
+        track = int(request.args.get("track", "0") or 0)
+        start_time = float(request.args.get("ss", "0") or 0.0)
+        internal_url = _internal_filejump_url(file_id, account_id=account_id)
+        vtt = extract_webvtt_subtitles(internal_url, subtitle_track=track, start_time=start_time)
+        resp = app.response_class(vtt, status=200, mimetype="text/vtt; charset=utf-8")
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.get("/api/filejump/download/<path:file_id>")
+@auth.require_auth
+def filejump_download(file_id):
+    account_id = request.args.get("account_id", "").strip() or None
+    try:
+        meta = filejump_manager.get_file_meta(file_id, account_id=account_id)
+        filename = meta["name"]
+        raw_mime = meta["mimeType"]
+        file_size = meta["size"]
+
+        disposition = make_content_disposition(filename, bool(request.args.get("dl")))
+        internal_url = _internal_filejump_url(file_id, account_id=account_id)
+
+        if request.args.get("transcode") == "1":
+            mode = request.args.get("mode", "auto")
+            audio_track = int(request.args.get("audio_track", "0") or 0)
+            start_time = float(request.args.get("ss", "0") or 0.0)
+            duration_hint = float(request.args.get("duration", "0") or 0.0)
+            end_byte = min(file_size - 1, 8 * 1024 * 1024 - 1) if file_size > 0 else 8 * 1024 * 1024 - 1
+            probe_info = probe_media_info(
+                cache_key=f"filejump:{account_id or 'default'}:{file_id}",
+                internal_url=internal_url,
+                filename=filename,
+                fallback_gen_fn=lambda: filejump_manager.stream_file_range(file_id, start=0, end=end_byte, account_id=account_id),
+            )
+            resp = app.response_class(
+                transcode_media_stream(
+                    internal_url=internal_url,
+                    chunk_iterable_fn=lambda: filejump_manager.stream_file_range(file_id, start=0, end=None, account_id=account_id),
+                    filename=filename,
+                    mode=mode,
+                    audio_track=audio_track,
+                    start_time=start_time,
+                    probe_info=probe_info,
+                    duration_hint=duration_hint,
+                ),
+                status=200,
+                mimetype="video/mp4",
+                direct_passthrough=True,
+            )
+            resp.headers["Cache-Control"] = "no-cache"
+            resp.headers["Content-Disposition"] = disposition
+            return resp
+
+        if request.args.get("transcode") == "audio":
+            start_time = float(request.args.get("ss", "0") or 0.0)
+            resp = app.response_class(
+                transcode_audio_stream(
+                    lambda: filejump_manager.stream_file_range(file_id, start=0, end=None, account_id=account_id),
+                    internal_url=internal_url,
+                    start_time=start_time,
+                ),
+                status=200,
+                mimetype="audio/mpeg",
+                direct_passthrough=True,
+            )
+            resp.headers["Cache-Control"] = "no-cache"
+            resp.headers["Content-Disposition"] = disposition
+            return resp
+
+        mime = guess_media_mime(filename, raw_mime)
+        range_header = request.headers.get("Range")
+
+        if range_header and file_size > 0:
+            m = re.search(r"bytes=(\d*)-(\d*)", range_header)
+            if not m:
+                resp = app.response_class("", status=416)
+                resp.headers["Content-Range"] = f"bytes */{file_size}"
+                return resp
+
+            if not m.group(1) and m.group(2):
+                suffix = int(m.group(2))
+                start = max(0, file_size - suffix)
+                end = file_size - 1
+            else:
+                start = int(m.group(1)) if m.group(1) else 0
+                end = int(m.group(2)) if m.group(2) else file_size - 1
+
+            if start >= file_size or start > end:
+                resp = app.response_class("", status=416)
+                resp.headers["Content-Range"] = f"bytes */{file_size}"
+                return resp
+
+            end = min(end, file_size - 1)
+            length = end - start + 1
+
+            resp = app.response_class(
+                filejump_manager.stream_file_range(file_id, start=start, end=end, account_id=account_id),
+                status=206,
+                mimetype=mime,
+                direct_passthrough=True,
+            )
+            resp.headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+            resp.headers["Content-Length"] = str(length)
+            resp.headers["Accept-Ranges"] = "bytes"
+            resp.headers["Cache-Control"] = "no-cache"
+            resp.headers["Content-Disposition"] = disposition
+            return resp
+        else:
+            resp = app.response_class(
+                filejump_manager.stream_file_range(file_id, start=0, end=None, account_id=account_id),
+                status=200,
+                mimetype=mime,
+                direct_passthrough=True,
+            )
+            if file_size > 0:
+                resp.headers["Content-Length"] = str(file_size)
+            resp.headers["Accept-Ranges"] = "bytes"
+            resp.headers["Cache-Control"] = "no-cache"
+            resp.headers["Content-Disposition"] = disposition
+            return resp
+    except Exception as e:
+        print(f"FILEJUMP DOWNLOAD ERROR file_id={file_id}: {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
+
+@app.post("/api/filejump/upload")
+@auth.require_admin
+def filejump_upload():
+    folder_id = request.args.get("folder", "root")
+    account_id = request.args.get("account_id", "").strip() or None
+    rel_path = (request.form.get("relative_path") or request.args.get("relative_path") or "").strip()
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "No file provided"}), 400
+    try:
+        filejump_manager.upload_file(
+            folder_id,
+            f.filename,
+            f.stream,
+            f.content_type or "application/octet-stream",
+            relative_path=rel_path or None,
+            account_id=account_id,
+        )
+        return jsonify({"ok": True})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.put("/api/filejump/content/<path:file_id>")
+@auth.require_admin
+def filejump_save_content(file_id):
+    b = request.get_json(force=True) or {}
+    account_id = (request.args.get("account_id") or b.get("account_id") or "").strip() or None
+    content = b.get("content")
+    if content is None:
+        return jsonify({"error": "content is required"}), 400
+    try:
+        meta = filejump_manager.get_file_meta(file_id, account_id=account_id)
+        mime = guess_media_mime(meta.get("name", "file.txt"), meta.get("mimeType"))
+        if mime == "application/octet-stream":
+            mime = "text/plain; charset=utf-8"
+        encoded = str(content).encode("utf-8")
+        updated = filejump_manager.update_file_content(
+            file_id,
+            io.BytesIO(encoded),
+            mime_type=mime,
+            account_id=account_id,
+        )
+        return jsonify({"ok": True, "size": len(encoded), "file": updated})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.post("/api/filejump/rename/<path:file_id>")
+@auth.require_admin
+def filejump_rename(file_id):
+    b = request.get_json(force=True) or {}
+    account_id = (request.args.get("account_id") or b.get("account_id") or "").strip() or None
+    new_name = (b.get("name") or b.get("new_name") or "").strip()
+    if not new_name:
+        return jsonify({"error": "New name is required"}), 400
+    try:
+        filejump_manager.rename_file(file_id, new_name, account_id=account_id)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.post("/api/filejump/zip")
+@auth.require_auth
+def filejump_zip():
+    b = request.get_json(force=True) or {}
+    account_id = (request.args.get("account_id") or b.get("account_id") or "").strip() or None
+    ids = b.get("ids") or []
+    if not ids:
+        return jsonify({"error": "No file IDs provided"}), 400
+    try:
+        tmp_path, zip_size = filejump_manager.create_zip_tmpfile(ids, account_id=account_id)
+        archive_name = b.get("name") or "FileJump_Download.zip"
+        resp = app.response_class(
+            _stream_and_unlink_tmpfile(tmp_path),
+            status=200,
+            mimetype="application/zip",
+            direct_passthrough=True,
+        )
+        resp.headers["Content-Length"] = str(zip_size)
+        resp.headers["Content-Disposition"] = make_content_disposition(archive_name, True)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.delete("/api/filejump/delete/<path:file_id>")
+@auth.require_admin
+def filejump_delete(file_id):
+    account_id = request.args.get("account_id", "").strip() or None
+    try:
+        filejump_manager.delete_file(file_id, account_id=account_id)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.post("/api/filejump/mkdir")
+@auth.require_admin
+def filejump_mkdir():
+    b = request.get_json(force=True) or {}
+    account_id = (request.args.get("account_id") or b.get("account_id") or "").strip() or None
+    try:
+        fid = filejump_manager.create_folder(b.get("parent", "root"), b.get("name", "New Folder"), account_id=account_id)
+        return jsonify({"id": fid})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ── Resumable Upload Sessions (All Drives: SMB, Google Drive, OneDrive, FileJump) ──
+_UPLOAD_SESSIONS_DIR = Path(os.environ.get("DATA_DIR", "/app/data")) / "upload_sessions"
+_upload_sessions_lock = threading.Lock()
+
+def _get_upload_session_paths(session_id):
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "", str(session_id or ""))
+    if not safe_id:
+        raise ValueError("Invalid upload session ID")
+    _UPLOAD_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    return _UPLOAD_SESSIONS_DIR / f"{safe_id}.json", _UPLOAD_SESSIONS_DIR / f"{safe_id}.part"
+
+@app.post("/api/transfers/upload/init")
+@auth.require_admin
+def init_resumable_upload():
+    b = request.get_json(force=True) or {}
+    drive_type = (b.get("driveType") or "").strip().lower()
+    drive_id = (b.get("driveId") or "default").strip()
+    folder = str(b.get("folder") or ("/" if drive_type == "smb" else "root")).strip()
+    file_name = str(b.get("fileName") or "").strip()
+    relative_path = str(b.get("relativePath") or "").strip()
+    total_size = int(b.get("totalSize") or 0)
+    mime_type = str(b.get("mimeType") or "application/octet-stream").strip()
+    client_key = str(b.get("clientKey") or "").strip()
+
+    if drive_type not in ("smb", "gdrive", "onedrive", "filejump"):
+        return jsonify({"error": "Invalid target drive type"}), 400
+    if not file_name:
+        return jsonify({"error": "fileName is required"}), 400
+
+    with _upload_sessions_lock:
+        _UPLOAD_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        if client_key:
+            session_id = "up_" + hashlib.sha256(
+                f"{drive_type}:{drive_id}:{folder}:{relative_path or file_name}:{total_size}:{client_key}".encode("utf-8")
+            ).hexdigest()[:24]
+        else:
+            session_id = f"up_{secrets.token_hex(12)}"
+
+        meta_path, part_path = _get_upload_session_paths(session_id)
+        if meta_path.exists() and part_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text())
+                actual_offset = part_path.stat().st_size
+                if actual_offset <= total_size:
+                    meta["offset"] = actual_offset
+                    meta_path.write_text(json.dumps(meta, indent=2))
+                    return jsonify({
+                        "sessionId": session_id,
+                        "offset": actual_offset,
+                        "totalSize": total_size,
+                        "resumed": actual_offset > 0,
+                    })
+            except Exception:
+                pass
+
+        part_path.write_bytes(b"")
+        meta = {
+            "sessionId": session_id,
+            "driveType": drive_type,
+            "driveId": drive_id,
+            "folder": folder,
+            "fileName": file_name,
+            "relativePath": relative_path,
+            "totalSize": total_size,
+            "mimeType": mime_type,
+            "offset": 0,
+            "createdAt": time.time(),
+        }
+        meta_path.write_text(json.dumps(meta, indent=2))
+        return jsonify({
+            "sessionId": session_id,
+            "offset": 0,
+            "totalSize": total_size,
+            "resumed": False,
+        })
+
+@app.get("/api/transfers/upload/status")
+@auth.require_auth
+def status_resumable_upload():
+    session_id = request.args.get("session_id", "").strip()
+    try:
+        meta_path, part_path = _get_upload_session_paths(session_id)
+        if not meta_path.exists():
+            return jsonify({"error": "Upload session not found"}), 404
+        meta = json.loads(meta_path.read_text())
+        offset = part_path.stat().st_size if part_path.exists() else 0
+        return jsonify({
+            "sessionId": session_id,
+            "offset": offset,
+            "totalSize": meta.get("totalSize", 0),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.post("/api/transfers/upload/chunk")
+@auth.require_admin
+def chunk_resumable_upload():
+    session_id = (request.args.get("session_id") or request.headers.get("X-Upload-Session-Id") or "").strip()
+    offset_arg = request.args.get("offset") or request.headers.get("X-Upload-Offset") or "0"
+    try:
+        expected_offset = int(offset_arg)
+        meta_path, part_path = _get_upload_session_paths(session_id)
+        if not meta_path.exists():
+            return jsonify({"error": "Upload session not found"}), 404
+
+        chunk_bytes = request.get_data(cache=False)
+        with _upload_sessions_lock:
+            current_size = part_path.stat().st_size if part_path.exists() else 0
+            if expected_offset != current_size:
+                return jsonify({
+                    "error": f"Offset mismatch (expected {current_size}, got {expected_offset})",
+                    "offset": current_size,
+                }), 409
+            with open(part_path, "ab") as fp:
+                fp.write(chunk_bytes)
+            new_offset = part_path.stat().st_size
+            meta = json.loads(meta_path.read_text())
+            meta["offset"] = new_offset
+            meta["updatedAt"] = time.time()
+            meta_path.write_text(json.dumps(meta, indent=2))
+            return jsonify({"ok": True, "offset": new_offset})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.post("/api/transfers/upload/complete")
+@auth.require_admin
+def complete_resumable_upload():
+    b = request.get_json(force=True) or {}
+    session_id = (b.get("sessionId") or request.args.get("session_id") or "").strip()
+    try:
+        meta_path, part_path = _get_upload_session_paths(session_id)
+        if not meta_path.exists() or not part_path.exists():
+            return jsonify({"error": "Upload session not found"}), 404
+        meta = json.loads(meta_path.read_text())
+        drive_type = meta["driveType"]
+        drive_id = meta["driveId"]
+        folder = meta["folder"]
+        file_name = meta["fileName"]
+        rel_path = meta.get("relativePath") or ""
+        mime_type = meta.get("mimeType") or guess_media_mime(file_name)
+
+        with open(part_path, "rb") as fp:
+            if drive_type == "smb":
+                sub = rel_path if rel_path else file_name
+                dest_full = _sanitize_smb_path(folder.rstrip("/") + "/" + sub.lstrip("/"), allow_root=False)
+                smb_manager.upload_file(drive_id, dest_full, fp)
+                _SMB_SIZE_CACHE.pop(f"{drive_id}:{dest_full}", None)
+            elif drive_type == "gdrive":
+                gdrive_manager.upload_file(
+                    folder or "root",
+                    file_name,
+                    fp,
+                    mime_type,
+                    relative_path=rel_path or None,
+                    account_id=drive_id,
+                )
+            elif drive_type == "onedrive":
+                onedrive_manager.upload_file(
+                    folder or "root",
+                    file_name,
+                    fp,
+                    mime_type,
+                    relative_path=rel_path or None,
+                    account_id=drive_id,
+                )
+            elif drive_type == "filejump":
+                filejump_manager.upload_file(
+                    folder or "root",
+                    file_name,
+                    fp,
+                    mime_type,
+                    relative_path=rel_path or None,
+                    account_id=drive_id,
+                )
+
+        try:
+            part_path.unlink(missing_ok=True)
+            meta_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.delete("/api/transfers/upload/cancel")
+@auth.require_admin
+def cancel_resumable_upload():
+    session_id = (request.args.get("session_id") or "").strip()
+    try:
+        meta_path, part_path = _get_upload_session_paths(session_id)
+        part_path.unlink(missing_ok=True)
+        meta_path.unlink(missing_ok=True)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+# ── Cross-Drive Transfer & Move (SMB <-> Google Drive <-> OneDrive <-> FileJump) ──
 def _read_source_item_tree(src_type, src_drive, item):
     """
     Returns (name, is_folder, children_or_None, read_bytes_and_mime_fn).
@@ -2984,6 +3546,15 @@ def _read_source_item_tree(src_type, src_drive, item):
             children = onedrive_manager.list_files(fid, account_id=src_drive)
             return name, True, children, None
         return name, False, None, lambda: (onedrive_manager.download_file(fid, account_id=src_drive)[0], meta.get("mimeType") or guess_media_mime(name))
+    elif src_type == "filejump":
+        fid = item["id"]
+        meta = filejump_manager.get_file_meta(fid, account_id=src_drive)
+        name = meta["name"]
+        is_folder = item.get("type") == "folder" or meta.get("isFolder") or meta.get("mimeType") == "application/vnd.filejump.folder"
+        if is_folder:
+            children = filejump_manager.list_files(fid, account_id=src_drive)
+            return name, True, children, None
+        return name, False, None, lambda: (filejump_manager.download_file(fid, account_id=src_drive)[0], meta.get("mimeType") or guess_media_mime(name))
     raise ValueError(f"Unsupported source drive type: {src_type!r}")
 
 def _copy_item_across_drives(src_type, src_drive, item, dest_type, dest_drive, dest_folder):
@@ -2997,6 +3568,8 @@ def _copy_item_across_drives(src_type, src_drive, item, dest_type, dest_drive, d
             next_dest = gdrive_manager.ensure_folder_path(dest_folder, [name], account_id=dest_drive)
         elif dest_type == "onedrive":
             next_dest = onedrive_manager.ensure_folder_path(dest_folder, [name], account_id=dest_drive)
+        elif dest_type == "filejump":
+            next_dest = filejump_manager.ensure_folder_path(dest_folder, [name], account_id=dest_drive)
         else:
             raise ValueError(f"Unsupported destination drive type: {dest_type!r}")
         for ch in (children or []):
@@ -3011,6 +3584,8 @@ def _copy_item_across_drives(src_type, src_drive, item, dest_type, dest_drive, d
             gdrive_manager.upload_file(dest_folder, name, data, mime, account_id=dest_drive)
         elif dest_type == "onedrive":
             onedrive_manager.upload_file(dest_folder, name, data, mime, account_id=dest_drive)
+        elif dest_type == "filejump":
+            filejump_manager.upload_file(dest_folder, name, data, mime, account_id=dest_drive)
         else:
             raise ValueError(f"Unsupported destination drive type: {dest_type!r}")
 
@@ -3029,7 +3604,8 @@ def transfer_items():
 
     if not items:
         return jsonify({"error": "No items selected for transfer"}), 400
-    if src_type not in ("smb", "gdrive", "onedrive") or dest_type not in ("smb", "gdrive", "onedrive"):
+    valid_types = ("smb", "gdrive", "onedrive", "filejump")
+    if src_type not in valid_types or dest_type not in valid_types:
         return jsonify({"error": "Invalid source or destination type"}), 400
 
     try:
@@ -3047,6 +3623,8 @@ def transfer_items():
                     gdrive_manager.move_file(item["id"], dest_folder, account_id=src_drive)
                 elif src_type == "onedrive":
                     onedrive_manager.move_file(item["id"], dest_folder, account_id=src_drive)
+                elif src_type == "filejump":
+                    filejump_manager.move_file(item["id"], dest_folder, account_id=src_drive)
             else:
                 _copy_item_across_drives(src_type, src_drive, item, dest_type, dest_drive, dest_folder)
                 if is_move:
@@ -3058,6 +3636,8 @@ def transfer_items():
                         gdrive_manager.delete_file(item["id"], account_id=src_drive)
                     elif src_type == "onedrive":
                         onedrive_manager.delete_file(item["id"], account_id=src_drive)
+                    elif src_type == "filejump":
+                        filejump_manager.delete_file(item["id"], account_id=src_drive)
             count += 1
         return jsonify({"ok": True, "copied": count, "moved": count if is_move else 0, "operation": "move" if is_move else "copy"})
     except ValueError as e:
@@ -3065,7 +3645,7 @@ def transfer_items():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ── Multi-Drive SMB Proxy Manager & Credentials (Google Drive + OneDrive) ────
+# ── Multi-Drive SMB Proxy Manager & Credentials (Google Drive + OneDrive + FileJump) ──
 _smb_proxy_lock = threading.Lock()
 _SMB_MOUNTS_BASE = Path("/mnt/gdrive_mounts")
 
@@ -3096,14 +3676,27 @@ def _unmount_path(mount_path):
         return True
     return False
 
+def _rclone_obscure_password(raw_pw):
+    if not raw_pw:
+        return ""
+    if shutil.which("rclone"):
+        try:
+            res = subprocess.run(["rclone", "obscure", str(raw_pw)], capture_output=True, text=True, timeout=5)
+            if res.returncode == 0 and res.stdout.strip():
+                return res.stdout.strip()
+        except Exception:
+            pass
+    return str(raw_pw)
+
 def _reconcile_smb_proxy():
     with _smb_proxy_lock:
         gd_accounts = _gd_load_accounts_raw()
         od_accounts = onedrive_manager._load_accounts_raw()
+        fj_accounts = filejump_manager._load_accounts_raw()
         gd_cfg = gdrive_manager.get_config()
         od_cfg = onedrive_manager.get_config()
 
-        # 1. Write multi-account rclone.conf (Google Drive + OneDrive)
+        # 1. Write multi-account rclone.conf (Google Drive + OneDrive + FileJump)
         rclone_blocks = []
         for idx, acc in enumerate(gd_accounts):
             d = acc.get("creds") or {}
@@ -3165,6 +3758,33 @@ def _reconcile_smb_proxy():
                 lines.append(f"drive_type = {drive_type}")
             rclone_blocks.append("\n".join(lines) + "\n")
 
+        for acc in fj_accounts:
+            api_token = acc.get("api_token") or ""
+            if not api_token:
+                continue
+            rc_id = _safe_rclone_id(acc.get("id", "default"))
+            auth_type = acc.get("auth_type", "token")
+            if auth_type == "webdav":
+                dav_url = acc.get("api_url") or filejump_manager.DEFAULT_WEBDAV_BASE
+                lines = [
+                    f"[filejump_{rc_id}]",
+                    "type = webdav",
+                    f"url = {dav_url}",
+                    "vendor = other",
+                    f"user = {acc.get('email', '')}",
+                    f"pass = {_rclone_obscure_password(api_token)}",
+                ]
+            else:
+                dav_url = filejump_manager.DEFAULT_WEBDAV_BASE
+                lines = [
+                    f"[filejump_{rc_id}]",
+                    "type = webdav",
+                    f"url = {dav_url}",
+                    "vendor = other",
+                    f"bearer_token = {api_token}",
+                ]
+            rclone_blocks.append("\n".join(lines) + "\n")
+
         try:
             os.makedirs("/root/.config/rclone", exist_ok=True)
             Path("/root/.config/rclone/rclone.conf").write_text("\n".join(rclone_blocks))
@@ -3197,6 +3817,12 @@ def _reconcile_smb_proxy():
                 rc_id = _safe_rclone_id(acc["id"])
                 mpath = str(_SMB_MOUNTS_BASE / f"od_{rc_id}")
                 desired_mounts[mpath] = f"onedrive_{rc_id}:"
+
+        for acc in fj_accounts:
+            if bool(acc.get("smb_enabled", True)) and acc.get("api_token"):
+                rc_id = _safe_rclone_id(acc.get("id", "default"))
+                mpath = str(_SMB_MOUNTS_BASE / f"fj_{rc_id}")
+                desired_mounts[mpath] = f"filejump_{rc_id}:"
 
         for mp in list(mounted_paths):
             if mp.startswith(str(_SMB_MOUNTS_BASE) + "/") and mp not in desired_mounts:
@@ -3235,7 +3861,7 @@ def _reconcile_smb_proxy():
                     if all(mp in mounted_paths for mp in desired_mounts):
                         break
 
-        # 3. Generate /etc/samba/smb.conf with a separate share stanza per enabled Google Drive & OneDrive
+        # 3. Generate /etc/samba/smb.conf with a separate share stanza per enabled Google Drive, OneDrive & FileJump
         smb_conf_lines = [
             "[global]",
             "   workgroup = WORKGROUP",
@@ -3302,6 +3928,31 @@ def _reconcile_smb_proxy():
                 "",
             ])
 
+        for acc in fj_accounts:
+            if not bool(acc.get("smb_enabled", True)):
+                continue
+            share_name = filejump_manager.sanitize_smb_share_name(acc.get("smb_share_name") or "FileJump")
+            while share_name.lower() in used_share_names:
+                share_name = f"{share_name[:28]}_fj"
+            used_share_names.add(share_name.lower())
+            rc_id = _safe_rclone_id(acc.get("id", "default"))
+            mpath = str(_SMB_MOUNTS_BASE / f"fj_{rc_id}")
+            try:
+                os.makedirs(mpath, exist_ok=True)
+            except Exception:
+                pass
+            smb_conf_lines.extend([
+                f"[{share_name}]",
+                f"   path = {mpath}",
+                f"   comment = SageDrive FileJump - {acc.get('custom_name') or acc.get('name') or share_name}",
+                "   valid users = @sambausers",
+                "   writable = yes",
+                "   browseable = yes",
+                "   create mask = 0775",
+                "   directory mask = 0775",
+                "",
+            ])
+
         smb_conf_text = "\n".join(smb_conf_lines)
         for conf_target in (Path("/etc/samba/smb.conf"), Path("/app/smb.conf")):
             try:
@@ -3337,6 +3988,7 @@ def _get_smb_proxy_status_unlocked():
             pass
     gd_accounts = _gd_load_accounts_raw()
     od_accounts = onedrive_manager._load_accounts_raw()
+    fj_accounts = filejump_manager._load_accounts_raw()
     mounted_paths = _get_active_mount_points()
     has_rclone = bool(shutil.which("rclone"))
     shares = []
@@ -3370,6 +4022,21 @@ def _get_smb_proxy_status_unlocked():
             "mount_path": mpath,
             "mounted": is_mounted,
         })
+    for acc in fj_accounts:
+        rc_id = _safe_rclone_id(acc.get("id", "default"))
+        mpath = str(_SMB_MOUNTS_BASE / f"fj_{rc_id}")
+        enabled = bool(acc.get("smb_enabled", True))
+        is_mounted = (mpath in mounted_paths) if has_rclone else enabled
+        shares.append({
+            "provider": "filejump",
+            "account_id": acc.get("id", "default"),
+            "account_name": acc.get("custom_name") or acc.get("name") or "FileJump",
+            "email": acc.get("email", ""),
+            "smb_enabled": enabled,
+            "smb_share_name": acc.get("smb_share_name") or "FileJump",
+            "mount_path": mpath,
+            "mounted": is_mounted,
+        })
     return {
         "username": username,
         "configured": configured,
@@ -3397,7 +4064,14 @@ def update_smb_proxy_share(account_id):
     provider = (b.get("provider") or "").strip().lower()
     try:
         od_ids = {a["id"] for a in onedrive_manager._load_accounts_raw()}
-        if provider == "onedrive" or account_id in od_ids or str(account_id).startswith("onedrive"):
+        fj_ids = {a["id"] for a in filejump_manager._load_accounts_raw()}
+        if provider == "filejump" or account_id in fj_ids or str(account_id).startswith("filejump"):
+            updated = filejump_manager.update_account_smb_proxy(
+                account_id,
+                smb_enabled=smb_enabled,
+                smb_share_name=smb_share_name,
+            )
+        elif provider == "onedrive" or account_id in od_ids or str(account_id).startswith("onedrive"):
             updated = onedrive_manager.update_account_smb_proxy(
                 account_id,
                 smb_enabled=smb_enabled,

@@ -33,6 +33,10 @@ const GDRIVE_ACCOUNTS_FILE = path.join(DATA_DIR, 'gdrive_accounts.json');
 const ONEDRIVE_FS_FILE = path.join(DATA_DIR, 'onedrive_fs.json');
 const ONEDRIVE_CONFIG_FILE = path.join(DATA_DIR, 'onedrive_client.json');
 const ONEDRIVE_ACCOUNTS_FILE = path.join(DATA_DIR, 'onedrive_accounts.json');
+const FILEJUMP_FS_FILE = path.join(DATA_DIR, 'filejump_fs.json');
+const FILEJUMP_ACCOUNTS_FILE = path.join(DATA_DIR, 'filejump_accounts.json');
+const UPLOAD_SESSIONS_DIR = path.join(DATA_DIR, 'upload_sessions');
+fs.mkdirSync(UPLOAD_SESSIONS_DIR, { recursive: true });
 const SMB_PROXY_FILE = path.join(DATA_DIR, 'smb_proxy_credentials.json');
 
 const SESSION_TTL = (parseInt(process.env.SESSION_TTL_HOURS || '24', 10) || 24) * 3600 * 1000;
@@ -328,6 +332,11 @@ function saveOneDriveFS() {
   saveJson(ONEDRIVE_FS_FILE, onedriveFSData);
 }
 
+const filejumpFSData = loadJson(FILEJUMP_FS_FILE, {});
+function saveFileJumpFS() {
+  saveJson(FILEJUMP_FS_FILE, filejumpFSData);
+}
+
 function seedGDrive() {
   if (Object.keys(gdriveFSData).length > 0) return;
   const now = new Date().toISOString();
@@ -455,6 +464,78 @@ function seedOneDrive() {
   saveOneDriveFS();
 }
 seedOneDrive();
+
+function seedFileJump() {
+  if (Object.keys(filejumpFSData).length > 0) return;
+  const now = new Date().toISOString();
+  filejumpFSData['fj-folder-docs'] = {
+    id: 'fj-folder-docs',
+    accountId: 'default',
+    name: 'Documents',
+    type: 'folder',
+    size: 0,
+    modified: now,
+    mimeType: 'application/vnd.filejump.folder',
+    parent: 'root',
+  };
+  filejumpFSData['fj-folder-media'] = {
+    id: 'fj-folder-media',
+    accountId: 'default',
+    name: 'Media',
+    type: 'folder',
+    size: 0,
+    modified: now,
+    mimeType: 'application/vnd.filejump.folder',
+    parent: 'root',
+  };
+
+  const readmePath = path.join(BLOBS_DIR, 'filejump_welcome.txt');
+  const readmeContent = Buffer.from(
+    'Welcome to SageDrive FileJump Cloud Storage integration.\nConnected via FileJump REST API or WebDAV.\nYou can queue resumable uploads & downloads, stream media, and manage files here.\n'
+  );
+  fs.writeFileSync(readmePath, readmeContent);
+
+  filejumpFSData['fj-file-readme'] = {
+    id: 'fj-file-readme',
+    accountId: 'default',
+    name: 'Welcome.txt',
+    type: 'file',
+    size: readmeContent.length,
+    modified: now,
+    mimeType: 'text/plain',
+    parent: 'root',
+    blobPath: readmePath,
+  };
+
+  if (fs.existsSync(SAMPLE_WAV_PATH)) {
+    filejumpFSData['fj-file-sample-audio'] = {
+      id: 'fj-file-sample-audio',
+      accountId: 'default',
+      name: 'Sample_Audio.wav',
+      type: 'file',
+      size: fs.statSync(SAMPLE_WAV_PATH).size,
+      modified: now,
+      mimeType: 'audio/wav',
+      parent: 'root',
+      blobPath: SAMPLE_WAV_PATH,
+    };
+  }
+  if (fs.existsSync(SAMPLE_MP4_PATH) && fs.statSync(SAMPLE_MP4_PATH).size > 0) {
+    filejumpFSData['fj-file-sample-video'] = {
+      id: 'fj-file-sample-video',
+      accountId: 'default',
+      name: 'Sample_Video.mp4',
+      type: 'file',
+      size: fs.statSync(SAMPLE_MP4_PATH).size,
+      modified: now,
+      mimeType: 'video/mp4',
+      parent: 'root',
+      blobPath: SAMPLE_MP4_PATH,
+    };
+  }
+  saveFileJumpFS();
+}
+seedFileJump();
 
 function ensureShareFS(shareId) {
   if (!smbFSData[shareId]) {
@@ -2708,7 +2789,773 @@ app.post('/api/onedrive/mkdir', requireAdmin, (req, res) => {
   return res.json({ id });
 });
 
-// ── Cross-Drive Transfer (SMB <-> Google Drive <-> OneDrive) ─────────────────
+// ── FileJump Helpers & Routes (Multi-Account: API Token + WebDAV) ─────────────
+function ensureFileJumpSmbProxyFields(accounts) {
+  const used = new Set();
+  for (const gd of loadGDriveAccountsRaw()) {
+    if (gd.smb_share_name) used.add(String(gd.smb_share_name).toLowerCase());
+  }
+  for (const od of loadOneDriveAccountsRaw()) {
+    if (od.smb_share_name) used.add(String(od.smb_share_name).toLowerCase());
+  }
+  let changed = false;
+  accounts.forEach((a, idx) => {
+    if (typeof a.smb_enabled !== 'boolean') {
+      a.smb_enabled = true;
+      changed = true;
+    }
+    const rawShare = String(a.smb_share_name || '').trim();
+    if (!rawShare) {
+      const defaultBase =
+        idx === 0 || a.id === 'default'
+          ? 'FileJump'
+          : a.custom_name || a.name || `FileJump_${idx + 1}`;
+      let candidate = sanitizeSmbShareName(defaultBase, `FileJump_${idx + 1}`);
+      const baseCand = candidate;
+      let suffix = 2;
+      while (used.has(candidate.toLowerCase())) {
+        candidate = `${baseCand.slice(0, 28)}_${suffix}`;
+        suffix++;
+      }
+      a.smb_share_name = candidate;
+      changed = true;
+    } else {
+      let sanitized = sanitizeSmbShareName(rawShare, `FileJump_${idx + 1}`);
+      if (used.has(sanitized.toLowerCase())) {
+        sanitized = `${sanitized.slice(0, 28)}_${idx + 1}`;
+      }
+      if (sanitized !== rawShare) {
+        a.smb_share_name = sanitized;
+        changed = true;
+      }
+    }
+    used.add(a.smb_share_name.toLowerCase());
+  });
+  return changed;
+}
+
+function loadFileJumpAccountsRaw() {
+  const list = loadJson(FILEJUMP_ACCOUNTS_FILE, null);
+  if (Array.isArray(list)) {
+    if (ensureFileJumpSmbProxyFields(list)) {
+      saveJson(FILEJUMP_ACCOUNTS_FILE, list);
+    }
+    return list;
+  }
+  return [];
+}
+
+function saveFileJumpAccountsRaw(accounts) {
+  ensureFileJumpSmbProxyFields(accounts);
+  saveJson(FILEJUMP_ACCOUNTS_FILE, accounts);
+}
+
+function listFileJumpAccounts() {
+  return loadFileJumpAccountsRaw().map((a) => ({
+    id: a.id,
+    name: a.custom_name || a.name || 'FileJump',
+    custom_name: a.custom_name || '',
+    original_name: a.original_name || a.name || 'FileJump',
+    email: a.email || '',
+    auth_type: a.auth_type || 'token',
+    api_url: a.api_url || (a.auth_type === 'webdav' ? 'https://uploads.filejump.com/dav' : 'https://drive.filejump.com'),
+    smb_enabled: Boolean(a.smb_enabled ?? true),
+    smb_share_name: a.smb_share_name || 'FileJump',
+  }));
+}
+
+function resolveFileJumpAccountId(rawId) {
+  const accounts = loadFileJumpAccountsRaw();
+  if (!accounts.length) return 'default';
+  if (!rawId || rawId === 'root' || rawId === 'default') {
+    const def = accounts.find((a) => a.id === 'default');
+    return def ? def.id : accounts[0].id;
+  }
+  const found = accounts.find((a) => a.id === rawId);
+  return found ? found.id : accounts[0].id;
+}
+
+function isFileJumpAuthenticated() {
+  return loadFileJumpAccountsRaw().length > 0;
+}
+
+function ensureFileJumpAccountSeeded(accountId) {
+  const accId = resolveFileJumpAccountId(accountId);
+  const hasAny = Object.values(filejumpFSData).some((f) => (f.accountId || 'default') === accId);
+  if (hasAny) return;
+  const now = new Date().toISOString();
+  const suffix = accId === 'default' ? '' : `_${accId}`;
+  filejumpFSData[`fj-folder-docs${suffix}`] = {
+    id: `fj-folder-docs${suffix}`,
+    accountId: accId,
+    name: 'Documents',
+    type: 'folder',
+    size: 0,
+    modified: now,
+    mimeType: 'application/vnd.filejump.folder',
+    parent: 'root',
+  };
+  filejumpFSData[`fj-folder-media${suffix}`] = {
+    id: `fj-folder-media${suffix}`,
+    accountId: accId,
+    name: 'Media',
+    type: 'folder',
+    size: 0,
+    modified: now,
+    mimeType: 'application/vnd.filejump.folder',
+    parent: 'root',
+  };
+  const readmePath = path.join(BLOBS_DIR, 'filejump_welcome.txt');
+  if (fs.existsSync(readmePath)) {
+    filejumpFSData[`fj-file-readme${suffix}`] = {
+      id: `fj-file-readme${suffix}`,
+      accountId: accId,
+      name: 'Welcome.txt',
+      type: 'file',
+      size: fs.statSync(readmePath).size,
+      modified: now,
+      mimeType: 'text/plain',
+      parent: 'root',
+      blobPath: readmePath,
+    };
+  }
+  if (fs.existsSync(SAMPLE_WAV_PATH)) {
+    filejumpFSData[`fj-file-sample-audio${suffix}`] = {
+      id: `fj-file-sample-audio${suffix}`,
+      accountId: accId,
+      name: 'Sample_Audio.wav',
+      type: 'file',
+      size: fs.statSync(SAMPLE_WAV_PATH).size,
+      modified: now,
+      mimeType: 'audio/wav',
+      parent: 'root',
+      blobPath: SAMPLE_WAV_PATH,
+    };
+  }
+  if (fs.existsSync(SAMPLE_MP4_PATH) && fs.statSync(SAMPLE_MP4_PATH).size > 0) {
+    filejumpFSData[`fj-file-sample-video${suffix}`] = {
+      id: `fj-file-sample-video${suffix}`,
+      accountId: accId,
+      name: 'Sample_Video.mp4',
+      type: 'file',
+      size: fs.statSync(SAMPLE_MP4_PATH).size,
+      modified: now,
+      mimeType: 'video/mp4',
+      parent: 'root',
+      blobPath: SAMPLE_MP4_PATH,
+    };
+  }
+  saveFileJumpFS();
+}
+
+function ensureFileJumpFolderPath(baseFolderId, parts, accountId = 'default') {
+  const accId = resolveFileJumpAccountId(accountId);
+  let currId = baseFolderId || 'root';
+  for (const part of parts) {
+    if (!part) continue;
+    const existing = Object.values(filejumpFSData).find(
+      (f) => (f.accountId || 'default') === accId && f.parent === currId && f.type === 'folder' && f.name === part
+    );
+    if (existing) {
+      currId = existing.id;
+    } else {
+      const newId = 'fj-folder-' + crypto.randomBytes(6).toString('hex');
+      filejumpFSData[newId] = {
+        id: newId,
+        accountId: accId,
+        name: part,
+        type: 'folder',
+        size: 0,
+        modified: new Date().toISOString(),
+        mimeType: 'application/vnd.filejump.folder',
+        parent: currId,
+      };
+      currId = newId;
+    }
+  }
+  return currId;
+}
+
+app.get('/api/filejump/status', requireAuth, (req, res) => {
+  return res.json({
+    configured: true,
+    authenticated: isFileJumpAuthenticated(),
+    accounts: listFileJumpAccounts(),
+  });
+});
+
+app.get('/api/filejump/accounts', requireAuth, (req, res) => {
+  return res.json(listFileJumpAccounts());
+});
+
+app.post('/api/filejump/accounts/:account_id/rename', requireAdmin, (req, res) => {
+  const { account_id } = req.params;
+  const b = req.body || {};
+  const newName = String(b.name || b.custom_name || '').trim();
+  if (!newName) {
+    return res.status(400).json({ error: 'Custom name cannot be empty' });
+  }
+  const accounts = loadFileJumpAccountsRaw();
+  const target = accounts.find(
+    (a) => a.id === account_id || ((account_id === 'root' || account_id === 'default') && a === accounts[0])
+  );
+  if (!target) {
+    return res.status(404).json({ error: `FileJump account '${account_id}' not found` });
+  }
+  if (!target.original_name) target.original_name = target.name || 'FileJump';
+  target.name = newName;
+  target.custom_name = newName;
+  saveFileJumpAccountsRaw(accounts);
+  return res.json({
+    id: target.id,
+    name: target.name,
+    custom_name: target.custom_name,
+    email: target.email || '',
+  });
+});
+
+app.delete('/api/filejump/accounts/:account_id', requireAdmin, (req, res) => {
+  const { account_id } = req.params;
+  const accounts = loadFileJumpAccountsRaw().filter((a) => a.id !== account_id);
+  saveFileJumpAccountsRaw(accounts);
+  return res.json({ ok: true });
+});
+
+app.post('/api/filejump/connect', requireAdmin, (req, res) => {
+  const b = req.body || {};
+  const authType = String(b.auth_type || 'token').trim().toLowerCase() === 'webdav' ? 'webdav' : 'token';
+  const apiToken = String(b.api_token || b.password || b.token || '').trim();
+  const email = String(b.email || b.username || '').trim();
+  const rawUrl = String(b.api_url || b.webdav_url || '').trim();
+  const customName = String(b.name || b.custom_name || '').trim();
+  const accountId = String(b.account_id || '').trim();
+
+  if (!apiToken) {
+    return res.status(400).json({ error: 'FileJump API Access Token or WebDAV token is required' });
+  }
+  if (authType === 'webdav' && !email) {
+    return res.status(400).json({ error: 'Account email is required for FileJump WebDAV authentication' });
+  }
+
+  const resolvedUrl =
+    rawUrl || (authType === 'webdav' ? 'https://uploads.filejump.com/dav' : 'https://drive.filejump.com');
+
+  const accounts = loadFileJumpAccountsRaw();
+  let target = accountId ? accounts.find((a) => a.id === accountId) : null;
+  if (target) {
+    target.auth_type = authType;
+    target.api_token = apiToken;
+    target.api_url = resolvedUrl;
+    if (email) target.email = email;
+    if (customName) {
+      target.name = customName;
+      target.custom_name = customName;
+    }
+  } else {
+    const newId = accounts.length === 0 ? 'default' : `filejump_${crypto.randomBytes(3).toString('hex')}`;
+    const idx = accounts.length + 1;
+    const defaultLabel = email
+      ? `FileJump (${email})`
+      : idx === 1
+      ? 'FileJump'
+      : `FileJump ${idx}`;
+    const dispName = customName || defaultLabel;
+    target = {
+      id: newId,
+      name: dispName,
+      custom_name: customName,
+      original_name: defaultLabel,
+      email: email || (authType === 'token' ? 'api-token@filejump.com' : 'user@filejump.com'),
+      auth_type: authType,
+      api_token: apiToken,
+      api_url: resolvedUrl,
+      smb_enabled: true,
+    };
+    accounts.push(target);
+    ensureFileJumpAccountSeeded(newId);
+  }
+  saveFileJumpAccountsRaw(accounts);
+  const allFormatted = listFileJumpAccounts();
+  const createdFormatted = allFormatted.find((a) => a.id === target.id) || allFormatted[allFormatted.length - 1];
+  return res.json({
+    ok: true,
+    account: createdFormatted,
+    accounts: allFormatted,
+  });
+});
+
+app.delete('/api/filejump/revoke', requireAdmin, (req, res) => {
+  const accountId = String(req.query.account_id || '').trim();
+  if (accountId) {
+    const accounts = loadFileJumpAccountsRaw().filter((a) => a.id !== accountId);
+    saveFileJumpAccountsRaw(accounts);
+  } else {
+    saveFileJumpAccountsRaw([]);
+  }
+  return res.json({ ok: true });
+});
+
+app.get('/api/filejump/files', requireAuth, (req, res) => {
+  const folderId = req.query.folder || 'root';
+  const accId = resolveFileJumpAccountId(req.query.account_id);
+  ensureFileJumpAccountSeeded(accId);
+
+  const out = [];
+  for (const f of Object.values(filejumpFSData)) {
+    const fAcc = f.accountId || 'default';
+    if (fAcc === accId && f.parent === folderId) {
+      out.push({
+        id: f.id,
+        name: f.name,
+        type: f.type,
+        size: f.size || 0,
+        modified: f.modified,
+        mimeType: f.mimeType,
+      });
+    }
+  }
+  return res.json(out);
+});
+
+app.get('/api/filejump/probe/:file_id', requireAuth, async (req, res) => {
+  const f = filejumpFSData[req.params.file_id];
+  if (!f) return res.status(404).json({ error: 'File not found' });
+  const info = await probeMediaItem(f);
+  return res.json(info);
+});
+
+app.get('/api/filejump/subtitles/:file_id', requireAuth, (req, res) => {
+  const f = filejumpFSData[req.params.file_id];
+  if (!f) return res.status(404).json({ error: 'File not found' });
+  return streamSubtitleResponse(req, res, f);
+});
+
+app.get('/api/filejump/download/:file_id', requireAuth, (req, res) => {
+  const f = filejumpFSData[req.params.file_id];
+  return streamFileResponse(req, res, f);
+});
+
+app.post('/api/filejump/upload', requireAdmin, upload.single('file'), (req, res) => {
+  const folderId = req.query.folder || 'root';
+  const accId = resolveFileJumpAccountId(req.query.account_id);
+  const relPath = String(req.body?.relative_path || req.query?.relative_path || '').trim().replace(/^\/+/, '');
+  const f = req.file;
+  if (!f) {
+    return res.status(400).json({ error: 'No file provided' });
+  }
+  let targetParent = folderId;
+  let actualName = f.originalname;
+  if (relPath) {
+    const parts = relPath.split('/').filter(Boolean);
+    if (parts.length > 1) {
+      targetParent = ensureFileJumpFolderPath(folderId, parts.slice(0, -1), accId);
+      actualName = parts[parts.length - 1];
+    } else if (parts.length === 1) {
+      actualName = parts[0];
+    }
+  }
+  const id = 'fj-file-' + crypto.randomBytes(6).toString('hex');
+  filejumpFSData[id] = {
+    id,
+    accountId: accId,
+    name: actualName,
+    type: 'file',
+    size: f.size,
+    modified: new Date().toISOString(),
+    mimeType: getMimeType(actualName, f.mimetype),
+    parent: targetParent,
+    blobPath: f.path,
+  };
+  saveFileJumpFS();
+  return res.json({ ok: true });
+});
+
+app.put('/api/filejump/content/:file_id', requireAdmin, (req, res) => {
+  const { file_id } = req.params;
+  const b = req.body || {};
+  if (b.content === undefined || b.content === null) {
+    return res.status(400).json({ error: 'content is required' });
+  }
+  const item = filejumpFSData[file_id];
+  if (!item) {
+    return res.status(404).json({ error: 'File not found' });
+  }
+  const buf = Buffer.from(String(b.content), 'utf-8');
+  const blobPath =
+    item.blobPath && !item.blobPath.includes('sample_')
+      ? item.blobPath
+      : path.join(BLOBS_DIR, `filejump_edit_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.txt`);
+  fs.writeFileSync(blobPath, buf);
+  item.blobPath = blobPath;
+  item.size = buf.length;
+  item.modified = new Date().toISOString();
+  saveFileJumpFS();
+  return res.json({ ok: true, size: buf.length, file: item });
+});
+
+app.post('/api/filejump/rename/:file_id', requireAdmin, (req, res) => {
+  const { file_id } = req.params;
+  const b = req.body || {};
+  const newName = String(b.name || b.new_name || '').trim();
+  if (!newName) {
+    return res.status(400).json({ error: 'New name is required' });
+  }
+  const item = filejumpFSData[file_id];
+  if (!item) {
+    return res.status(404).json({ error: 'File not found' });
+  }
+  item.name = newName;
+  item.modified = new Date().toISOString();
+  saveFileJumpFS();
+  return res.json({ ok: true });
+});
+
+app.post('/api/filejump/zip', requireAuth, (req, res) => {
+  const b = req.body || {};
+  const ids = Array.isArray(b.ids) ? b.ids : [];
+  if (!ids.length) {
+    return res.status(400).json({ error: 'No file IDs provided' });
+  }
+  const zipItems = [];
+
+  function addFileJumpItemToZip(fid, arcPrefix) {
+    const item = filejumpFSData[fid];
+    if (!item) return;
+    const arcPath = arcPrefix ? `${arcPrefix}/${item.name}` : item.name;
+    if (item.type === 'folder') {
+      const children = Object.values(filejumpFSData).filter((c) => c.parent === fid);
+      if (children.length === 0) {
+        zipItems.push({ arcPath, isDir: true });
+      } else {
+        for (const ch of children) {
+          addFileJumpItemToZip(ch.id, arcPath);
+        }
+      }
+    } else {
+      zipItems.push({
+        arcPath,
+        data: getItemBuffer(item),
+      });
+    }
+  }
+
+  for (const id of ids) {
+    addFileJumpItemToZip(id, '');
+  }
+
+  const zipBuf = buildZipBuffer(zipItems);
+  const archiveName = b.name || 'FileJump_Download.zip';
+  res.writeHead(200, {
+    'Content-Type': 'application/zip',
+    'Content-Length': String(zipBuf.length),
+    'Content-Disposition': makeDispositionHeader(archiveName, true),
+    'Cache-Control': 'no-cache',
+  });
+  return res.end(zipBuf);
+});
+
+app.delete('/api/filejump/delete/:file_id', requireAdmin, (req, res) => {
+  const { file_id } = req.params;
+  function deleteRecursive(fid) {
+    const item = filejumpFSData[fid];
+    if (!item) return;
+    if (item.type === 'folder') {
+      for (const ch of Object.values(filejumpFSData)) {
+        if (ch.parent === fid) deleteRecursive(ch.id);
+      }
+    }
+    delete filejumpFSData[fid];
+  }
+  deleteRecursive(file_id);
+  saveFileJumpFS();
+  return res.json({ ok: true });
+});
+
+app.post('/api/filejump/mkdir', requireAdmin, (req, res) => {
+  const b = req.body || {};
+  const accId = resolveFileJumpAccountId(req.query.account_id || b.account_id);
+  const parent = b.parent || 'root';
+  const name = b.name || 'New Folder';
+  const id = 'fj-folder-' + crypto.randomBytes(6).toString('hex');
+  filejumpFSData[id] = {
+    id,
+    accountId: accId,
+    name,
+    type: 'folder',
+    size: 0,
+    modified: new Date().toISOString(),
+    mimeType: 'application/vnd.filejump.folder',
+    parent,
+  };
+  saveFileJumpFS();
+  return res.json({ id });
+});
+
+// ── Resumable Upload Sessions (All Drives: SMB, Google Drive, OneDrive, FileJump) ──
+function getUploadSessionPaths(sessionId) {
+  const safeId = String(sessionId || '').replace(/[^A-Za-z0-9_-]/g, '');
+  if (!safeId) throw new Error('Invalid upload session ID');
+  fs.mkdirSync(UPLOAD_SESSIONS_DIR, { recursive: true });
+  return {
+    metaPath: path.join(UPLOAD_SESSIONS_DIR, `${safeId}.json`),
+    partPath: path.join(UPLOAD_SESSIONS_DIR, `${safeId}.part`),
+  };
+}
+
+app.post('/api/transfers/upload/init', requireAdmin, (req, res) => {
+  const b = req.body || {};
+  const driveType = String(b.driveType || '').trim().toLowerCase();
+  const driveId = String(b.driveId || 'default').trim();
+  const folder = String(b.folder || (driveType === 'smb' ? '/' : 'root')).trim();
+  const fileName = String(b.fileName || '').trim();
+  const relativePath = String(b.relativePath || '').trim();
+  const totalSize = parseInt(b.totalSize || '0', 10) || 0;
+  const mimeType = String(b.mimeType || 'application/octet-stream').trim();
+  const clientKey = String(b.clientKey || '').trim();
+
+  if (!['smb', 'gdrive', 'onedrive', 'filejump'].includes(driveType)) {
+    return res.status(400).json({ error: 'Invalid target drive type' });
+  }
+  if (!fileName) {
+    return res.status(400).json({ error: 'fileName is required' });
+  }
+
+  const sessionId = clientKey
+    ? 'up_' +
+      crypto
+        .createHash('sha256')
+        .update(`${driveType}:${driveId}:${folder}:${relativePath || fileName}:${totalSize}:${clientKey}`)
+        .digest('hex')
+        .slice(0, 24)
+    : `up_${crypto.randomBytes(12).toString('hex')}`;
+
+  const { metaPath, partPath } = getUploadSessionPaths(sessionId);
+  if (fs.existsSync(metaPath) && fs.existsSync(partPath)) {
+    try {
+      const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+      const actualOffset = fs.statSync(partPath).size;
+      if (actualOffset <= totalSize) {
+        meta.offset = actualOffset;
+        fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf-8');
+        return res.json({
+          sessionId,
+          offset: actualOffset,
+          totalSize,
+          resumed: actualOffset > 0,
+        });
+      }
+    } catch (_) {}
+  }
+
+  fs.writeFileSync(partPath, Buffer.alloc(0));
+  const meta = {
+    sessionId,
+    driveType,
+    driveId,
+    folder,
+    fileName,
+    relativePath,
+    totalSize,
+    mimeType,
+    offset: 0,
+    createdAt: Date.now(),
+  };
+  fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf-8');
+  return res.json({
+    sessionId,
+    offset: 0,
+    totalSize,
+    resumed: false,
+  });
+});
+
+app.get('/api/transfers/upload/status', requireAuth, (req, res) => {
+  try {
+    const sessionId = String(req.query.session_id || '').trim();
+    const { metaPath, partPath } = getUploadSessionPaths(sessionId);
+    if (!fs.existsSync(metaPath)) {
+      return res.status(404).json({ error: 'Upload session not found' });
+    }
+    const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+    const offset = fs.existsSync(partPath) ? fs.statSync(partPath).size : 0;
+    return res.json({
+      sessionId,
+      offset,
+      totalSize: meta.totalSize || 0,
+    });
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+});
+
+app.post(
+  '/api/transfers/upload/chunk',
+  requireAdmin,
+  express.raw({ type: '*/*', limit: '64mb' }),
+  (req, res) => {
+    try {
+      const sessionId = String(req.query.session_id || req.headers['x-upload-session-id'] || '').trim();
+      const expectedOffset = parseInt(req.query.offset || req.headers['x-upload-offset'] || '0', 10) || 0;
+      const { metaPath, partPath } = getUploadSessionPaths(sessionId);
+      if (!fs.existsSync(metaPath)) {
+        return res.status(404).json({ error: 'Upload session not found' });
+      }
+      const currentSize = fs.existsSync(partPath) ? fs.statSync(partPath).size : 0;
+      if (expectedOffset !== currentSize) {
+        return res.status(409).json({
+          error: `Offset mismatch (expected ${currentSize}, got ${expectedOffset})`,
+          offset: currentSize,
+        });
+      }
+      const chunkBuf = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || '');
+      fs.appendFileSync(partPath, chunkBuf);
+      const newOffset = fs.statSync(partPath).size;
+      const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+      meta.offset = newOffset;
+      meta.updatedAt = Date.now();
+      fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf-8');
+      return res.json({ ok: true, offset: newOffset });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+app.post('/api/transfers/upload/complete', requireAdmin, (req, res) => {
+  try {
+    const b = req.body || {};
+    const sessionId = String(b.sessionId || req.query.session_id || '').trim();
+    const { metaPath, partPath } = getUploadSessionPaths(sessionId);
+    if (!fs.existsSync(metaPath) || !fs.existsSync(partPath)) {
+      return res.status(404).json({ error: 'Upload session not found' });
+    }
+    const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+    const { driveType, driveId, folder, fileName, relativePath, mimeType } = meta;
+    const ext = path.extname(fileName || '') || '';
+    const finalBlobPath = path.join(BLOBS_DIR, `upload_${Date.now()}_${crypto.randomBytes(6).toString('hex')}${ext}`);
+    fs.renameSync(partPath, finalBlobPath);
+    const finalSize = fs.statSync(finalBlobPath).size;
+    const relClean = String(relativePath || '').trim().replace(/^\/+/, '');
+
+    if (driveType === 'smb') {
+      const entries = ensureShareFS(driveId);
+      const destDir = (folder || '/').replace(/\/+$/, '');
+      const subPath = relClean || fileName;
+      const fullPath = `${destDir}/${subPath}`;
+      ensureSmbParentDirs(entries, fullPath);
+      const actualName = path.posix.basename(fullPath);
+      entries[fullPath] = {
+        name: actualName,
+        type: 'file',
+        size: finalSize,
+        modified: Math.floor(Date.now() / 1000),
+        path: fullPath,
+        blobPath: finalBlobPath,
+        mimeType: getMimeType(actualName, mimeType),
+      };
+      saveSmbFS();
+    } else if (driveType === 'gdrive') {
+      const accId = resolveGDriveAccountId(driveId);
+      let targetParent = folder || 'root';
+      let actualName = fileName;
+      if (relClean) {
+        const parts = relClean.split('/').filter(Boolean);
+        if (parts.length > 1) {
+          targetParent = ensureGDriveFolderPath(targetParent, parts.slice(0, -1), accId);
+          actualName = parts[parts.length - 1];
+        } else if (parts.length === 1) {
+          actualName = parts[0];
+        }
+      }
+      const id = 'file-' + crypto.randomBytes(6).toString('hex');
+      gdriveFSData[id] = {
+        id,
+        accountId: accId,
+        name: actualName,
+        type: 'file',
+        size: finalSize,
+        modified: new Date().toISOString(),
+        mimeType: getMimeType(actualName, mimeType),
+        parent: targetParent,
+        blobPath: finalBlobPath,
+      };
+      saveGDriveFS();
+    } else if (driveType === 'onedrive') {
+      const accId = resolveOneDriveAccountId(driveId);
+      let targetParent = folder || 'root';
+      let actualName = fileName;
+      if (relClean) {
+        const parts = relClean.split('/').filter(Boolean);
+        if (parts.length > 1) {
+          targetParent = ensureOneDriveFolderPath(targetParent, parts.slice(0, -1), accId);
+          actualName = parts[parts.length - 1];
+        } else if (parts.length === 1) {
+          actualName = parts[0];
+        }
+      }
+      const id = 'od-file-' + crypto.randomBytes(6).toString('hex');
+      onedriveFSData[id] = {
+        id,
+        accountId: accId,
+        name: actualName,
+        type: 'file',
+        size: finalSize,
+        modified: new Date().toISOString(),
+        mimeType: getMimeType(actualName, mimeType),
+        parent: targetParent,
+        blobPath: finalBlobPath,
+      };
+      saveOneDriveFS();
+    } else if (driveType === 'filejump') {
+      const accId = resolveFileJumpAccountId(driveId);
+      let targetParent = folder || 'root';
+      let actualName = fileName;
+      if (relClean) {
+        const parts = relClean.split('/').filter(Boolean);
+        if (parts.length > 1) {
+          targetParent = ensureFileJumpFolderPath(targetParent, parts.slice(0, -1), accId);
+          actualName = parts[parts.length - 1];
+        } else if (parts.length === 1) {
+          actualName = parts[0];
+        }
+      }
+      const id = 'fj-file-' + crypto.randomBytes(6).toString('hex');
+      filejumpFSData[id] = {
+        id,
+        accountId: accId,
+        name: actualName,
+        type: 'file',
+        size: finalSize,
+        modified: new Date().toISOString(),
+        mimeType: getMimeType(actualName, mimeType),
+        parent: targetParent,
+        blobPath: finalBlobPath,
+      };
+      saveFileJumpFS();
+    }
+
+    try {
+      if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
+    } catch (_) {}
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/transfers/upload/cancel', requireAdmin, (req, res) => {
+  try {
+    const sessionId = String(req.query.session_id || '').trim();
+    const { metaPath, partPath } = getUploadSessionPaths(sessionId);
+    if (fs.existsSync(partPath)) fs.unlinkSync(partPath);
+    if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+});
+
+// ── Cross-Drive Transfer (SMB <-> Google Drive <-> OneDrive <-> FileJump) ─────
 function copyBlobFile(srcItem, nameHint) {
   const buf = getItemBuffer(srcItem);
   const ext = path.extname(nameHint || srcItem?.name || '') || '';
@@ -2732,7 +3579,12 @@ function readSourceNode(srcType, srcDrive, itemRef) {
     }
     return { name: item.name, type: 'file', srcItem: item };
   }
-  const store = srcType === 'onedrive' ? onedriveFSData : gdriveFSData;
+  const store =
+    srcType === 'onedrive'
+      ? onedriveFSData
+      : srcType === 'filejump'
+      ? filejumpFSData
+      : gdriveFSData;
   const fid = itemRef.id;
   const item = store[fid];
   if (!item) return null;
@@ -2820,6 +3672,28 @@ function writeDestNode(node, destType, destDrive, destFolder) {
         blobPath,
       };
     }
+  } else if (destType === 'filejump') {
+    const accId = resolveFileJumpAccountId(destDrive);
+    if (node.type === 'folder') {
+      const newFolderId = ensureFileJumpFolderPath(destFolder || 'root', [node.name], accId);
+      for (const ch of node.children || []) {
+        writeDestNode(ch, 'filejump', accId, newFolderId);
+      }
+    } else {
+      const { blobPath, size } = copyBlobFile(node.srcItem, node.name);
+      const id = 'fj-file-' + crypto.randomBytes(6).toString('hex');
+      filejumpFSData[id] = {
+        id,
+        accountId: accId,
+        name: node.name,
+        type: 'file',
+        size,
+        modified: new Date().toISOString(),
+        mimeType: getMimeType(node.name, node.srcItem?.mimeType),
+        parent: destFolder || 'root',
+        blobPath,
+      };
+    }
   }
 }
 
@@ -2853,6 +3727,17 @@ function deleteOneDriveRecursive(fid) {
     }
   }
   delete onedriveFSData[fid];
+}
+
+function deleteFileJumpRecursive(fid) {
+  const item = filejumpFSData[fid];
+  if (!item) return;
+  if (item.type === 'folder') {
+    for (const ch of Object.values(filejumpFSData)) {
+      if (ch.parent === fid) deleteFileJumpRecursive(ch.id);
+    }
+  }
+  delete filejumpFSData[fid];
 }
 
 function moveSmbPathSameShare(shareId, oldPath, destDir) {
@@ -2905,7 +3790,8 @@ app.post('/api/transfer', requireAdmin, (req, res) => {
   if (!items.length) {
     return res.status(400).json({ error: 'No items selected for transfer' });
   }
-  if (!['smb', 'gdrive', 'onedrive'].includes(srcType) || !['smb', 'gdrive', 'onedrive'].includes(destType)) {
+  const validTypes = ['smb', 'gdrive', 'onedrive', 'filejump'];
+  if (!validTypes.includes(srcType) || !validTypes.includes(destType)) {
     return res.status(400).json({ error: 'Invalid source or destination type' });
   }
 
@@ -2926,6 +3812,12 @@ app.post('/api/transfer', requireAdmin, (req, res) => {
         if (it.id === destFolder) throw new Error('Cannot move a folder into itself');
         odItem.parent = destFolder || 'root';
         odItem.modified = new Date().toISOString();
+      } else if (isMove && srcType === 'filejump' && destType === 'filejump' && resolveFileJumpAccountId(srcDrive) === resolveFileJumpAccountId(destDrive)) {
+        const fjItem = filejumpFSData[it.id];
+        if (!fjItem) throw new Error('Source file not found');
+        if (it.id === destFolder) throw new Error('Cannot move a folder into itself');
+        fjItem.parent = destFolder || 'root';
+        fjItem.modified = new Date().toISOString();
       } else {
         const node = readSourceNode(srcType, srcDrive, it);
         if (!node) throw new Error('Source item not found');
@@ -2934,6 +3826,7 @@ app.post('/api/transfer', requireAdmin, (req, res) => {
           if (srcType === 'smb') deleteSmbPathRecursive(srcDrive, it.path);
           else if (srcType === 'gdrive') deleteGDriveRecursive(it.id);
           else if (srcType === 'onedrive') deleteOneDriveRecursive(it.id);
+          else if (srcType === 'filejump') deleteFileJumpRecursive(it.id);
         }
       }
       count++;
@@ -2941,6 +3834,7 @@ app.post('/api/transfer', requireAdmin, (req, res) => {
     saveSmbFS();
     saveGDriveFS();
     saveOneDriveFS();
+    saveFileJumpFS();
     return res.json({
       ok: true,
       copied: count,
@@ -2959,6 +3853,7 @@ function getSmbProxyStatus() {
   const configured = Boolean(d);
   const gdAccounts = loadGDriveAccountsRaw();
   const odAccounts = loadOneDriveAccountsRaw();
+  const fjAccounts = loadFileJumpAccountsRaw();
   const shares = [];
 
   for (const a of gdAccounts) {
@@ -2991,6 +3886,21 @@ function getSmbProxyStatus() {
     });
   }
 
+  for (const a of fjAccounts) {
+    const rcId = String(a.id || 'default').replace(/[^A-Za-z0-9_]/g, '_');
+    const enabled = Boolean(a.smb_enabled ?? true);
+    shares.push({
+      provider: 'filejump',
+      account_id: a.id,
+      account_name: a.custom_name || a.name || 'FileJump',
+      email: a.email || '',
+      smb_enabled: enabled,
+      smb_share_name: a.smb_share_name || 'FileJump',
+      mount_path: `/mnt/gdrive_mounts/fj_${rcId}`,
+      mounted: enabled,
+    });
+  }
+
   return { username, configured, shares };
 }
 
@@ -3008,11 +3918,16 @@ app.post('/api/smb/proxy-shares/:account_id', requireAdmin, (req, res) => {
   const provider = String(b.provider || req.query.provider || '').trim().toLowerCase();
   const gdAccounts = loadGDriveAccountsRaw();
   const odAccounts = loadOneDriveAccountsRaw();
+  const fjAccounts = loadFileJumpAccountsRaw();
 
   let targetProvider = provider;
   let target = null;
 
-  if (targetProvider === 'onedrive') {
+  if (targetProvider === 'filejump') {
+    target = fjAccounts.find(
+      (a) => a.id === account_id || ((account_id === 'root' || account_id === 'default') && a === fjAccounts[0])
+    );
+  } else if (targetProvider === 'onedrive') {
     target = odAccounts.find(
       (a) => a.id === account_id || ((account_id === 'root' || account_id === 'default') && a === odAccounts[0])
     );
@@ -3026,7 +3941,12 @@ app.post('/api/smb/proxy-shares/:account_id', requireAdmin, (req, res) => {
       targetProvider = 'gdrive';
     } else {
       target = odAccounts.find((a) => a.id === account_id);
-      if (target) targetProvider = 'onedrive';
+      if (target) {
+        targetProvider = 'onedrive';
+      } else {
+        target = fjAccounts.find((a) => a.id === account_id);
+        if (target) targetProvider = 'filejump';
+      }
     }
   }
 
@@ -3046,6 +3966,7 @@ app.post('/api/smb/proxy-shares/:account_id', requireAdmin, (req, res) => {
     const allOtherShares = [
       ...gdAccounts.filter((a) => !(targetProvider === 'gdrive' && a.id === target.id)),
       ...odAccounts.filter((a) => !(targetProvider === 'onedrive' && a.id === target.id)),
+      ...fjAccounts.filter((a) => !(targetProvider === 'filejump' && a.id === target.id)),
     ];
     const conflict = allOtherShares.find(
       (other) => String(other.smb_share_name || '').toLowerCase() === cleaned.toLowerCase()
@@ -3059,7 +3980,9 @@ app.post('/api/smb/proxy-shares/:account_id', requireAdmin, (req, res) => {
     target.smb_enabled = Boolean(b.smb_enabled);
   }
 
-  if (targetProvider === 'onedrive') {
+  if (targetProvider === 'filejump') {
+    saveFileJumpAccountsRaw(fjAccounts);
+  } else if (targetProvider === 'onedrive') {
     saveOneDriveAccountsRaw(odAccounts);
   } else {
     saveGDriveAccountsRaw(gdAccounts);

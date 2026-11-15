@@ -14,6 +14,7 @@ token_file = data_dir / 'gdrive_token.json'
 config_file = data_dir / 'gdrive_client.json'
 od_accounts_file = data_dir / 'onedrive_accounts.json'
 od_config_file = data_dir / 'onedrive_client.json'
+fj_accounts_file = data_dir / 'filejump_accounts.json'
 
 cfg = {}
 if config_file.exists():
@@ -60,6 +61,15 @@ if od_accounts_file.exists():
         loaded_od = json.loads(od_accounts_file.read_text())
         if isinstance(loaded_od, list):
             od_accounts = loaded_od
+    except Exception:
+        pass
+
+fj_accounts = []
+if fj_accounts_file.exists():
+    try:
+        loaded_fj = json.loads(fj_accounts_file.read_text())
+        if isinstance(loaded_fj, list):
+            fj_accounts = loaded_fj
     except Exception:
         pass
 
@@ -189,6 +199,58 @@ drive_type = {drive_type}
             "",
         ])
 
+for idx, acc in enumerate(fj_accounts):
+    d = acc.get("creds") or {}
+    auth_type = acc.get("auth_type") or ("webdav" if d.get("password") else "token")
+    rc_id = safe_rclone_id(f"filejump_{acc.get('id', f'fj_{idx+1}')}")
+    webdav_url = (acc.get("webdav_url") or d.get("webdav_url") or "https://uploads.filejump.com/dav").strip()
+    if auth_type == "webdav":
+        w_user = d.get("username") or acc.get("email") or ""
+        w_pass = d.get("password") or ""
+        obscured_pass = w_pass
+        try:
+            obs = subprocess.run(["rclone", "obscure", w_pass], capture_output=True, text=True, timeout=5)
+            if obs.returncode == 0 and obs.stdout.strip():
+                obscured_pass = obs.stdout.strip()
+        except Exception:
+            pass
+        rclone_blocks.append(f"""[filejump_{rc_id}]
+type = webdav
+url = {webdav_url}
+vendor = other
+user = {w_user}
+pass = {obscured_pass}
+""")
+    else:
+        b_tok = d.get("api_token") or ""
+        rclone_blocks.append(f"""[filejump_{rc_id}]
+type = webdav
+url = {webdav_url}
+vendor = other
+bearer_token = {b_tok}
+""")
+    if bool(acc.get("smb_enabled", True)):
+        base_share = safe_share_name(acc.get("smb_share_name") or ("FileJump" if idx == 0 else f"FileJump_{idx+1}"), fallback="FileJump")
+        share_name = base_share
+        s_idx = 2
+        while share_name.lower() in used_share_names:
+            share_name = f"{base_share}_{s_idx}"
+            s_idx += 1
+        used_share_names.add(share_name.lower())
+        mpath = f"/mnt/gdrive_mounts/{rc_id}"
+        os.makedirs(mpath, exist_ok=True)
+        smb_conf_lines.extend([
+            f"[{share_name}]",
+            f"   path = {mpath}",
+            f"   comment = SageDrive FileJump - {acc.get('custom_name') or acc.get('name') or share_name}",
+            "   valid users = @sambausers",
+            "   writable = yes",
+            "   browseable = yes",
+            "   create mask = 0775",
+            "   directory mask = 0775",
+            "",
+        ])
+
 with open('/root/.config/rclone/rclone.conf', 'w') as f:
     f.write("\n".join(rclone_blocks))
 
@@ -234,7 +296,26 @@ for idx, acc in enumerate(od_accounts):
     ], check=False)
     mounted_count += 1
 
-print(f"✅ Configured {len(accounts)} Google Drive(s), {len(od_accounts)} OneDrive(s), and mounted {mounted_count} SMB Proxy share(s).")
+for idx, acc in enumerate(fj_accounts):
+    d = acc.get("creds") or {}
+    if not bool(acc.get("smb_enabled", True)) or not (d.get("api_token") or d.get("password")):
+        continue
+    rc_id = safe_rclone_id(f"filejump_{acc.get('id', f'fj_{idx+1}')}")
+    mpath = f"/mnt/gdrive_mounts/{rc_id}"
+    subprocess.run([
+        "rclone", "mount", f"filejump_{rc_id}:", mpath,
+        "--config", "/root/.config/rclone/rclone.conf",
+        "--allow-other",
+        "--buffer-size", "16M",
+        "--vfs-read-chunk-size", "32M",
+        "--vfs-cache-mode", "writes",
+        "--vfs-cache-max-size", "512M",
+        "--dir-cache-time", "5m",
+        "--daemon"
+    ], check=False)
+    mounted_count += 1
+
+print(f"✅ Configured {len(accounts)} Google Drive(s), {len(od_accounts)} OneDrive(s), {len(fj_accounts)} FileJump(s), and mounted {mounted_count} SMB Proxy share(s).")
 PYEOF
 sleep 2
 

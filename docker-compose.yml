@@ -20,6 +20,7 @@ services:
       - ./backend/smb_manager.py:/app/smb_manager.py:ro
       - ./backend/gdrive_manager.py:/app/gdrive_manager.py:ro
       - ./backend/onedrive_manager.py:/app/onedrive_manager.py:ro
+      - ./backend/filejump_manager.py:/app/filejump_manager.py:ro
       - ./frontend/public/index.html:/app/static/index.html
       - ./backend/main.py:/app/main.py
       - ./entrypoint.sh:/app/entrypoint.sh:ro

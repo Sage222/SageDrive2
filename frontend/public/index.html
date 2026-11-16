@@ -4436,23 +4436,31 @@ async function runResumableUploadJob(job) {
   renderTransferQueueUI();
 
   try {
+    const resolvedDriveType = job.driveType || _activeDrive?.type || '';
+    job.driveType = resolvedDriveType;
     if (!job.uploadId) {
       const initRes = await apiJSON('/api/transfers/upload/init', {
         method: 'POST',
         json: {
-          drive_type: job.driveType,
+          driveType: resolvedDriveType,
+          drive_type: resolvedDriveType,
+          driveId: job.driveId,
           drive_id: job.driveId,
           folder: job.targetFolder,
           path: job.targetFolder,
+          fileName: job.file.name,
           filename: job.file.name,
+          relativePath: job.relativePath || job.file.name,
           relative_path: job.relativePath || job.file.name,
+          totalSize: job.totalBytes,
           total_size: job.totalBytes,
+          mimeType: job.file.type || 'application/octet-stream',
         }
       });
-      job.uploadId = initRes.upload_id;
+      job.uploadId = initRes.upload_id || initRes.sessionId;
       job.transferredBytes = Number(initRes.offset) || 0;
     } else {
-      const stRes = await apiJSON(`/api/transfers/upload/status?upload_id=${encodeURIComponent(job.uploadId)}`).catch(() => null);
+      const stRes = await apiJSON(`/api/transfers/upload/status?upload_id=${encodeURIComponent(job.uploadId)}&session_id=${encodeURIComponent(job.uploadId)}`).catch(() => null);
       if (stRes && typeof stRes.offset === 'number') {
         job.transferredBytes = stRes.offset;
       } else {
@@ -4475,7 +4483,7 @@ async function runResumableUploadJob(job) {
       job.abortCtrl = ctrl;
 
       const r = await apiFetch(
-        `/api/transfers/upload/chunk?upload_id=${encodeURIComponent(job.uploadId)}&offset=${chunkStart}`,
+        `/api/transfers/upload/chunk?upload_id=${encodeURIComponent(job.uploadId)}&session_id=${encodeURIComponent(job.uploadId)}&offset=${chunkStart}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/octet-stream' },
@@ -4503,7 +4511,7 @@ async function runResumableUploadJob(job) {
     if (job.status !== 'active') return;
     await apiJSON('/api/transfers/upload/complete', {
       method: 'POST',
-      json: { upload_id: job.uploadId }
+      json: { upload_id: job.uploadId, sessionId: job.uploadId }
     });
 
     job.status = 'completed';

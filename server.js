@@ -3304,14 +3304,14 @@ function getUploadSessionPaths(sessionId) {
 
 app.post('/api/transfers/upload/init', requireAdmin, (req, res) => {
   const b = req.body || {};
-  const driveType = String(b.driveType || '').trim().toLowerCase();
-  const driveId = String(b.driveId || 'default').trim();
-  const folder = String(b.folder || (driveType === 'smb' ? '/' : 'root')).trim();
-  const fileName = String(b.fileName || '').trim();
-  const relativePath = String(b.relativePath || '').trim();
-  const totalSize = parseInt(b.totalSize || '0', 10) || 0;
-  const mimeType = String(b.mimeType || 'application/octet-stream').trim();
-  const clientKey = String(b.clientKey || '').trim();
+  const driveType = String(b.driveType || b.drive_type || '').trim().toLowerCase();
+  const driveId = String(b.driveId || b.drive_id || 'default').trim();
+  const folder = String(b.folder || b.path || (driveType === 'smb' ? '/' : 'root')).trim();
+  const fileName = String(b.fileName || b.filename || '').trim();
+  const relativePath = String(b.relativePath || b.relative_path || '').trim();
+  const totalSize = parseInt((b.totalSize !== undefined ? b.totalSize : b.total_size) || '0', 10) || 0;
+  const mimeType = String(b.mimeType || b.mime_type || 'application/octet-stream').trim();
+  const clientKey = String(b.clientKey || b.client_key || '').trim();
 
   if (!['smb', 'gdrive', 'onedrive', 'filejump'].includes(driveType)) {
     return res.status(400).json({ error: 'Invalid target drive type' });
@@ -3339,8 +3339,10 @@ app.post('/api/transfers/upload/init', requireAdmin, (req, res) => {
         fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf-8');
         return res.json({
           sessionId,
+          upload_id: sessionId,
           offset: actualOffset,
           totalSize,
+          total_size: totalSize,
           resumed: actualOffset > 0,
         });
       }
@@ -3363,15 +3365,17 @@ app.post('/api/transfers/upload/init', requireAdmin, (req, res) => {
   fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf-8');
   return res.json({
     sessionId,
+    upload_id: sessionId,
     offset: 0,
     totalSize,
+    total_size: totalSize,
     resumed: false,
   });
 });
 
 app.get('/api/transfers/upload/status', requireAuth, (req, res) => {
   try {
-    const sessionId = String(req.query.session_id || '').trim();
+    const sessionId = String(req.query.session_id || req.query.upload_id || req.query.sessionId || '').trim();
     const { metaPath, partPath } = getUploadSessionPaths(sessionId);
     if (!fs.existsSync(metaPath)) {
       return res.status(404).json({ error: 'Upload session not found' });
@@ -3380,8 +3384,10 @@ app.get('/api/transfers/upload/status', requireAuth, (req, res) => {
     const offset = fs.existsSync(partPath) ? fs.statSync(partPath).size : 0;
     return res.json({
       sessionId,
+      upload_id: sessionId,
       offset,
       totalSize: meta.totalSize || 0,
+      total_size: meta.totalSize || 0,
     });
   } catch (err) {
     return res.status(400).json({ error: err.message });
@@ -3394,7 +3400,9 @@ app.post(
   express.raw({ type: '*/*', limit: '64mb' }),
   (req, res) => {
     try {
-      const sessionId = String(req.query.session_id || req.headers['x-upload-session-id'] || '').trim();
+      const sessionId = String(
+        req.query.session_id || req.query.upload_id || req.query.sessionId || req.headers['x-upload-session-id'] || ''
+      ).trim();
       const expectedOffset = parseInt(req.query.offset || req.headers['x-upload-offset'] || '0', 10) || 0;
       const { metaPath, partPath } = getUploadSessionPaths(sessionId);
       if (!fs.existsSync(metaPath)) {
@@ -3424,7 +3432,9 @@ app.post(
 app.post('/api/transfers/upload/complete', requireAdmin, (req, res) => {
   try {
     const b = req.body || {};
-    const sessionId = String(b.sessionId || req.query.session_id || '').trim();
+    const sessionId = String(
+      b.sessionId || b.upload_id || b.session_id || req.query.session_id || req.query.upload_id || ''
+    ).trim();
     const { metaPath, partPath } = getUploadSessionPaths(sessionId);
     if (!fs.existsSync(metaPath) || !fs.existsSync(partPath)) {
       return res.status(404).json({ error: 'Upload session not found' });
@@ -3543,9 +3553,12 @@ app.post('/api/transfers/upload/complete', requireAdmin, (req, res) => {
   }
 });
 
-app.delete('/api/transfers/upload/cancel', requireAdmin, (req, res) => {
+const handleUploadCancel = (req, res) => {
   try {
-    const sessionId = String(req.query.session_id || '').trim();
+    const b = req.body || {};
+    const sessionId = String(
+      b.sessionId || b.upload_id || b.session_id || req.query.session_id || req.query.upload_id || ''
+    ).trim();
     const { metaPath, partPath } = getUploadSessionPaths(sessionId);
     if (fs.existsSync(partPath)) fs.unlinkSync(partPath);
     if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
@@ -3553,7 +3566,9 @@ app.delete('/api/transfers/upload/cancel', requireAdmin, (req, res) => {
   } catch (err) {
     return res.status(400).json({ error: err.message });
   }
-});
+};
+app.post('/api/transfers/upload/cancel', requireAdmin, handleUploadCancel);
+app.delete('/api/transfers/upload/cancel', requireAdmin, handleUploadCancel);
 
 // ── Cross-Drive Transfer (SMB <-> Google Drive <-> OneDrive <-> FileJump) ─────
 function copyBlobFile(srcItem, nameHint) {

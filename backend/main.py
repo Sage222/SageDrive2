@@ -3333,14 +3333,14 @@ def _get_upload_session_paths(session_id):
 @auth.require_admin
 def init_resumable_upload():
     b = request.get_json(force=True) or {}
-    drive_type = (b.get("driveType") or "").strip().lower()
-    drive_id = (b.get("driveId") or "default").strip()
-    folder = str(b.get("folder") or ("/" if drive_type == "smb" else "root")).strip()
-    file_name = str(b.get("fileName") or "").strip()
-    relative_path = str(b.get("relativePath") or "").strip()
-    total_size = int(b.get("totalSize") or 0)
-    mime_type = str(b.get("mimeType") or "application/octet-stream").strip()
-    client_key = str(b.get("clientKey") or "").strip()
+    drive_type = str(b.get("driveType") or b.get("drive_type") or "").strip().lower()
+    drive_id = str(b.get("driveId") or b.get("drive_id") or "default").strip()
+    folder = str(b.get("folder") or b.get("path") or ("/" if drive_type == "smb" else "root")).strip()
+    file_name = str(b.get("fileName") or b.get("filename") or "").strip()
+    relative_path = str(b.get("relativePath") or b.get("relative_path") or "").strip()
+    total_size = int(b.get("totalSize") if b.get("totalSize") is not None else (b.get("total_size") or 0))
+    mime_type = str(b.get("mimeType") or b.get("mime_type") or "application/octet-stream").strip()
+    client_key = str(b.get("clientKey") or b.get("client_key") or "").strip()
 
     if drive_type not in ("smb", "gdrive", "onedrive", "filejump"):
         return jsonify({"error": "Invalid target drive type"}), 400
@@ -3366,8 +3366,10 @@ def init_resumable_upload():
                     meta_path.write_text(json.dumps(meta, indent=2))
                     return jsonify({
                         "sessionId": session_id,
+                        "upload_id": session_id,
                         "offset": actual_offset,
                         "totalSize": total_size,
+                        "total_size": total_size,
                         "resumed": actual_offset > 0,
                     })
             except Exception:
@@ -3389,15 +3391,22 @@ def init_resumable_upload():
         meta_path.write_text(json.dumps(meta, indent=2))
         return jsonify({
             "sessionId": session_id,
+            "upload_id": session_id,
             "offset": 0,
             "totalSize": total_size,
+            "total_size": total_size,
             "resumed": False,
         })
 
 @app.get("/api/transfers/upload/status")
 @auth.require_auth
 def status_resumable_upload():
-    session_id = request.args.get("session_id", "").strip()
+    session_id = (
+        request.args.get("session_id")
+        or request.args.get("upload_id")
+        or request.args.get("sessionId")
+        or ""
+    ).strip()
     try:
         meta_path, part_path = _get_upload_session_paths(session_id)
         if not meta_path.exists():
@@ -3406,8 +3415,10 @@ def status_resumable_upload():
         offset = part_path.stat().st_size if part_path.exists() else 0
         return jsonify({
             "sessionId": session_id,
+            "upload_id": session_id,
             "offset": offset,
             "totalSize": meta.get("totalSize", 0),
+            "total_size": meta.get("totalSize", 0),
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -3415,7 +3426,13 @@ def status_resumable_upload():
 @app.post("/api/transfers/upload/chunk")
 @auth.require_admin
 def chunk_resumable_upload():
-    session_id = (request.args.get("session_id") or request.headers.get("X-Upload-Session-Id") or "").strip()
+    session_id = (
+        request.args.get("session_id")
+        or request.args.get("upload_id")
+        or request.args.get("sessionId")
+        or request.headers.get("X-Upload-Session-Id")
+        or ""
+    ).strip()
     offset_arg = request.args.get("offset") or request.headers.get("X-Upload-Offset") or "0"
     try:
         expected_offset = int(offset_arg)
@@ -3445,8 +3462,15 @@ def chunk_resumable_upload():
 @app.post("/api/transfers/upload/complete")
 @auth.require_admin
 def complete_resumable_upload():
-    b = request.get_json(force=True) or {}
-    session_id = (b.get("sessionId") or request.args.get("session_id") or "").strip()
+    b = request.get_json(force=True, silent=True) or {}
+    session_id = (
+        b.get("sessionId")
+        or b.get("upload_id")
+        or b.get("session_id")
+        or request.args.get("session_id")
+        or request.args.get("upload_id")
+        or ""
+    ).strip()
     try:
         meta_path, part_path = _get_upload_session_paths(session_id)
         if not meta_path.exists() or not part_path.exists():
@@ -3503,10 +3527,18 @@ def complete_resumable_upload():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.delete("/api/transfers/upload/cancel")
+@app.route("/api/transfers/upload/cancel", methods=["POST", "DELETE"])
 @auth.require_admin
 def cancel_resumable_upload():
-    session_id = (request.args.get("session_id") or "").strip()
+    b = request.get_json(force=True, silent=True) or {}
+    session_id = (
+        b.get("sessionId")
+        or b.get("upload_id")
+        or b.get("session_id")
+        or request.args.get("session_id")
+        or request.args.get("upload_id")
+        or ""
+    ).strip()
     try:
         meta_path, part_path = _get_upload_session_paths(session_id)
         part_path.unlink(missing_ok=True)

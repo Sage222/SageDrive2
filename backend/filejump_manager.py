@@ -763,8 +763,47 @@ def ensure_folder_path(base_folder_id, parts, account_id=None):
     return curr_id
 
 
-def upload_file(parent_id, filename, data_or_stream, mime_type="application/octet-stream", relative_path=None, account_id=None):
-    acc = _require_account(account_id)
+class _MultipartStreamReader:
+    """
+    Streams a multipart/form-data body (preamble + file stream + epilogue)
+    in small chunks without buffering the file in memory or on disk.
+    """
+    def __init__(self, preamble: bytes, stream_obj, file_size: int, epilogue: bytes):
+        self._preamble = memoryview(preamble)
+        self._preamble_pos = 0
+        self._stream = stream_obj
+        self._file_remaining = max(0, int(file_size))
+        self._epilogue = memoryview(epilogue)
+        self._epilogue_pos = 0
+        self.total_length = len(preamble) + max(0, int(file_size)) + len(epilogue)
+
+    def __len__(self):
+        return self.total_length
+
+    def read(self, size=65536):
+        if size is None or size < 0:
+            size = 65536
+        if self._preamble_pos < len(self._preamble):
+            take = min(size, len(self._preamble) - self._preamble_pos)
+            chunk = bytes(self._preamble[self._preamble_pos:self._preamble_pos + take])
+            self._preamble_pos += take
+            return chunk
+        if self._file_remaining > 0:
+            to_read = min(size, self._file_remaining)
+            chunk = self._stream.read(to_read)
+            if chunk:
+                self._file_remaining -= len(chunk)
+                return chunk
+            self._file_remaining = 0
+        if self._epilogue_pos < len(self._epilogue):
+            take = min(size, len(self._epilogue) - self._epilogue_pos)
+            chunk = bytes(self._epilogue[self._epilogue_pos:self._epilogue_pos + take])
+            self._epilogue_pos += take
+            return chunk
+        return b""
+
+
+def resolve_upload_target(parent_id, filename, relative_path=None, account_id=None):
     target_parent = parent_id or "root"
     actual_name = filename
     if relative_path:
@@ -775,26 +814,51 @@ def upload_file(parent_id, filename, data_or_stream, mime_type="application/octe
             actual_name = parts[-1]
         elif len(parts) == 1:
             actual_name = parts[0]
+    return target_parent, actual_name
+
+
+def upload_file(
+    parent_id,
+    filename,
+    data_or_stream,
+    mime_type="application/octet-stream",
+    relative_path=None,
+    account_id=None,
+    total_size=None,
+):
+    acc = _require_account(account_id)
+    target_parent, actual_name = resolve_upload_target(
+        parent_id, filename, relative_path=relative_path, account_id=account_id
+    )
 
     if acc.get("auth_type") == "webdav":
         base_norm = _webdav_norm_path(target_parent)
         dest_norm = f"/{actual_name}" if base_norm == "/" else f"{base_norm.rstrip('/')}/{actual_name}"
         url = _webdav_build_url(acc, dest_norm)
+        headers = {"Content-Type": mime_type or "application/octet-stream"}
         if isinstance(data_or_stream, (bytes, bytearray)):
             body = bytes(data_or_stream)
+            headers["Content-Length"] = str(len(body))
         else:
-            if hasattr(data_or_stream, "seek"):
-                try:
-                    data_or_stream.seek(0)
-                except Exception:
-                    pass
-            body = data_or_stream
+            if total_size is not None and int(total_size) >= 0:
+                headers["Content-Length"] = str(int(total_size))
+                if int(total_size) == 0:
+                    body = b""
+                else:
+                    body = data_or_stream
+            else:
+                if hasattr(data_or_stream, "seek"):
+                    try:
+                        data_or_stream.seek(0)
+                    except Exception:
+                        pass
+                body = data_or_stream
         r = requests.put(
             url,
             auth=_webdav_auth(acc),
-            headers={"Content-Type": mime_type or "application/octet-stream"},
+            headers=headers,
             data=body,
-            timeout=(20, 1800),
+            timeout=(20, 14400),
         )
         r.raise_for_status()
         return dest_norm
@@ -807,21 +871,54 @@ def upload_file(parent_id, filename, data_or_stream, mime_type="application/octe
 
     if isinstance(data_or_stream, (bytes, bytearray)):
         stream_obj = io.BytesIO(data_or_stream)
+        if total_size is None:
+            total_size = len(data_or_stream)
     else:
-        if hasattr(data_or_stream, "seek"):
-            try:
-                data_or_stream.seek(0)
-            except Exception:
-                pass
         stream_obj = data_or_stream
+
+    # When total_size is known, stream multipart/form-data directly without buffering in RAM
+    if total_size is not None and int(total_size) >= 0 and not hasattr(stream_obj, "seek"):
+        boundary = f"----SageDriveBoundary{secrets.token_hex(12)}"
+        parts_buf = []
+        for k, v in form_data.items():
+            parts_buf.append(
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{k}"\r\n\r\n'
+                f"{v}\r\n"
+            )
+        safe_fn = actual_name.replace('"', "%22")
+        parts_buf.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{safe_fn}"\r\n'
+            f"Content-Type: {mime_type or 'application/octet-stream'}\r\n\r\n"
+        )
+        preamble = "".join(parts_buf).encode("utf-8")
+        epilogue = f"\r\n--{boundary}--\r\n".encode("utf-8")
+        mp_reader = _MultipartStreamReader(preamble, stream_obj, int(total_size), epilogue)
+        req_headers = dict(headers)
+        req_headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+        req_headers["Content-Length"] = str(mp_reader.total_length)
+        r = requests.post(
+            f"{base}/api/v1/uploads",
+            headers=req_headers,
+            data=mp_reader,
+            timeout=(20, 14400),
+        )
+        r.raise_for_status()
+        resp = r.json()
+        entry = resp.get("fileEntry") or resp.get("data") or resp
+        return str(entry.get("id") or entry.get("hash") or actual_name)
 
     last_err = None
     for ep in ("/api/v1/uploads", "/api/v1/file-entries", "/api/v1/files"):
         try:
             if hasattr(stream_obj, "seek"):
-                stream_obj.seek(0)
+                try:
+                    stream_obj.seek(0)
+                except Exception:
+                    pass
             files = {"file": (actual_name, stream_obj, mime_type or "application/octet-stream")}
-            r = requests.post(f"{base}{ep}", headers=headers, data=form_data, files=files, timeout=(20, 1800))
+            r = requests.post(f"{base}{ep}", headers=headers, data=form_data, files=files, timeout=(20, 14400))
             if r.status_code == 404:
                 continue
             r.raise_for_status()
@@ -834,6 +931,7 @@ def upload_file(parent_id, filename, data_or_stream, mime_type="application/octe
     if last_err:
         raise last_err
     raise RuntimeError("FileJump upload failed")
+
 
 
 def update_file_content(file_id, data_or_stream, mime_type="text/plain; charset=utf-8", account_id=None):

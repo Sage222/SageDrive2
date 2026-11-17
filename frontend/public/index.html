@@ -4190,7 +4190,7 @@ function queueSelectedDownloads(type) {
 const _transferQueue = [];
 let _transferDrawerOpen = false;
 let _transferWorkerRunning = false;
-const UPLOAD_CHUNK_SIZE = 2 * 1024 * 1024; // 2 MiB chunks for byte-offset resume
+const UPLOAD_CHUNK_SIZE = 2560 * 1024; // 2.5 MiB (exact multiple of 256 KiB & 320 KiB for direct upstream streaming)
 
 function toggleTransferDrawer(forceState = null) {
   _transferDrawerOpen = typeof forceState === 'boolean' ? forceState : !_transferDrawerOpen;

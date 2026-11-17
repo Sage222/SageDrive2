@@ -321,6 +321,28 @@ def upload_file(share_id, dest_path, data_or_stream):
     finally:
         c.close()
 
+def upload_chunk(share_id, dest_path, chunk_bytes, offset=0, truncate=False):
+    norm_path = sanitize_smb_path(dest_path, allow_root=False)
+    cfg = _cfg(share_id)
+    c = _conn(cfg)
+    try:
+        if offset == 0:
+            parent = "/".join(norm_path.split("/")[:-1])
+            if parent and parent != "/":
+                _ensure_dirs_on_conn(c, cfg["share"], parent)
+        bio = io.BytesIO(chunk_bytes if isinstance(chunk_bytes, (bytes, bytearray)) else bytes(chunk_bytes))
+        c.storeFileFromOffset(
+            cfg["share"],
+            norm_path,
+            bio,
+            offset=int(offset or 0),
+            truncate=bool(truncate),
+            timeout=300,
+        )
+    finally:
+        c.close()
+
+
 def rename_path(share_id, old_path, new_name):
     norm_old = sanitize_smb_path(old_path, allow_root=False)
     clean_name = (new_name or "").replace("\x00", "").replace("/", "").replace("\\", "").strip()

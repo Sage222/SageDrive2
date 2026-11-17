@@ -617,8 +617,7 @@ def _gd_ensure_folder_path(base_folder_id, parts, account_id=None):
             curr_id = created["id"]
     return curr_id
 
-def _gd_upload_file(parent_id, filename, data_or_stream, mime_type="application/octet-stream", relative_path=None, account_id=None):
-    svc = _gd_svc(account_id=account_id)
+def _gd_resolve_upload_target(parent_id, filename, relative_path=None, account_id=None):
     target_parent = parent_id or "root"
     actual_name = filename
     if relative_path:
@@ -631,16 +630,152 @@ def _gd_upload_file(parent_id, filename, data_or_stream, mime_type="application/
             actual_name = segments[-1]
         elif segments:
             actual_name = segments[0]
-    stream_obj = data_or_stream if hasattr(data_or_stream, "read") else io.BytesIO(
-        data_or_stream if isinstance(data_or_stream, (bytes, bytearray)) else str(data_or_stream).encode("utf-8")
+    return target_parent, actual_name
+
+def _gd_start_resumable_upload(
+    parent_id,
+    filename,
+    mime_type="application/octet-stream",
+    total_size=None,
+    relative_path=None,
+    account_id=None,
+):
+    target_parent, actual_name = _gd_resolve_upload_target(
+        parent_id, filename, relative_path=relative_path, account_id=account_id
     )
-    media = MediaIoBaseUpload(stream_obj, mimetype=mime_type, chunksize=8 * 1024 * 1024, resumable=True)
-    svc.files().create(
-        body={"name": actual_name, "parents": [target_parent]},
-        media_body=media,
-        fields="id",
-        supportsAllDrives=True,
-    ).execute()
+    url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true"
+    for attempt in range(2):
+        c = _gd_load_creds(force_refresh=(attempt > 0), account_id=account_id)
+        if not c:
+            raise RuntimeError("Not authenticated with Google Drive")
+        headers = {
+            "Authorization": f"Bearer {c.token}",
+            "Content-Type": "application/json; charset=UTF-8",
+            "X-Upload-Content-Type": mime_type or "application/octet-stream",
+        }
+        if total_size is not None and int(total_size) >= 0:
+            headers["X-Upload-Content-Length"] = str(int(total_size))
+        r = requests.post(
+            url,
+            headers=headers,
+            json={"name": actual_name, "parents": [target_parent]},
+            timeout=30,
+        )
+        if r.status_code in (401, 403) and attempt == 0:
+            continue
+        if not r.ok:
+            raise RuntimeError(f"Google Drive resumable init failed ({r.status_code}): {r.text[:300]}")
+        loc = r.headers.get("Location")
+        if not loc:
+            raise RuntimeError("Google Drive did not return a resumable upload Location header")
+        return loc
+    raise RuntimeError("Google Drive authentication failed after token refresh")
+
+def _gd_push_resumable_chunk(resumable_uri, chunk_bytes, offset, total_size=None):
+    chunk_len = len(chunk_bytes)
+    if chunk_len == 0:
+        return int(offset or 0)
+    end_byte = int(offset) + chunk_len - 1
+    total_str = str(int(total_size)) if (total_size is not None and int(total_size) > 0) else "*"
+    headers = {
+        "Content-Length": str(chunk_len),
+        "Content-Range": f"bytes {int(offset)}-{end_byte}/{total_str}",
+    }
+    r = requests.put(resumable_uri, data=chunk_bytes, headers=headers, timeout=300)
+    if r.status_code not in (200, 201, 308):
+        raise RuntimeError(f"Google Drive chunk upload failed ({r.status_code}): {r.text[:300]}")
+    return int(offset) + chunk_len
+
+def _gd_query_resumable_offset(resumable_uri, total_size=None):
+    total_str = str(int(total_size)) if (total_size is not None and int(total_size) > 0) else "*"
+    headers = {
+        "Content-Length": "0",
+        "Content-Range": f"bytes */{total_str}",
+    }
+    r = requests.put(resumable_uri, headers=headers, timeout=20)
+    if r.status_code in (200, 201):
+        return int(total_size or 0)
+    if r.status_code == 308:
+        rng = r.headers.get("Range") or ""
+        if "-" in rng:
+            try:
+                return int(rng.split("-")[-1].strip()) + 1
+            except Exception:
+                pass
+        return 0
+    raise RuntimeError(f"Google Drive session check failed ({r.status_code})")
+
+def _gd_cancel_resumable_upload(resumable_uri):
+    if not resumable_uri:
+        return
+    try:
+        requests.delete(resumable_uri, timeout=15)
+    except Exception:
+        pass
+
+def _gd_upload_file(
+    parent_id,
+    filename,
+    data_or_stream,
+    mime_type="application/octet-stream",
+    relative_path=None,
+    account_id=None,
+    total_size=None,
+):
+    if isinstance(data_or_stream, (bytes, bytearray)):
+        raw_bytes = bytes(data_or_stream)
+        total_size = len(raw_bytes)
+        stream_obj = io.BytesIO(raw_bytes)
+    elif hasattr(data_or_stream, "read"):
+        stream_obj = data_or_stream
+    else:
+        raw_bytes = str(data_or_stream).encode("utf-8")
+        total_size = len(raw_bytes)
+        stream_obj = io.BytesIO(raw_bytes)
+
+    resumable_uri = _gd_start_resumable_upload(
+        parent_id,
+        filename,
+        mime_type=mime_type,
+        total_size=total_size,
+        relative_path=relative_path,
+        account_id=account_id,
+    )
+    if total_size is not None and int(total_size) == 0:
+        r = requests.put(
+            resumable_uri,
+            data=b"",
+            headers={"Content-Length": "0", "Content-Range": "bytes */0"},
+            timeout=60,
+        )
+        if r.status_code not in (200, 201):
+            raise RuntimeError(f"Google Drive empty file upload failed ({r.status_code}): {r.text[:300]}")
+        return
+
+    chunk_unit = 5 * 1024 * 1024  # 5 MiB (multiple of 256 KiB required by Google Drive)
+    offset = 0
+    while True:
+        buf = bytearray()
+        while len(buf) < chunk_unit:
+            part = stream_obj.read(chunk_unit - len(buf))
+            if not part:
+                break
+            buf.extend(part)
+        if not buf:
+            if offset == 0:
+                requests.put(
+                    resumable_uri,
+                    data=b"",
+                    headers={"Content-Length": "0", "Content-Range": "bytes */0"},
+                    timeout=60,
+                )
+            break
+        is_last = len(buf) < chunk_unit
+        final_total = (offset + len(buf)) if (is_last and total_size is None) else total_size
+        offset = _gd_push_resumable_chunk(resumable_uri, bytes(buf), offset, total_size=final_total)
+        if is_last:
+            break
+
 
 def _gd_update_file_content(file_id, data_or_stream, mime_type="text/plain; charset=utf-8", account_id=None):
     _gd_meta_cache.pop(_gd_cache_key(account_id, file_id), None)
@@ -754,6 +889,11 @@ gdrive_manager.get_file_meta = _gd_get_file_meta
 gdrive_manager.stream_file_range = _gd_stream_file_range
 gdrive_manager.download_file = _gd_download_file
 gdrive_manager.ensure_folder_path = _gd_ensure_folder_path
+gdrive_manager.resolve_upload_target = _gd_resolve_upload_target
+gdrive_manager.start_resumable_upload = _gd_start_resumable_upload
+gdrive_manager.push_resumable_chunk = _gd_push_resumable_chunk
+gdrive_manager.query_resumable_offset = _gd_query_resumable_offset
+gdrive_manager.cancel_resumable_upload = _gd_cancel_resumable_upload
 gdrive_manager.upload_file = _gd_upload_file
 gdrive_manager.update_file_content = _gd_update_file_content
 gdrive_manager.move_file = _gd_move_file
@@ -794,6 +934,27 @@ def _smb_upload_file(share_id, dest_path, data_or_stream):
     finally:
         c.close()
 
+def _smb_upload_chunk(share_id, dest_path, chunk_bytes, offset=0, truncate=False):
+    norm_path = _sanitize_smb_path(dest_path, allow_root=False)
+    cfg = smb_manager._cfg(share_id)
+    c = smb_manager._conn(cfg)
+    try:
+        if offset == 0:
+            parent = "/".join(norm_path.split("/")[:-1])
+            if parent and parent != "/":
+                smb_manager._ensure_dirs_on_conn(c, cfg["share"], parent)
+        bio = io.BytesIO(chunk_bytes if isinstance(chunk_bytes, (bytes, bytearray)) else bytes(chunk_bytes))
+        c.storeFileFromOffset(
+            cfg["share"],
+            norm_path,
+            bio,
+            offset=int(offset or 0),
+            truncate=bool(truncate),
+            timeout=300,
+        )
+    finally:
+        c.close()
+
 def _smb_move_path(share_id, old_path, dest_dir):
     norm_old = _sanitize_smb_path(old_path, allow_root=False)
     norm_dest_dir = _sanitize_smb_path(dest_dir, allow_root=True)
@@ -815,6 +976,7 @@ def _smb_move_path(share_id, old_path, dest_dir):
 
 smb_manager.sanitize_smb_path = _sanitize_smb_path
 smb_manager.upload_file = _smb_upload_file
+smb_manager.upload_chunk = _smb_upload_chunk
 smb_manager.move_path = _smb_move_path
 
 def _get_smb_file_size(share_id, path):
@@ -3318,16 +3480,180 @@ def filejump_mkdir():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ── Resumable Upload Sessions (All Drives: SMB, Google Drive, OneDrive, FileJump) ──
-_UPLOAD_SESSIONS_DIR = Path(os.environ.get("DATA_DIR", "/app/data")) / "upload_sessions"
+# ── Zero-Disk Direct Streaming Upload Sessions (All Drives: SMB, Google Drive, OneDrive, FileJump) ──
+_LEGACY_UPLOAD_SESSIONS_DIR = Path(os.environ.get("DATA_DIR", "/app/data")) / "upload_sessions"
+try:
+    if _LEGACY_UPLOAD_SESSIONS_DIR.exists():
+        shutil.rmtree(_LEGACY_UPLOAD_SESSIONS_DIR, ignore_errors=True)
+except Exception:
+    pass
+
+_UPLOAD_SESSIONS = {}
 _upload_sessions_lock = threading.Lock()
 
-def _get_upload_session_paths(session_id):
-    safe_id = re.sub(r"[^A-Za-z0-9_-]", "", str(session_id or ""))
-    if not safe_id:
-        raise ValueError("Invalid upload session ID")
-    _UPLOAD_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    return _UPLOAD_SESSIONS_DIR / f"{safe_id}.json", _UPLOAD_SESSIONS_DIR / f"{safe_id}.part"
+
+class _UploadAbortedError(Exception):
+    pass
+
+
+class _StreamingUploadPipe:
+    """
+    Zero-disk in-memory byte pipe that streams incoming browser upload chunks
+    directly into an outbound HTTP/WebDAV/REST connection (e.g. FileJump)
+    without writing anything to container storage.
+    """
+    def __init__(self, total_size):
+        self.total_size = max(0, int(total_size or 0))
+        self.bytes_accepted = 0
+        self.bytes_transmitted = 0
+        self.eof = False
+        self.aborted = False
+        self.error = None
+        self.result = None
+        self.worker_done = threading.Event()
+        self._cond = threading.Condition()
+        self._buf = bytearray()
+
+    def __len__(self):
+        return self.total_size
+
+    def write_chunk(self, data: bytes, timeout=600.0):
+        if not data:
+            return self.bytes_accepted
+        mv = memoryview(data)
+        pos = 0
+        step = 262144  # 256 KiB slices
+        deadline = time.time() + timeout
+        with self._cond:
+            while pos < len(mv):
+                if self.aborted:
+                    raise _UploadAbortedError("Upload cancelled")
+                if self.error is not None:
+                    raise self.error
+                while len(self._buf) >= 524288 and not self.aborted and self.error is None and not self.worker_done.is_set():
+                    rem = deadline - time.time()
+                    if rem <= 0:
+                        self.aborted = True
+                        self._cond.notify_all()
+                        raise TimeoutError("Timed out streaming chunk to remote destination")
+                    self._cond.wait(timeout=min(1.0, rem))
+                if self.aborted:
+                    raise _UploadAbortedError("Upload cancelled")
+                if self.error is not None:
+                    raise self.error
+                if self.worker_done.is_set():
+                    if self.error is not None:
+                        raise self.error
+                    raise RuntimeError("Remote upload connection closed unexpectedly")
+                take = min(step, len(mv) - pos)
+                self._buf.extend(mv[pos:pos + take])
+                pos += take
+                self.bytes_accepted += take
+                if self.total_size > 0 and self.bytes_accepted >= self.total_size:
+                    self.eof = True
+                self._cond.notify_all()
+
+            while len(self._buf) > 0 and not self.aborted and self.error is None and not self.worker_done.is_set():
+                rem = deadline - time.time()
+                if rem <= 0:
+                    self.aborted = True
+                    self._cond.notify_all()
+                    raise TimeoutError("Timed out waiting for remote destination to accept chunk")
+                self._cond.wait(timeout=min(1.0, rem))
+
+            if self.aborted:
+                raise _UploadAbortedError("Upload cancelled")
+            if self.error is not None:
+                raise self.error
+            return self.bytes_accepted
+
+    def read(self, size=65536):
+        if size is None or size < 0:
+            size = 65536
+        with self._cond:
+            while len(self._buf) == 0 and not self.eof and not self.aborted and self.error is None:
+                self._cond.wait(timeout=1.0)
+            if self.aborted:
+                raise _UploadAbortedError("Upload cancelled")
+            if self.error is not None:
+                raise self.error
+            if len(self._buf) == 0:
+                return b""
+            take = min(size, len(self._buf))
+            out = bytes(self._buf[:take])
+            del self._buf[:take]
+            self.bytes_transmitted += len(out)
+            self._cond.notify_all()
+            return out
+
+    def finish_and_wait(self, timeout=600.0):
+        with self._cond:
+            self.eof = True
+            self._cond.notify_all()
+        if not self.worker_done.wait(timeout=timeout):
+            self.abort()
+            raise TimeoutError("Timed out waiting for remote destination to finalize upload")
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+    def abort(self):
+        with self._cond:
+            self.aborted = True
+            self.eof = True
+            self._buf.clear()
+            self._cond.notify_all()
+
+
+def _start_filejump_pipe_worker(sess):
+    pipe = _StreamingUploadPipe(sess["totalSize"])
+    sess["pipe"] = pipe
+    sess["offset"] = 0
+    drive_id = sess["driveId"]
+    target_parent = sess.get("resolvedParent") or sess["folder"] or "root"
+    actual_name = sess.get("resolvedName") or sess["fileName"]
+    mime_type = sess["mimeType"]
+    total_size = sess["totalSize"]
+
+    def _worker():
+        try:
+            res = filejump_manager.upload_file(
+                target_parent,
+                actual_name,
+                pipe,
+                mime_type,
+                relative_path=None,
+                account_id=drive_id,
+                total_size=total_size,
+            )
+            pipe.result = res
+        except Exception as exc:
+            with pipe._cond:
+                pipe.error = exc
+                pipe._cond.notify_all()
+        finally:
+            pipe.worker_done.set()
+            with pipe._cond:
+                pipe._cond.notify_all()
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return pipe
+
+
+def _cleanup_expired_upload_sessions():
+    now = time.time()
+    expired = [
+        sid for sid, s in _UPLOAD_SESSIONS.items()
+        if now - s.get("updatedAt", s.get("createdAt", now)) > 14400
+    ]
+    for sid in expired:
+        s = _UPLOAD_SESSIONS.pop(sid, None)
+        if s and s.get("pipe"):
+            try:
+                s["pipe"].abort()
+            except Exception:
+                pass
+
 
 @app.post("/api/transfers/upload/init")
 @auth.require_admin
@@ -3347,36 +3673,62 @@ def init_resumable_upload():
     if not file_name:
         return jsonify({"error": "fileName is required"}), 400
 
-    with _upload_sessions_lock:
-        _UPLOAD_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-        if client_key:
-            session_id = "up_" + hashlib.sha256(
-                f"{drive_type}:{drive_id}:{folder}:{relative_path or file_name}:{total_size}:{client_key}".encode("utf-8")
-            ).hexdigest()[:24]
-        else:
-            session_id = f"up_{secrets.token_hex(12)}"
+    try:
+        with _upload_sessions_lock:
+            _cleanup_expired_upload_sessions()
+            if client_key:
+                session_id = "up_" + hashlib.sha256(
+                    f"{drive_type}:{drive_id}:{folder}:{relative_path or file_name}:{total_size}:{client_key}".encode("utf-8")
+                ).hexdigest()[:24]
+            else:
+                session_id = f"up_{secrets.token_hex(12)}"
 
-        meta_path, part_path = _get_upload_session_paths(session_id)
-        if meta_path.exists() and part_path.exists():
-            try:
-                meta = json.loads(meta_path.read_text())
-                actual_offset = part_path.stat().st_size
-                if actual_offset <= total_size:
-                    meta["offset"] = actual_offset
-                    meta_path.write_text(json.dumps(meta, indent=2))
+            existing = _UPLOAD_SESSIONS.get(session_id)
+            if existing:
+                actual_offset = int(existing.get("offset") or 0)
+                if drive_type == "filejump":
+                    pipe = existing.get("pipe")
+                    if pipe and (pipe.error is not None or pipe.aborted or pipe.worker_done.is_set()):
+                        existing["pipe"] = None
+                        existing["offset"] = 0
+                        actual_offset = 0
+                elif drive_type == "gdrive" and existing.get("resumableUri"):
+                    try:
+                        actual_offset = gdrive_manager.query_resumable_offset(existing["resumableUri"], total_size)
+                        existing["offset"] = actual_offset
+                    except Exception:
+                        existing["resumableUri"] = None
+                        existing["offset"] = 0
+                        actual_offset = 0
+                elif drive_type == "onedrive" and existing.get("uploadUrl"):
+                    try:
+                        actual_offset = onedrive_manager.query_resumable_offset(existing["uploadUrl"], total_size)
+                        existing["offset"] = actual_offset
+                    except Exception:
+                        existing["uploadUrl"] = None
+                        existing["offset"] = 0
+                        actual_offset = 0
+                elif drive_type == "smb" and existing.get("destFull"):
+                    try:
+                        actual_offset = smb_manager.get_file_size(drive_id, existing["destFull"])
+                        existing["offset"] = actual_offset
+                    except Exception:
+                        existing["offset"] = 0
+                        actual_offset = 0
+
+                if 0 < actual_offset <= total_size:
+                    existing["updatedAt"] = time.time()
                     return jsonify({
                         "sessionId": session_id,
                         "upload_id": session_id,
                         "offset": actual_offset,
                         "totalSize": total_size,
                         "total_size": total_size,
-                        "resumed": actual_offset > 0,
+                        "resumed": True,
                     })
-            except Exception:
-                pass
 
-        part_path.write_bytes(b"")
-        meta = {
+        # Prepare target destination metadata / upstream session outside the lock
+        sess = {
             "sessionId": session_id,
             "driveType": drive_type,
             "driveId": drive_id,
@@ -3384,11 +3736,50 @@ def init_resumable_upload():
             "fileName": file_name,
             "relativePath": relative_path,
             "totalSize": total_size,
-            "mimeType": mime_type,
+            "mimeType": mime_type or guess_media_mime(file_name),
             "offset": 0,
             "createdAt": time.time(),
+            "updatedAt": time.time(),
+            "lock": threading.Lock(),
         }
-        meta_path.write_text(json.dumps(meta, indent=2))
+
+        if drive_type == "smb":
+            sub = relative_path if relative_path else file_name
+            dest_full = _sanitize_smb_path(folder.rstrip("/") + "/" + sub.lstrip("/"), allow_root=False)
+            sess["destFull"] = dest_full
+            if total_size == 0:
+                smb_manager.upload_chunk(drive_id, dest_full, b"", offset=0, truncate=True)
+        elif drive_type == "gdrive":
+            if total_size > 0:
+                sess["resumableUri"] = gdrive_manager.start_resumable_upload(
+                    folder or "root",
+                    file_name,
+                    mime_type=sess["mimeType"],
+                    total_size=total_size,
+                    relative_path=relative_path or None,
+                    account_id=drive_id,
+                )
+        elif drive_type == "onedrive":
+            if total_size > 0:
+                sess["uploadUrl"] = onedrive_manager.start_resumable_upload(
+                    folder or "root",
+                    file_name,
+                    relative_path=relative_path or None,
+                    account_id=drive_id,
+                )
+        elif drive_type == "filejump":
+            target_parent, actual_name = filejump_manager.resolve_upload_target(
+                folder or "root",
+                file_name,
+                relative_path=relative_path or None,
+                account_id=drive_id,
+            )
+            sess["resolvedParent"] = target_parent
+            sess["resolvedName"] = actual_name
+
+        with _upload_sessions_lock:
+            _UPLOAD_SESSIONS[session_id] = sess
+
         return jsonify({
             "sessionId": session_id,
             "upload_id": session_id,
@@ -3397,6 +3788,9 @@ def init_resumable_upload():
             "total_size": total_size,
             "resumed": False,
         })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 @app.get("/api/transfers/upload/status")
 @auth.require_auth
@@ -3407,21 +3801,56 @@ def status_resumable_upload():
         or request.args.get("sessionId")
         or ""
     ).strip()
+    with _upload_sessions_lock:
+        sess = _UPLOAD_SESSIONS.get(session_id)
+    if not sess:
+        return jsonify({"error": "Upload session not found"}), 404
+
     try:
-        meta_path, part_path = _get_upload_session_paths(session_id)
-        if not meta_path.exists():
-            return jsonify({"error": "Upload session not found"}), 404
-        meta = json.loads(meta_path.read_text())
-        offset = part_path.stat().st_size if part_path.exists() else 0
-        return jsonify({
-            "sessionId": session_id,
-            "upload_id": session_id,
-            "offset": offset,
-            "totalSize": meta.get("totalSize", 0),
-            "total_size": meta.get("totalSize", 0),
-        })
+        with sess["lock"]:
+            drive_type = sess["driveType"]
+            total_size = sess.get("totalSize", 0)
+            offset = int(sess.get("offset") or 0)
+            if drive_type == "filejump":
+                pipe = sess.get("pipe")
+                if pipe:
+                    if pipe.error is not None or pipe.aborted or (pipe.worker_done.is_set() and pipe.bytes_accepted < total_size):
+                        sess["pipe"] = None
+                        sess["offset"] = 0
+                        offset = 0
+                    else:
+                        offset = pipe.bytes_accepted
+                        sess["offset"] = offset
+            elif drive_type == "gdrive" and sess.get("resumableUri"):
+                try:
+                    offset = gdrive_manager.query_resumable_offset(sess["resumableUri"], total_size)
+                    sess["offset"] = offset
+                except Exception:
+                    pass
+            elif drive_type == "onedrive" and sess.get("uploadUrl"):
+                try:
+                    offset = onedrive_manager.query_resumable_offset(sess["uploadUrl"], total_size)
+                    sess["offset"] = offset
+                except Exception:
+                    pass
+            elif drive_type == "smb" and sess.get("destFull") and offset > 0:
+                try:
+                    offset = smb_manager.get_file_size(sess["driveId"], sess["destFull"])
+                    sess["offset"] = offset
+                except Exception:
+                    offset = 0
+                    sess["offset"] = 0
+
+            return jsonify({
+                "sessionId": session_id,
+                "upload_id": session_id,
+                "offset": offset,
+                "totalSize": total_size,
+                "total_size": total_size,
+            })
     except Exception as e:
         return jsonify({"error": str(e)}), 400
+
 
 @app.post("/api/transfers/upload/chunk")
 @auth.require_admin
@@ -3436,28 +3865,89 @@ def chunk_resumable_upload():
     offset_arg = request.args.get("offset") or request.headers.get("X-Upload-Offset") or "0"
     try:
         expected_offset = int(offset_arg)
-        meta_path, part_path = _get_upload_session_paths(session_id)
-        if not meta_path.exists():
+        with _upload_sessions_lock:
+            sess = _UPLOAD_SESSIONS.get(session_id)
+        if not sess:
             return jsonify({"error": "Upload session not found"}), 404
 
         chunk_bytes = request.get_data(cache=False)
-        with _upload_sessions_lock:
-            current_size = part_path.stat().st_size if part_path.exists() else 0
-            if expected_offset != current_size:
+        with sess["lock"]:
+            drive_type = sess["driveType"]
+            drive_id = sess["driveId"]
+            total_size = sess["totalSize"]
+
+            if drive_type == "filejump":
+                pipe = sess.get("pipe")
+                if pipe and (pipe.error is not None or pipe.aborted or (pipe.worker_done.is_set() and pipe.bytes_accepted < total_size)):
+                    sess["pipe"] = None
+                    sess["offset"] = 0
+                    pipe = None
+                if expected_offset == 0:
+                    if pipe:
+                        pipe.abort()
+                    pipe = _start_filejump_pipe_worker(sess)
+
+            current_offset = int(sess.get("offset") or 0)
+            if expected_offset != current_offset:
                 return jsonify({
-                    "error": f"Offset mismatch (expected {current_size}, got {expected_offset})",
-                    "offset": current_size,
+                    "error": f"Offset mismatch (expected {current_offset}, got {expected_offset})",
+                    "offset": current_offset,
                 }), 409
-            with open(part_path, "ab") as fp:
-                fp.write(chunk_bytes)
-            new_offset = part_path.stat().st_size
-            meta = json.loads(meta_path.read_text())
-            meta["offset"] = new_offset
-            meta["updatedAt"] = time.time()
-            meta_path.write_text(json.dumps(meta, indent=2))
+
+            if drive_type == "smb":
+                dest_full = sess["destFull"]
+                smb_manager.upload_chunk(
+                    drive_id,
+                    dest_full,
+                    chunk_bytes,
+                    offset=expected_offset,
+                    truncate=(expected_offset == 0),
+                )
+                new_offset = expected_offset + len(chunk_bytes)
+            elif drive_type == "gdrive":
+                if not sess.get("resumableUri"):
+                    sess["resumableUri"] = gdrive_manager.start_resumable_upload(
+                        sess["folder"] or "root",
+                        sess["fileName"],
+                        mime_type=sess["mimeType"],
+                        total_size=total_size,
+                        relative_path=sess["relativePath"] or None,
+                        account_id=drive_id,
+                    )
+                new_offset = gdrive_manager.push_resumable_chunk(
+                    sess["resumableUri"],
+                    chunk_bytes,
+                    expected_offset,
+                    total_size=total_size,
+                )
+            elif drive_type == "onedrive":
+                if not sess.get("uploadUrl"):
+                    sess["uploadUrl"] = onedrive_manager.start_resumable_upload(
+                        sess["folder"] or "root",
+                        sess["fileName"],
+                        relative_path=sess["relativePath"] or None,
+                        account_id=drive_id,
+                    )
+                new_offset = onedrive_manager.push_resumable_chunk(
+                    sess["uploadUrl"],
+                    chunk_bytes,
+                    expected_offset,
+                    total_size=total_size,
+                )
+            elif drive_type == "filejump":
+                pipe = sess.get("pipe")
+                if not pipe:
+                    pipe = _start_filejump_pipe_worker(sess)
+                new_offset = pipe.write_chunk(chunk_bytes)
+
+            sess["offset"] = new_offset
+            sess["updatedAt"] = time.time()
             return jsonify({"ok": True, "offset": new_offset})
+    except _UploadAbortedError as e:
+        return jsonify({"error": str(e)}), 499
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 @app.post("/api/transfers/upload/complete")
 @auth.require_admin
@@ -3472,60 +3962,68 @@ def complete_resumable_upload():
         or ""
     ).strip()
     try:
-        meta_path, part_path = _get_upload_session_paths(session_id)
-        if not meta_path.exists() or not part_path.exists():
+        with _upload_sessions_lock:
+            sess = _UPLOAD_SESSIONS.get(session_id)
+        if not sess:
             return jsonify({"error": "Upload session not found"}), 404
-        meta = json.loads(meta_path.read_text())
-        drive_type = meta["driveType"]
-        drive_id = meta["driveId"]
-        folder = meta["folder"]
-        file_name = meta["fileName"]
-        rel_path = meta.get("relativePath") or ""
-        mime_type = meta.get("mimeType") or guess_media_mime(file_name)
 
-        with open(part_path, "rb") as fp:
+        with sess["lock"]:
+            drive_type = sess["driveType"]
+            drive_id = sess["driveId"]
+            folder = sess["folder"]
+            file_name = sess["fileName"]
+            rel_path = sess.get("relativePath") or ""
+            mime_type = sess.get("mimeType") or guess_media_mime(file_name)
+            total_size = int(sess.get("totalSize") or 0)
+
             if drive_type == "smb":
-                sub = rel_path if rel_path else file_name
-                dest_full = _sanitize_smb_path(folder.rstrip("/") + "/" + sub.lstrip("/"), allow_root=False)
-                smb_manager.upload_file(drive_id, dest_full, fp)
-                _SMB_SIZE_CACHE.pop(f"{drive_id}:{dest_full}", None)
+                dest_full = sess.get("destFull")
+                if dest_full:
+                    _SMB_SIZE_CACHE.pop(f"{drive_id}:{dest_full}", None)
             elif drive_type == "gdrive":
-                gdrive_manager.upload_file(
-                    folder or "root",
-                    file_name,
-                    fp,
-                    mime_type,
-                    relative_path=rel_path or None,
-                    account_id=drive_id,
-                )
+                if total_size == 0 and int(sess.get("offset") or 0) == 0:
+                    gdrive_manager.upload_file(
+                        folder or "root",
+                        file_name,
+                        b"",
+                        mime_type,
+                        relative_path=rel_path or None,
+                        account_id=drive_id,
+                        total_size=0,
+                    )
             elif drive_type == "onedrive":
-                onedrive_manager.upload_file(
-                    folder or "root",
-                    file_name,
-                    fp,
-                    mime_type,
-                    relative_path=rel_path or None,
-                    account_id=drive_id,
-                )
+                if total_size == 0 and int(sess.get("offset") or 0) == 0:
+                    onedrive_manager.upload_file(
+                        folder or "root",
+                        file_name,
+                        b"",
+                        mime_type,
+                        relative_path=rel_path or None,
+                        account_id=drive_id,
+                        total_size=0,
+                    )
             elif drive_type == "filejump":
-                filejump_manager.upload_file(
-                    folder or "root",
-                    file_name,
-                    fp,
-                    mime_type,
-                    relative_path=rel_path or None,
-                    account_id=drive_id,
-                )
+                pipe = sess.get("pipe")
+                if pipe:
+                    pipe.finish_and_wait()
+                elif total_size == 0:
+                    filejump_manager.upload_file(
+                        sess.get("resolvedParent") or folder or "root",
+                        sess.get("resolvedName") or file_name,
+                        b"",
+                        mime_type,
+                        relative_path=None,
+                        account_id=drive_id,
+                        total_size=0,
+                    )
 
-        try:
-            part_path.unlink(missing_ok=True)
-            meta_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        with _upload_sessions_lock:
+            _UPLOAD_SESSIONS.pop(session_id, None)
 
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/api/transfers/upload/cancel", methods=["POST", "DELETE"])
 @auth.require_admin
@@ -3540,17 +4038,65 @@ def cancel_resumable_upload():
         or ""
     ).strip()
     try:
-        meta_path, part_path = _get_upload_session_paths(session_id)
-        part_path.unlink(missing_ok=True)
-        meta_path.unlink(missing_ok=True)
+        with _upload_sessions_lock:
+            sess = _UPLOAD_SESSIONS.pop(session_id, None)
+        if sess:
+            drive_type = sess.get("driveType")
+            if drive_type == "filejump" and sess.get("pipe"):
+                sess["pipe"].abort()
+            elif drive_type == "gdrive" and sess.get("resumableUri"):
+                gdrive_manager.cancel_resumable_upload(sess["resumableUri"])
+            elif drive_type == "onedrive" and sess.get("uploadUrl"):
+                onedrive_manager.cancel_resumable_upload(sess["uploadUrl"])
+            elif drive_type == "smb" and sess.get("destFull") and int(sess.get("offset") or 0) > 0:
+                try:
+                    smb_manager.delete_path(sess["driveId"], sess["destFull"], False)
+                except Exception:
+                    pass
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
-# ── Cross-Drive Transfer & Move (SMB <-> Google Drive <-> OneDrive <-> FileJump) ──
+
+# ── Cross-Drive Direct Streaming Transfer & Move (SMB <-> Google Drive <-> OneDrive <-> FileJump) ──
+class _GeneratorStreamReader:
+    """
+    Wraps a chunk generator (such as stream_file_range) into a file-like .read(size)
+    stream so cross-drive copies stream directly from source to destination in small
+    RAM buffers without touching container disk or loading whole files in memory.
+    """
+    def __init__(self, gen):
+        self._gen = iter(gen)
+        self._buf = bytearray()
+        self._eof = False
+
+    def read(self, size=65536):
+        if size is None or size < 0:
+            while not self._eof:
+                try:
+                    chunk = next(self._gen)
+                    if chunk:
+                        self._buf.extend(chunk)
+                except StopIteration:
+                    self._eof = True
+            out = bytes(self._buf)
+            self._buf.clear()
+            return out
+        while len(self._buf) < size and not self._eof:
+            try:
+                chunk = next(self._gen)
+                if chunk:
+                    self._buf.extend(chunk)
+            except StopIteration:
+                self._eof = True
+        out = bytes(self._buf[:size])
+        del self._buf[:size]
+        return out
+
+
 def _read_source_item_tree(src_type, src_drive, item):
     """
-    Returns (name, is_folder, children_or_None, read_bytes_and_mime_fn).
+    Returns (name, is_folder, children_or_None, open_stream_mime_size_fn).
     """
     if src_type == "smb":
         norm_smb = _sanitize_smb_path(item["path"], allow_root=False)
@@ -3559,7 +4105,13 @@ def _read_source_item_tree(src_type, src_drive, item):
         if is_folder:
             children = smb_manager.browse(src_drive, norm_smb)
             return name, True, children, None
-        return name, False, None, lambda: (smb_manager.read_file_bytes(src_drive, norm_smb), guess_media_mime(name))
+
+        def _open_smb():
+            sz = _get_smb_file_size(src_drive, norm_smb)
+            gen = smb_manager.stream_file_range(src_drive, norm_smb, start=0, length=sz if sz > 0 else None)
+            return _GeneratorStreamReader(gen), guess_media_mime(name), sz
+
+        return name, False, None, _open_smb
     elif src_type == "gdrive":
         fid = item["id"]
         meta = gdrive_manager.get_file_meta(fid, account_id=src_drive)
@@ -3568,7 +4120,17 @@ def _read_source_item_tree(src_type, src_drive, item):
         if is_folder:
             children = gdrive_manager.list_files(fid, account_id=src_drive)
             return name, True, children, None
-        return name, False, None, lambda: (gdrive_manager.download_file(fid, account_id=src_drive)[0], meta.get("mimeType") or guess_media_mime(name))
+
+        def _open_gd():
+            mime = meta.get("mimeType") or guess_media_mime(name)
+            sz = int(meta.get("size") or 0)
+            if mime.startswith("application/vnd.google-apps."):
+                raw_bytes, _, exp_mime = gdrive_manager.download_file(fid, account_id=src_drive)
+                return io.BytesIO(raw_bytes), exp_mime, len(raw_bytes)
+            gen = gdrive_manager.stream_file_range(fid, start=0, end=None, account_id=src_drive)
+            return _GeneratorStreamReader(gen), mime, sz
+
+        return name, False, None, _open_gd
     elif src_type == "onedrive":
         fid = item["id"]
         meta = onedrive_manager.get_file_meta(fid, account_id=src_drive)
@@ -3577,7 +4139,14 @@ def _read_source_item_tree(src_type, src_drive, item):
         if is_folder:
             children = onedrive_manager.list_files(fid, account_id=src_drive)
             return name, True, children, None
-        return name, False, None, lambda: (onedrive_manager.download_file(fid, account_id=src_drive)[0], meta.get("mimeType") or guess_media_mime(name))
+
+        def _open_od():
+            mime = meta.get("mimeType") or guess_media_mime(name)
+            sz = int(meta.get("size") or 0)
+            gen = onedrive_manager.stream_file_range(fid, start=0, end=None, account_id=src_drive)
+            return _GeneratorStreamReader(gen), mime, sz
+
+        return name, False, None, _open_od
     elif src_type == "filejump":
         fid = item["id"]
         meta = filejump_manager.get_file_meta(fid, account_id=src_drive)
@@ -3586,11 +4155,19 @@ def _read_source_item_tree(src_type, src_drive, item):
         if is_folder:
             children = filejump_manager.list_files(fid, account_id=src_drive)
             return name, True, children, None
-        return name, False, None, lambda: (filejump_manager.download_file(fid, account_id=src_drive)[0], meta.get("mimeType") or guess_media_mime(name))
+
+        def _open_fj():
+            mime = meta.get("mimeType") or guess_media_mime(name)
+            sz = int(meta.get("size") or 0)
+            gen = filejump_manager.stream_file_range(fid, start=0, end=None, account_id=src_drive)
+            return _GeneratorStreamReader(gen), mime, sz
+
+        return name, False, None, _open_fj
     raise ValueError(f"Unsupported source drive type: {src_type!r}")
 
+
 def _copy_item_across_drives(src_type, src_drive, item, dest_type, dest_drive, dest_folder):
-    name, is_folder, children, read_fn = _read_source_item_tree(src_type, src_drive, item)
+    name, is_folder, children, open_fn = _read_source_item_tree(src_type, src_drive, item)
     if is_folder:
         if dest_type == "smb":
             norm_dest = _sanitize_smb_path(dest_folder, allow_root=True)
@@ -3607,19 +4184,20 @@ def _copy_item_across_drives(src_type, src_drive, item, dest_type, dest_drive, d
         for ch in (children or []):
             _copy_item_across_drives(src_type, src_drive, ch, dest_type, dest_drive, next_dest)
     else:
-        data, mime = read_fn()
+        stream_obj, mime, total_size = open_fn()
         if dest_type == "smb":
             norm_dest = _sanitize_smb_path(dest_folder, allow_root=True)
             target_path = _sanitize_smb_path(norm_dest.rstrip("/") + "/" + name, allow_root=False)
-            smb_manager.upload_file(dest_drive, target_path, data)
+            smb_manager.upload_file(dest_drive, target_path, stream_obj)
         elif dest_type == "gdrive":
-            gdrive_manager.upload_file(dest_folder, name, data, mime, account_id=dest_drive)
+            gdrive_manager.upload_file(dest_folder, name, stream_obj, mime, account_id=dest_drive, total_size=total_size)
         elif dest_type == "onedrive":
-            onedrive_manager.upload_file(dest_folder, name, data, mime, account_id=dest_drive)
+            onedrive_manager.upload_file(dest_folder, name, stream_obj, mime, account_id=dest_drive, total_size=total_size)
         elif dest_type == "filejump":
-            filejump_manager.upload_file(dest_folder, name, data, mime, account_id=dest_drive)
+            filejump_manager.upload_file(dest_folder, name, stream_obj, mime, account_id=dest_drive, total_size=total_size)
         else:
             raise ValueError(f"Unsupported destination drive type: {dest_type!r}")
+
 
 @app.post("/api/transfer")
 @auth.require_admin
@@ -3862,6 +4440,10 @@ def _reconcile_smb_proxy():
 
         mounted_paths = _get_active_mount_points()
         if has_rclone:
+            try:
+                shutil.rmtree("/root/.cache/rclone", ignore_errors=True)
+            except Exception:
+                pass
             newly_started = False
             for mpath, remote_name in desired_mounts.items():
                 if mpath not in mounted_paths:
@@ -3874,8 +4456,7 @@ def _reconcile_smb_proxy():
                                 "--allow-other",
                                 "--buffer-size", "16M",
                                 "--vfs-read-chunk-size", "32M",
-                                "--vfs-cache-mode", "writes",
-                                "--vfs-cache-max-size", "512M",
+                                "--vfs-cache-mode", "off",
                                 "--dir-cache-time", "5m",
                                 "--daemon",
                             ],

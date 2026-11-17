@@ -201,15 +201,17 @@ drive_type = {drive_type}
 
 for idx, acc in enumerate(fj_accounts):
     d = acc.get("creds") or {}
+    api_token = acc.get("api_token") or d.get("api_token") or d.get("password") or ""
+    if not api_token:
+        continue
     auth_type = acc.get("auth_type") or ("webdav" if d.get("password") else "token")
-    rc_id = safe_rclone_id(f"filejump_{acc.get('id', f'fj_{idx+1}')}")
-    webdav_url = (acc.get("webdav_url") or d.get("webdav_url") or "https://uploads.filejump.com/dav").strip()
+    rc_id = safe_rclone_id(acc.get("id", f"fj_{idx+1}"))
+    webdav_url = (acc.get("api_url") or acc.get("webdav_url") or d.get("webdav_url") or "https://uploads.filejump.com/dav").strip()
     if auth_type == "webdav":
-        w_user = d.get("username") or acc.get("email") or ""
-        w_pass = d.get("password") or ""
-        obscured_pass = w_pass
+        w_user = acc.get("email") or d.get("username") or ""
+        obscured_pass = api_token
         try:
-            obs = subprocess.run(["rclone", "obscure", w_pass], capture_output=True, text=True, timeout=5)
+            obs = subprocess.run(["rclone", "obscure", api_token], capture_output=True, text=True, timeout=5)
             if obs.returncode == 0 and obs.stdout.strip():
                 obscured_pass = obs.stdout.strip()
         except Exception:
@@ -222,12 +224,11 @@ user = {w_user}
 pass = {obscured_pass}
 """)
     else:
-        b_tok = d.get("api_token") or ""
         rclone_blocks.append(f"""[filejump_{rc_id}]
 type = webdav
-url = {webdav_url}
+url = https://uploads.filejump.com/dav
 vendor = other
-bearer_token = {b_tok}
+bearer_token = {api_token}
 """)
     if bool(acc.get("smb_enabled", True)):
         base_share = safe_share_name(acc.get("smb_share_name") or ("FileJump" if idx == 0 else f"FileJump_{idx+1}"), fallback="FileJump")
@@ -237,7 +238,7 @@ bearer_token = {b_tok}
             share_name = f"{base_share}_{s_idx}"
             s_idx += 1
         used_share_names.add(share_name.lower())
-        mpath = f"/mnt/gdrive_mounts/{rc_id}"
+        mpath = f"/mnt/gdrive_mounts/fj_{rc_id}"
         os.makedirs(mpath, exist_ok=True)
         smb_conf_lines.extend([
             f"[{share_name}]",
@@ -257,6 +258,10 @@ with open('/root/.config/rclone/rclone.conf', 'w') as f:
 with open('/etc/samba/smb.conf', 'w') as f:
     f.write("\n".join(smb_conf_lines))
 
+import shutil
+shutil.rmtree("/root/.cache/rclone", ignore_errors=True)
+shutil.rmtree("/app/data/upload_sessions", ignore_errors=True)
+
 mounted_count = 0
 for idx, acc in enumerate(accounts):
     d = acc.get("creds") or {}
@@ -270,8 +275,7 @@ for idx, acc in enumerate(accounts):
         "--allow-other",
         "--buffer-size", "16M",
         "--vfs-read-chunk-size", "32M",
-        "--vfs-cache-mode", "writes",
-        "--vfs-cache-max-size", "512M",
+        "--vfs-cache-mode", "off",
         "--dir-cache-time", "5m",
         "--daemon"
     ], check=False)
@@ -279,7 +283,7 @@ for idx, acc in enumerate(accounts):
 
 for idx, acc in enumerate(od_accounts):
     d = acc.get("creds") or {}
-    if not bool(acc.get("smb_enabled", True)) or not (d.get("access_token") or d.get("refresh_token")):
+    if not bool(acc.get("smb_enabled", True)) or not (d.get("token") or d.get("access_token") or d.get("refresh_token")):
         continue
     rc_id = safe_rclone_id(f"onedrive_{acc.get('id', f'od_{idx+1}')}")
     mpath = f"/mnt/gdrive_mounts/{rc_id}"
@@ -289,8 +293,7 @@ for idx, acc in enumerate(od_accounts):
         "--allow-other",
         "--buffer-size", "16M",
         "--vfs-read-chunk-size", "32M",
-        "--vfs-cache-mode", "writes",
-        "--vfs-cache-max-size", "512M",
+        "--vfs-cache-mode", "off",
         "--dir-cache-time", "5m",
         "--daemon"
     ], check=False)
@@ -298,18 +301,18 @@ for idx, acc in enumerate(od_accounts):
 
 for idx, acc in enumerate(fj_accounts):
     d = acc.get("creds") or {}
-    if not bool(acc.get("smb_enabled", True)) or not (d.get("api_token") or d.get("password")):
+    api_token = acc.get("api_token") or d.get("api_token") or d.get("password") or ""
+    if not bool(acc.get("smb_enabled", True)) or not api_token:
         continue
-    rc_id = safe_rclone_id(f"filejump_{acc.get('id', f'fj_{idx+1}')}")
-    mpath = f"/mnt/gdrive_mounts/{rc_id}"
+    rc_id = safe_rclone_id(acc.get("id", f"fj_{idx+1}"))
+    mpath = f"/mnt/gdrive_mounts/fj_{rc_id}"
     subprocess.run([
         "rclone", "mount", f"filejump_{rc_id}:", mpath,
         "--config", "/root/.config/rclone/rclone.conf",
         "--allow-other",
         "--buffer-size", "16M",
         "--vfs-read-chunk-size", "32M",
-        "--vfs-cache-mode", "writes",
-        "--vfs-cache-max-size", "512M",
+        "--vfs-cache-mode", "off",
         "--dir-cache-time", "5m",
         "--daemon"
     ], check=False)

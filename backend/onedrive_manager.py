@@ -625,7 +625,7 @@ def ensure_folder_path(base_folder_id, parts, account_id=None):
     return curr_id
 
 
-def upload_file(parent_id, filename, data_or_stream, mime_type="application/octet-stream", relative_path=None, account_id=None):
+def resolve_upload_target(parent_id, filename, relative_path=None, account_id=None):
     target_parent = parent_id or "root"
     actual_name = filename
     if relative_path:
@@ -638,18 +638,93 @@ def upload_file(parent_id, filename, data_or_stream, mime_type="application/octe
             actual_name = segments[-1]
         elif segments:
             actual_name = segments[0]
+    return target_parent, actual_name
 
-    stream_obj = data_or_stream if hasattr(data_or_stream, "read") else io.BytesIO(
-        data_or_stream if isinstance(data_or_stream, (bytes, bytearray)) else str(data_or_stream).encode("utf-8")
+
+def start_resumable_upload(parent_id, filename, relative_path=None, account_id=None):
+    target_parent, actual_name = resolve_upload_target(
+        parent_id, filename, relative_path=relative_path, account_id=account_id
     )
-
-    # Read first 4MB chunk; if the entire file fits in <=4MB, use simple PUT; otherwise use UploadSession
-    chunk_unit = 327680 * 10  # 3.2 MiB (exact multiple of 320 KiB as required by Microsoft Graph)
-    first_chunk = stream_obj.read(chunk_unit)
-    second_chunk = stream_obj.read(chunk_unit)
-
     safe_name = requests.utils.quote(actual_name)
-    if not second_chunk:
+    if target_parent == "root":
+        sess_ep = f"/me/drive/root:/{safe_name}:/createUploadSession"
+    else:
+        sess_ep = f"/me/drive/items/{target_parent}:/{safe_name}:/createUploadSession"
+    sess_resp = _graph_request(
+        "POST",
+        sess_ep,
+        account_id=account_id,
+        json={"item": {"@microsoft.graph.conflictBehavior": "replace", "name": actual_name}},
+    )
+    return sess_resp.json()["uploadUrl"]
+
+
+def push_resumable_chunk(upload_url, chunk_bytes, offset, total_size):
+    chunk_len = len(chunk_bytes)
+    if chunk_len == 0:
+        return int(offset or 0)
+    end_byte = int(offset) + chunk_len - 1
+    headers = {
+        "Content-Length": str(chunk_len),
+        "Content-Range": f"bytes {int(offset)}-{end_byte}/{int(total_size)}",
+    }
+    up_r = requests.put(upload_url, data=chunk_bytes, headers=headers, timeout=300)
+    if not up_r.ok and up_r.status_code not in (200, 201, 202):
+        raise RuntimeError(f"OneDrive chunk upload failed ({up_r.status_code}): {up_r.text[:300]}")
+    return int(offset) + chunk_len
+
+
+def query_resumable_offset(upload_url, total_size=0):
+    r = requests.get(upload_url, timeout=20)
+    if not r.ok:
+        raise RuntimeError(f"OneDrive session check failed ({r.status_code})")
+    data = r.json()
+    ranges = data.get("nextExpectedRanges") or []
+    if ranges:
+        first_range = str(ranges[0])
+        start_part = first_range.split("-")[0].strip()
+        if start_part.isdigit():
+            return int(start_part)
+    return int(total_size or 0)
+
+
+def cancel_resumable_upload(upload_url):
+    if not upload_url:
+        return
+    try:
+        requests.delete(upload_url, timeout=15)
+    except Exception:
+        pass
+
+
+def upload_file(
+    parent_id,
+    filename,
+    data_or_stream,
+    mime_type="application/octet-stream",
+    relative_path=None,
+    account_id=None,
+    total_size=None,
+):
+    target_parent, actual_name = resolve_upload_target(
+        parent_id, filename, relative_path=relative_path, account_id=account_id
+    )
+    if isinstance(data_or_stream, (bytes, bytearray)):
+        raw_bytes = bytes(data_or_stream)
+        total_size = len(raw_bytes)
+        stream_obj = io.BytesIO(raw_bytes)
+    elif hasattr(data_or_stream, "read"):
+        stream_obj = data_or_stream
+    else:
+        raw_bytes = str(data_or_stream).encode("utf-8")
+        total_size = len(raw_bytes)
+        stream_obj = io.BytesIO(raw_bytes)
+
+    chunk_unit = 327680 * 16  # 5 MiB (exact multiple of 320 KiB as required by Microsoft Graph)
+    safe_name = requests.utils.quote(actual_name)
+
+    if total_size is not None and int(total_size) <= 4 * 1024 * 1024:
+        body = stream_obj.read()
         if target_parent == "root":
             put_ep = f"/me/drive/root:/{safe_name}:/content"
         else:
@@ -658,52 +733,80 @@ def upload_file(parent_id, filename, data_or_stream, mime_type="application/octe
             "PUT",
             put_ep,
             account_id=account_id,
-            data=first_chunk or b"",
+            data=body or b"",
             headers={"Content-Type": mime_type or "application/octet-stream"},
             timeout=120,
         )
         return
 
-    # Large file upload via UploadSession
+    first_chunk = bytearray()
+    while len(first_chunk) < chunk_unit:
+        part = stream_obj.read(chunk_unit - len(first_chunk))
+        if not part:
+            break
+        first_chunk.extend(part)
+
+    if len(first_chunk) < chunk_unit:
+        if target_parent == "root":
+            put_ep = f"/me/drive/root:/{safe_name}:/content"
+        else:
+            put_ep = f"/me/drive/items/{target_parent}:/{safe_name}:/content"
+        _graph_request(
+            "PUT",
+            put_ep,
+            account_id=account_id,
+            data=bytes(first_chunk),
+            headers={"Content-Type": mime_type or "application/octet-stream"},
+            timeout=120,
+        )
+        return
+
+    # Stream directly to OneDrive UploadSession in memory without touching disk
     if target_parent == "root":
         sess_ep = f"/me/drive/root:/{safe_name}:/createUploadSession"
     else:
         sess_ep = f"/me/drive/items/{target_parent}:/{safe_name}:/createUploadSession"
 
-    # SpooledTemporaryFile keeps up to 16MB in memory and spills larger streams to disk so we know total file size for Content-Range
-    with tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024) as tmp:
-        tmp.write(first_chunk)
-        tmp.write(second_chunk)
-        while True:
-            buf = stream_obj.read(chunk_unit)
+    sess_resp = _graph_request(
+        "POST",
+        sess_ep,
+        account_id=account_id,
+        json={"item": {"@microsoft.graph.conflictBehavior": "replace", "name": actual_name}},
+    )
+    upload_url = sess_resp.json()["uploadUrl"]
+
+    if total_size is not None and int(total_size) > 0:
+        known_total = int(total_size)
+        offset = push_resumable_chunk(upload_url, bytes(first_chunk), 0, known_total)
+        while offset < known_total:
+            buf = bytearray()
+            while len(buf) < chunk_unit:
+                part = stream_obj.read(chunk_unit - len(buf))
+                if not part:
+                    break
+                buf.extend(part)
             if not buf:
                 break
-            tmp.write(buf)
-        total_size = tmp.tell()
-        tmp.seek(0)
+            offset = push_resumable_chunk(upload_url, bytes(buf), offset, known_total)
+        return
 
-        sess_resp = _graph_request(
-            "POST",
-            sess_ep,
-            account_id=account_id,
-            json={"item": {"@microsoft.graph.conflictBehavior": "replace", "name": actual_name}},
-        )
-        upload_url = sess_resp.json()["uploadUrl"]
-
-        offset = 0
-        while offset < total_size:
-            piece = tmp.read(chunk_unit)
-            if not piece:
+    # Fallback when caller did not provide total_size: read chunks in memory
+    chunks = [bytes(first_chunk)]
+    while True:
+        buf = bytearray()
+        while len(buf) < chunk_unit:
+            part = stream_obj.read(chunk_unit - len(buf))
+            if not part:
                 break
-            end_byte = offset + len(piece) - 1
-            headers = {
-                "Content-Length": str(len(piece)),
-                "Content-Range": f"bytes {offset}-{end_byte}/{total_size}",
-            }
-            up_r = requests.put(upload_url, data=piece, headers=headers, timeout=300)
-            if not up_r.ok and up_r.status_code not in (200, 201, 202):
-                raise RuntimeError(f"OneDrive chunk upload failed ({up_r.status_code}): {up_r.text[:300]}")
-            offset += len(piece)
+            buf.extend(part)
+        if not buf:
+            break
+        chunks.append(bytes(buf))
+    computed_total = sum(len(c) for c in chunks)
+    offset = 0
+    for c in chunks:
+        offset = push_resumable_chunk(upload_url, c, offset, computed_total)
+
 
 
 def update_file_content(file_id, data_or_stream, mime_type="text/plain; charset=utf-8", account_id=None):

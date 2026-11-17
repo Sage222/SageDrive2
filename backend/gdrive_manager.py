@@ -558,8 +558,7 @@ def ensure_folder_path(base_folder_id, parts, account_id=None):
             curr_id = created["id"]
     return curr_id
 
-def upload_file(parent_id, filename, data_or_stream, mime_type="application/octet-stream", relative_path=None, account_id=None):
-    svc = _svc(account_id=account_id)
+def resolve_upload_target(parent_id, filename, relative_path=None, account_id=None):
     target_parent = parent_id or "root"
     actual_name = filename
     if relative_path:
@@ -572,16 +571,152 @@ def upload_file(parent_id, filename, data_or_stream, mime_type="application/octe
             actual_name = segments[-1]
         elif segments:
             actual_name = segments[0]
-    stream_obj = data_or_stream if hasattr(data_or_stream, "read") else io.BytesIO(
-        data_or_stream if isinstance(data_or_stream, (bytes, bytearray)) else str(data_or_stream).encode("utf-8")
+    return target_parent, actual_name
+
+def start_resumable_upload(
+    parent_id,
+    filename,
+    mime_type="application/octet-stream",
+    total_size=None,
+    relative_path=None,
+    account_id=None,
+):
+    target_parent, actual_name = resolve_upload_target(
+        parent_id, filename, relative_path=relative_path, account_id=account_id
     )
-    media = MediaIoBaseUpload(stream_obj, mimetype=mime_type, chunksize=8 * 1024 * 1024, resumable=True)
-    svc.files().create(
-        body={"name": actual_name, "parents": [target_parent]},
-        media_body=media,
-        fields="id",
-        supportsAllDrives=True,
-    ).execute()
+    url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true"
+    for attempt in range(2):
+        c = _load_creds(force_refresh=(attempt > 0), account_id=account_id)
+        if not c:
+            raise RuntimeError("Not authenticated with Google Drive")
+        headers = {
+            "Authorization": f"Bearer {c.token}",
+            "Content-Type": "application/json; charset=UTF-8",
+            "X-Upload-Content-Type": mime_type or "application/octet-stream",
+        }
+        if total_size is not None and int(total_size) >= 0:
+            headers["X-Upload-Content-Length"] = str(int(total_size))
+        r = requests.post(
+            url,
+            headers=headers,
+            json={"name": actual_name, "parents": [target_parent]},
+            timeout=30,
+        )
+        if r.status_code in (401, 403) and attempt == 0:
+            continue
+        if not r.ok:
+            raise RuntimeError(f"Google Drive resumable init failed ({r.status_code}): {r.text[:300]}")
+        loc = r.headers.get("Location")
+        if not loc:
+            raise RuntimeError("Google Drive did not return a resumable upload Location header")
+        return loc
+    raise RuntimeError("Google Drive authentication failed after token refresh")
+
+def push_resumable_chunk(resumable_uri, chunk_bytes, offset, total_size=None):
+    chunk_len = len(chunk_bytes)
+    if chunk_len == 0:
+        return int(offset or 0)
+    end_byte = int(offset) + chunk_len - 1
+    total_str = str(int(total_size)) if (total_size is not None and int(total_size) > 0) else "*"
+    headers = {
+        "Content-Length": str(chunk_len),
+        "Content-Range": f"bytes {int(offset)}-{end_byte}/{total_str}",
+    }
+    r = requests.put(resumable_uri, data=chunk_bytes, headers=headers, timeout=300)
+    if r.status_code not in (200, 201, 308):
+        raise RuntimeError(f"Google Drive chunk upload failed ({r.status_code}): {r.text[:300]}")
+    return int(offset) + chunk_len
+
+def query_resumable_offset(resumable_uri, total_size=None):
+    total_str = str(int(total_size)) if (total_size is not None and int(total_size) > 0) else "*"
+    headers = {
+        "Content-Length": "0",
+        "Content-Range": f"bytes */{total_str}",
+    }
+    r = requests.put(resumable_uri, headers=headers, timeout=20)
+    if r.status_code in (200, 201):
+        return int(total_size or 0)
+    if r.status_code == 308:
+        rng = r.headers.get("Range") or ""
+        if "-" in rng:
+            try:
+                return int(rng.split("-")[-1].strip()) + 1
+            except Exception:
+                pass
+        return 0
+    raise RuntimeError(f"Google Drive session check failed ({r.status_code})")
+
+def cancel_resumable_upload(resumable_uri):
+    if not resumable_uri:
+        return
+    try:
+        requests.delete(resumable_uri, timeout=15)
+    except Exception:
+        pass
+
+def upload_file(
+    parent_id,
+    filename,
+    data_or_stream,
+    mime_type="application/octet-stream",
+    relative_path=None,
+    account_id=None,
+    total_size=None,
+):
+    if isinstance(data_or_stream, (bytes, bytearray)):
+        raw_bytes = bytes(data_or_stream)
+        total_size = len(raw_bytes)
+        stream_obj = io.BytesIO(raw_bytes)
+    elif hasattr(data_or_stream, "read"):
+        stream_obj = data_or_stream
+    else:
+        raw_bytes = str(data_or_stream).encode("utf-8")
+        total_size = len(raw_bytes)
+        stream_obj = io.BytesIO(raw_bytes)
+
+    resumable_uri = start_resumable_upload(
+        parent_id,
+        filename,
+        mime_type=mime_type,
+        total_size=total_size,
+        relative_path=relative_path,
+        account_id=account_id,
+    )
+    if total_size is not None and int(total_size) == 0:
+        r = requests.put(
+            resumable_uri,
+            data=b"",
+            headers={"Content-Length": "0", "Content-Range": "bytes */0"},
+            timeout=60,
+        )
+        if r.status_code not in (200, 201):
+            raise RuntimeError(f"Google Drive empty file upload failed ({r.status_code}): {r.text[:300]}")
+        return
+
+    chunk_unit = 5 * 1024 * 1024  # 5 MiB (multiple of 256 KiB required by Google Drive)
+    offset = 0
+    while True:
+        buf = bytearray()
+        while len(buf) < chunk_unit:
+            part = stream_obj.read(chunk_unit - len(buf))
+            if not part:
+                break
+            buf.extend(part)
+        if not buf:
+            if offset == 0:
+                requests.put(
+                    resumable_uri,
+                    data=b"",
+                    headers={"Content-Length": "0", "Content-Range": "bytes */0"},
+                    timeout=60,
+                )
+            break
+        is_last = len(buf) < chunk_unit
+        final_total = (offset + len(buf)) if (is_last and total_size is None) else total_size
+        offset = push_resumable_chunk(resumable_uri, bytes(buf), offset, total_size=final_total)
+        if is_last:
+            break
+
 
 def update_file_content(file_id, data_or_stream, mime_type="text/plain; charset=utf-8", account_id=None):
     _meta_cache.pop(_cache_key(account_id, file_id), None)

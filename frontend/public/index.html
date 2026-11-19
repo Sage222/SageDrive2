@@ -323,23 +323,29 @@
     .speed-btn:hover,.zoom-btn:hover{color:var(--color-text)}
     .speed-btn.active,.zoom-btn.active{background:var(--color-primary);color:#fff;font-weight:500}
     .video-stage{position:relative;width:100%;max-height:66vh;background:#000;
-                 border-radius:var(--radius-md);overflow:hidden;
+                 border-radius:0;overflow:visible;filter:none;backdrop-filter:none;transform:none;
                  display:flex;align-items:center;justify-content:center;user-select:none}
+    .video-stage.is-zoomed{overflow:hidden}
     .video-stage video{width:100%;max-height:66vh;display:block;background:#000;object-fit:contain;
-                       transform-origin:center center;transition:transform 160ms ease;cursor:pointer}
+                       border-radius:0;filter:none;backdrop-filter:none;transform:none;
+                       transform-origin:center center;cursor:pointer}
+    .video-stage.is-zoomed video{transition:transform 160ms ease}
     .video-stage:fullscreen,.video-stage:-webkit-full-screen{
-      max-height:100vh;width:100vw;height:100vh;border-radius:0;background:#000;
+      max-height:100vh;width:100vw;height:100vh;border-radius:0;background:#000;overflow:visible;
+    }
+    .video-stage.is-zoomed:fullscreen,.video-stage.is-zoomed:-webkit-full-screen{
+      overflow:hidden;
     }
     .video-stage:fullscreen video,.video-stage:-webkit-full-screen video{
-      max-height:100vh;width:100vw;height:100vh;object-fit:contain;
+      max-height:100vh;width:100vw;height:100vh;object-fit:contain;border-radius:0;filter:none;
     }
     .video-stage.hud-hidden{cursor:none}
-    .video-stage.hud-hidden .video-stage-hud{opacity:0;pointer-events:none;transform:translateY(8px)}
+    .video-stage.hud-hidden .video-stage-hud{opacity:0;visibility:hidden;pointer-events:none;transform:none}
     .video-stage-hud{position:absolute;left:0;right:0;bottom:0;z-index:10;
                      background:linear-gradient(to top, rgba(0,0,0,.88) 0%, rgba(0,0,0,.62) 68%, transparent 100%);
                      padding:var(--space-5) var(--space-3) var(--space-2);
                      display:flex;flex-direction:column;gap:6px;color:#fff;
-                     transition:opacity 180ms ease, transform 180ms ease}
+                     transition:opacity 180ms ease}
     .video-hud-row{display:flex;align-items:center;justify-content:space-between;gap:var(--space-2);flex-wrap:wrap}
     .video-hud-left,.video-hud-right{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
     .hud-btn{display:inline-flex;align-items:center;gap:4px;padding:4px 8px;
@@ -403,11 +409,14 @@
     .modal-backdrop{position:fixed;inset:0;background:oklch(0 0 0/.5);
                     backdrop-filter:blur(4px);z-index:100;display:flex;
                     align-items:center;justify-content:center;padding:var(--space-4)}
+    .modal-backdrop.video-modal-backdrop{backdrop-filter:none;-webkit-backdrop-filter:none;filter:none}
     .modal{background:var(--color-surface);border:1px solid var(--color-border);
            border-radius:var(--radius-xl);box-shadow:var(--shadow-lg);
            width:100%;max-width:480px;max-height:calc(100dvh - 24px);
            display:flex;flex-direction:column;overflow:hidden;
            animation:modal-in .2s ease}
+    .modal.video-modal{border-radius:0;overflow:visible;animation:none;transform:none;filter:none;backdrop-filter:none}
+    .modal.video-modal .modal-body{overflow:visible}
     @keyframes modal-in{from{opacity:0;transform:scale(.96) translateY(8px)}to{opacity:1;transform:none}}
     .modal-header{padding:var(--space-4) var(--space-5);
                   border-bottom:1px solid var(--color-divider);
@@ -2517,14 +2526,18 @@ function setPlaybackRate(rate) {
 
 function setVideoZoom(zoom) {
   _videoZoom = zoom;
+  const isDefaultZoom = Math.abs(zoom - 1) < 0.001;
   const player = document.getElementById('active-media-player');
+  const stage = document.getElementById('video-stage-container');
   if (player && _activeMediaState && _activeMediaState.isVid) {
-    player.style.transform = zoom === 1 ? 'scale(1)' : `scale(${zoom})`;
+    player.style.transform = isDefaultZoom ? 'none' : `scale(${zoom})`;
+  }
+  if (stage) {
+    stage.classList.toggle('is-zoomed', !isDefaultZoom);
   }
   document.querySelectorAll('.zoom-btn, .hud-zoom-btn').forEach(btn => {
     btn.classList.toggle('active', Math.abs(parseFloat(btn.dataset.zoom) - zoom) < 0.001);
   });
-  const stage = document.getElementById('video-stage-container');
   if (stage && stage._wakeHud) stage._wakeHud();
 }
 
@@ -2829,10 +2842,12 @@ function openMedia(fJson, type) {
     : 'Bluetooth Audio Delay: OFF (Click for +100ms audio delay)';
   var savedResume = isVid ? getSavedVideoProgress(f, type) : null;
 
+  var isDefaultZoom = Math.abs(_videoZoom - 1) < 0.001;
+  var videoTransformStyle = isDefaultZoom ? 'transform:none;border-radius:0;filter:none' : ('transform:scale(' + _videoZoom + ');border-radius:0;filter:none');
   var mediaEl = isVid
-    ? '<div id="video-stage-container" class="video-stage" title="Double-tap left for -15s, double-tap right for +15s">'
-        + '<video id="active-media-player" autoplay playsinline preload="auto" crossorigin="anonymous" '
-        +   'style="transform:scale(' + _videoZoom + ')">'
+    ? '<div id="video-stage-container" class="video-stage' + (isDefaultZoom ? '' : ' is-zoomed') + '" title="Double-tap left for -15s, double-tap right for +15s">'
+        + '<video id="active-media-player" autoplay playsinline preload="auto" '
+        +   'style="' + videoTransformStyle + '">'
         +   'Your browser cannot play this video.</video>'
         + '<div id="video-skip-left" class="video-skip-indicator left">'
         +   '<svg data-lucide="chevrons-left" width="18" height="18"></svg>'
@@ -2988,6 +3003,14 @@ function openMedia(fJson, type) {
     + '</div></div>',
     styleW
   );
+  if (isVid) {
+    const mb = document.getElementById('modal-backdrop');
+    if (mb) {
+      mb.classList.add('video-modal-backdrop');
+      const modalCard = mb.querySelector('.modal');
+      if (modalCard) modalCard.classList.add('video-modal');
+    }
+  }
   lucide.createIcons();
 
   const player = document.getElementById('active-media-player');
@@ -7062,8 +7085,8 @@ function showAddFileJumpModal() {
         <div class="form-group">
           <label class="form-label" for="fj-base-url">FileJump Server URL</label>
           <input class="form-input" id="fj-base-url" type="text"
-                 value="https://drive.filejump.com"
-                 placeholder="https://drive.filejump.com (or https://app.filejump.com)" />
+                 value="https://filejump.com"
+                 placeholder="https://filejump.com" />
         </div>
       </div>
       <div id="fj-webdav-fields" style="display:none;flex-direction:column;gap:var(--space-3)">
@@ -7124,7 +7147,7 @@ async function doConnectFileJump() {
     body.password = document.getElementById('fj-webdav-pass')?.value || '';
   } else {
     body.api_token = (document.getElementById('fj-api-token')?.value || '').trim();
-    body.base_url = (document.getElementById('fj-base-url')?.value || 'https://drive.filejump.com').trim();
+    body.base_url = (document.getElementById('fj-base-url')?.value || 'https://filejump.com').trim();
   }
   if (btn) {
     btn.disabled = true;

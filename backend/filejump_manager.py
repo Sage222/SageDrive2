@@ -18,8 +18,16 @@ import requests
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 ACCOUNTS_FILE = DATA_DIR / "filejump_accounts.json"
 
-DEFAULT_REST_BASE = os.getenv("FILEJUMP_API_URL", "https://drive.filejump.com").rstrip("/")
+DEFAULT_REST_BASE = os.getenv("FILEJUMP_API_URL", "https://filejump.com").rstrip("/")
+DEFAULT_UPLOAD_URL = os.getenv("FILEJUMP_UPLOAD_URL", "https://uploads.filejump.com/api/upload").rstrip("/")
 DEFAULT_WEBDAV_BASE = os.getenv("FILEJUMP_WEBDAV_URL", "https://uploads.filejump.com/dav").rstrip("/")
+
+LEGACY_FILEJUMP_HOSTS = {
+    "https://drive.filejump.com",
+    "http://drive.filejump.com",
+    "https://app.filejump.com",
+    "http://app.filejump.com",
+}
 
 RESERVED_SMB_NAMES = {"global", "homes", "printers", "print$", "ipc$"}
 
@@ -40,7 +48,10 @@ def _normalize_rest_base(url_str):
     for suffix in ("/api/v1", "/api"):
         if raw.endswith(suffix):
             raw = raw[:-len(suffix)]
-    return raw.rstrip("/")
+    raw = raw.rstrip("/")
+    if raw.lower() in LEGACY_FILEJUMP_HOSTS:
+        return "https://filejump.com"
+    return raw
 
 
 def _normalize_webdav_base(url_str):
@@ -56,6 +67,12 @@ def _ensure_smb_proxy_fields(accounts):
     used = set()
     changed = False
     for idx, acc in enumerate(accounts):
+        if acc.get("auth_type", "token") != "webdav":
+            cur_url = str(acc.get("api_url") or "").strip().rstrip("/")
+            norm_url = _normalize_rest_base(cur_url)
+            if cur_url != norm_url:
+                acc["api_url"] = norm_url
+                changed = True
         if "smb_enabled" not in acc:
             acc["smb_enabled"] = True
             changed = True
@@ -222,8 +239,10 @@ def is_authenticated(account_id=None):
 def _probe_rest_account(api_token, base_url=None, email_hint=""):
     candidates = []
     if base_url:
-        candidates.append(_normalize_rest_base(base_url))
-    for default_host in ("https://drive.filejump.com", "https://app.filejump.com", "https://filejump.com"):
+        norm = _normalize_rest_base(base_url)
+        if norm not in candidates:
+            candidates.append(norm)
+    for default_host in ("https://filejump.com", "https://drive.filejump.com"):
         if default_host not in candidates:
             candidates.append(default_host)
 
@@ -234,7 +253,14 @@ def _probe_rest_account(api_token, base_url=None, email_hint=""):
 
     last_err = None
     for host in candidates:
-        for probe_ep in ("/api/v1/drive/file-entries?perPage=1", "/api/v1/file-entries?perPage=1", "/api/v1/users/me"):
+        for probe_ep in (
+            "/api/auth/user",
+            "/api/files?per_page=1",
+            "/api/folders",
+            "/api/v1/auth/user",
+            "/api/v1/files?per_page=1",
+            "/api/v1/drive/file-entries?perPage=1",
+        ):
             try:
                 r = requests.get(f"{host}{probe_ep}", headers=headers, timeout=12)
                 if r.status_code in (401, 403):
@@ -246,12 +272,24 @@ def _probe_rest_account(api_token, base_url=None, email_hint=""):
                         data = r.json()
                     except Exception:
                         pass
-                    user_obj = data.get("user") if isinstance(data, dict) else None
+                    user_obj = None
+                    if isinstance(data, dict):
+                        if isinstance(data.get("user"), dict):
+                            user_obj = data["user"]
+                        elif isinstance(data.get("data"), dict) and ("email" in data["data"] or "name" in data["data"]):
+                            user_obj = data["data"]
+                        elif "email" in data:
+                            user_obj = data
                     detected_email = email_hint
                     detected_name = ""
                     if isinstance(user_obj, dict):
                         detected_email = user_obj.get("email") or detected_email
-                        detected_name = user_obj.get("display_name") or user_obj.get("first_name") or ""
+                        detected_name = (
+                            user_obj.get("name")
+                            or user_obj.get("display_name")
+                            or user_obj.get("first_name")
+                            or ""
+                        )
                     return {
                         "api_url": host,
                         "email": detected_email or "",
@@ -462,12 +500,13 @@ def _parse_webdav_multistatus(xml_bytes, base_url, requested_norm_path):
     return items
 
 
-# ── REST API Implementation Helpers ───────────────────────────────────────────
-def _rest_headers(acc, content_type=None):
+# ── REST API Implementation Helpers (https://filejump.com/kb/api-guide) ───────
+def _rest_headers(acc, content_type=None, accept="application/json"):
     h = {
         "Authorization": f"Bearer {acc.get('api_token') or ''}",
-        "Accept": "application/json",
     }
+    if accept:
+        h["Accept"] = accept
     if content_type:
         h["Content-Type"] = content_type
     return h
@@ -477,96 +516,180 @@ def _rest_base(acc):
     return _normalize_rest_base(acc.get("api_url") or DEFAULT_REST_BASE)
 
 
-def _normalize_rest_entry(item):
+def _parse_rest_id(raw_id):
+    """
+    Returns (is_explicit_folder: bool, clean_id: str | None).
+    Folder IDs returned to the UI are prefixed with 'folder:' so that numeric
+    folder IDs and numeric file IDs from /api/folders and /api/files never collide.
+    """
+    if raw_id is None:
+        return True, None
+    s = str(raw_id).strip()
+    if s in ("", "root", "/", "0", "folder:root", "folder:0", "folder:/"):
+        return True, None
+    if s.startswith("folder:"):
+        return True, s[len("folder:"):].strip()
+    if s.startswith("file:"):
+        return False, s[len("file:"):].strip()
+    return False, s
+
+
+def _extract_list_from_payload(payload, *keys):
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    data_val = payload.get("data")
+    if isinstance(data_val, list):
+        return data_val
+    if isinstance(data_val, dict):
+        if isinstance(data_val.get("data"), list):
+            return data_val["data"]
+        for k in keys:
+            if isinstance(data_val.get(k), list):
+                return data_val[k]
+    for k in keys:
+        if isinstance(payload.get(k), list):
+            return payload[k]
+    return []
+
+
+def _normalize_rest_entry(item, force_type=None):
     if not isinstance(item, dict):
         return None
-    raw_type = str(item.get("type") or "").lower()
-    is_folder = raw_type == "folder" or bool(item.get("is_folder"))
-    entry_id = str(item.get("id") if item.get("id") is not None else item.get("hash") or "")
-    if not entry_id:
+    raw_type = str(force_type or item.get("type") or "").lower()
+    is_folder = (
+        raw_type == "folder"
+        or bool(item.get("is_folder"))
+        or ("parent_id" in item and "mime_type" not in item and "file_size" not in item and "size" not in item)
+    )
+    raw_id = item.get("id") if item.get("id") is not None else item.get("hash")
+    if raw_id is None or str(raw_id) == "":
         return None
-    name = item.get("name") or item.get("file_name") or entry_id
-    size = 0 if is_folder else int(item.get("file_size") or item.get("size") or 0)
+    clean_id = str(raw_id).strip()
+    if clean_id.startswith("folder:"):
+        clean_id = clean_id[len("folder:"):]
+    entry_id = f"folder:{clean_id}" if is_folder else clean_id
+    name = item.get("name") or item.get("file_name") or clean_id
+    size = 0 if is_folder else int(item.get("size") or item.get("file_size") or 0)
     modified = item.get("updated_at") or item.get("created_at") or datetime.now(timezone.utc).isoformat()
     mime = (
         "application/vnd.filejump.folder"
         if is_folder
-        else (item.get("mime") or mimetypes.guess_type(name)[0] or "application/octet-stream")
+        else (
+            item.get("mime_type")
+            or item.get("mime")
+            or mimetypes.guess_type(name)[0]
+            or "application/octet-stream"
+        )
     )
     return {
         "id": entry_id,
-        "hash": item.get("hash") or entry_id,
+        "raw_id": clean_id,
+        "hash": item.get("hash") or clean_id,
         "name": name,
         "type": "folder" if is_folder else "file",
         "size": size,
         "modified": modified,
         "mimeType": mime,
-        "url": item.get("url") or "",
+        "url": item.get("download_url") or item.get("url") or "",
+        "parent_id": item.get("folder_id") if not is_folder else item.get("parent_id"),
     }
 
 
 def _rest_get_entry_raw(acc, file_id):
     base = _rest_base(acc)
     headers = _rest_headers(acc)
-    for ep in (
-        f"/api/v1/file-entries/{quote(str(file_id))}",
-        f"/api/v1/drive/file-entries/{quote(str(file_id))}",
-        f"/api/v1/entries/{quote(str(file_id))}",
-    ):
+    is_folder_hint, clean_id = _parse_rest_id(file_id)
+    if not clean_id:
+        return {"id": "root", "name": "root", "type": "folder", "size": 0}
+
+    q_id = quote(str(clean_id))
+    if is_folder_hint:
+        endpoints = [
+            (f"/api/folders/{q_id}", "folder"),
+            (f"/api/v1/folders/{q_id}", "folder"),
+            (f"/api/v1/file-entries/{q_id}", "folder"),
+            (f"/api/v1/drive/file-entries/{q_id}", "folder"),
+        ]
+    else:
+        endpoints = [
+            (f"/api/files/{q_id}", "file"),
+            (f"/api/v1/files/{q_id}", "file"),
+            (f"/api/folders/{q_id}", "folder"),
+            (f"/api/v1/file-entries/{q_id}", None),
+            (f"/api/v1/drive/file-entries/{q_id}", None),
+        ]
+
+    for ep, ftype in endpoints:
         r = requests.get(f"{base}{ep}", headers=headers, timeout=20)
         if r.status_code == 404:
             continue
         if r.status_code < 400:
             data = r.json()
             if isinstance(data, dict):
-                entry = data.get("fileEntry") or data.get("entry") or data.get("data") or data
+                entry = (
+                    data.get("data")
+                    or data.get("file")
+                    or data.get("folder")
+                    or data.get("fileEntry")
+                    or data.get("entry")
+                    or data
+                )
                 if isinstance(entry, dict) and (entry.get("id") is not None or entry.get("name")):
+                    if ftype and "type" not in entry:
+                        entry = dict(entry)
+                        entry["type"] = ftype
                     return entry
     raise FileNotFoundError(f"FileJump entry '{file_id}' not found")
 
 
 def _rest_open_download_response(acc, file_id, range_header=None):
     base = _rest_base(acc)
-    headers = _rest_headers(acc)
+    _, clean_id = _parse_rest_id(file_id)
+    if not clean_id:
+        raise ValueError("Cannot download root folder directly")
+
+    # Note: Do NOT send Accept: application/json when requesting the binary stream,
+    # because /api/files/{id}/download returns JSON instead of redirecting if Accept: application/json is set.
+    stream_headers = _rest_headers(acc, accept="*/*")
     if range_header:
-        headers["Range"] = range_header
+        stream_headers["Range"] = range_header
 
-    entry_hash = None
-    entry_url = None
-    try:
-        raw = _rest_get_entry_raw(acc, file_id)
-        entry_hash = raw.get("hash")
-        entry_url = raw.get("url")
-    except Exception:
-        pass
-
-    candidate_urls = []
-    if entry_url:
-        if entry_url.startswith(("http://", "https://")):
-            candidate_urls.append(entry_url)
-        else:
-            candidate_urls.append(f"{base}/{entry_url.lstrip('/')}")
-    if entry_hash:
-        candidate_urls.append(f"{base}/api/v1/file-entries/download/{quote(str(entry_hash))}")
-    candidate_urls.extend([
-        f"{base}/api/v1/file-entries/download/{quote(str(file_id))}",
-        f"{base}/api/v1/file-entries/{quote(str(file_id))}?alt=media",
-        f"{base}/api/v1/uploads/{quote(str(file_id))}",
-    ])
+    q_id = quote(str(clean_id))
+    candidate_urls = [
+        f"{base}/api/files/{q_id}/download",
+        f"{base}/api/files/download/{q_id}",
+        f"{base}/api/v1/files/{q_id}/download",
+        f"{base}/api/v1/files/download/{q_id}",
+        f"{base}/api/v1/file-entries/download/{q_id}",
+    ]
 
     last_resp = None
     for url in candidate_urls:
-        r = requests.get(url, headers=headers, stream=True, timeout=(15, 300), allow_redirects=True)
+        r = requests.get(url, headers=stream_headers, stream=True, timeout=(15, 300), allow_redirects=True)
+        if r.status_code == 404:
+            r.close()
+            continue
         if r.status_code < 400:
             ctype = (r.headers.get("Content-Type") or "").lower()
-            if "application/json" in ctype and not url.endswith("alt=media"):
+            if "application/json" in ctype:
                 try:
                     j = r.json()
-                    dl_url = j.get("url") or j.get("download_url")
+                    data_obj = j.get("data") if isinstance(j.get("data"), dict) else j
+                    dl_url = (
+                        (data_obj.get("download_url") if isinstance(data_obj, dict) else None)
+                        or j.get("download_url")
+                        or j.get("url")
+                    )
                     if dl_url:
                         r.close()
-                        dl_headers = {"Range": range_header} if range_header else {}
-                        r2 = requests.get(dl_url, headers=dl_headers, stream=True, timeout=(15, 300))
+                        dl_headers = {"Accept": "*/*"}
+                        if range_header:
+                            dl_headers["Range"] = range_header
+                        if urlparse(dl_url).netloc == urlparse(base).netloc:
+                            dl_headers["Authorization"] = f"Bearer {acc.get('api_token') or ''}"
+                        r2 = requests.get(dl_url, headers=dl_headers, stream=True, timeout=(15, 300), allow_redirects=True)
                         if r2.status_code < 400:
                             return r2
                 except Exception:
@@ -602,22 +725,99 @@ def list_files(folder_id="root", account_id=None):
 
     base = _rest_base(acc)
     headers = _rest_headers(acc)
+    _, clean_parent_id = _parse_rest_id(folder_id)
+
+    # 1. Official FileJump REST API (/api/folders + /api/files)
+    folder_params = {}
+    if clean_parent_id:
+        folder_params["parent_id"] = clean_parent_id
+
+    r_folders = requests.get(f"{base}/api/folders", headers=headers, params=folder_params, timeout=30)
+    if r_folders.status_code != 404:
+        r_folders.raise_for_status()
+        raw_folders = _extract_list_from_payload(r_folders.json(), "folders", "entries")
+
+        # If inside a subfolder and /api/folders?parent_id=... returned empty, also check /api/folders/all
+        if clean_parent_id and not raw_folders:
+            try:
+                r_all_f = requests.get(f"{base}/api/folders/all", headers=headers, timeout=20)
+                if r_all_f.status_code < 400:
+                    raw_folders = _extract_list_from_payload(r_all_f.json(), "folders", "entries")
+            except Exception:
+                pass
+
+        out = []
+        seen_ids = set()
+        for raw_f in raw_folders:
+            if not isinstance(raw_f, dict):
+                continue
+            if "parent_id" in raw_f or "parentId" in raw_f:
+                f_parent = raw_f.get("parent_id") if "parent_id" in raw_f else raw_f.get("parentId")
+                if clean_parent_id is None:
+                    if f_parent not in (None, "", 0, "0", "root"):
+                        continue
+                else:
+                    if str(f_parent) != str(clean_parent_id):
+                        continue
+            norm = _normalize_rest_entry(raw_f, force_type="folder")
+            if norm and norm["id"] not in seen_ids:
+                seen_ids.add(norm["id"])
+                out.append({
+                    "id": norm["id"],
+                    "name": norm["name"],
+                    "type": "folder",
+                    "size": 0,
+                    "modified": norm["modified"],
+                    "mimeType": norm["mimeType"],
+                })
+
+        file_params = {"per_page": 500}
+        if clean_parent_id:
+            file_params["folder_id"] = clean_parent_id
+        r_files = requests.get(f"{base}/api/files", headers=headers, params=file_params, timeout=30)
+        r_files.raise_for_status()
+        raw_files = _extract_list_from_payload(r_files.json(), "files", "fileEntries", "entries")
+
+        for raw_item in raw_files:
+            if not isinstance(raw_item, dict):
+                continue
+            if "folder_id" in raw_item or "folderId" in raw_item:
+                item_folder = raw_item.get("folder_id") if "folder_id" in raw_item else raw_item.get("folderId")
+                if clean_parent_id is None:
+                    if item_folder not in (None, "", 0, "0", "root"):
+                        continue
+                else:
+                    if str(item_folder) != str(clean_parent_id):
+                        continue
+            norm = _normalize_rest_entry(raw_item, force_type="file")
+            if norm and norm["id"] not in seen_ids:
+                seen_ids.add(norm["id"])
+                out.append({
+                    "id": norm["id"],
+                    "name": norm["name"],
+                    "type": norm["type"],
+                    "size": norm["size"],
+                    "modified": norm["modified"],
+                    "mimeType": norm["mimeType"],
+                })
+
+        out.sort(key=lambda x: (0 if x["type"] == "folder" else 1, x["name"].lower()))
+        return out
+
+    # 2. Fallback for legacy / self-hosted instances
     params = {"perPage": 500}
-    if folder_id and folder_id not in ("root", "/", "0"):
-        params["folderId"] = folder_id
-        params["parentIds"] = folder_id
+    if clean_parent_id:
+        params["folderId"] = clean_parent_id
+        params["parentIds"] = clean_parent_id
 
     for ep in ("/api/v1/drive/file-entries", "/api/v1/file-entries"):
         r = requests.get(f"{base}{ep}", headers=headers, params=params, timeout=30)
         if r.status_code == 404:
             continue
         r.raise_for_status()
-        payload = r.json()
-        raw_list = payload.get("data") if isinstance(payload, dict) else payload
-        if not isinstance(raw_list, list) and isinstance(payload, dict):
-            raw_list = payload.get("fileEntries") or payload.get("entries") or []
+        raw_list = _extract_list_from_payload(r.json(), "fileEntries", "entries")
         out = []
-        for raw_item in raw_list or []:
+        for raw_item in raw_list:
             norm = _normalize_rest_entry(raw_item)
             if norm:
                 out.append({
@@ -676,8 +876,9 @@ def get_file_meta(file_id, account_id=None):
             "isFolder": is_dir,
         }
 
+    is_folder_hint, _ = _parse_rest_id(file_id)
     raw = _rest_get_entry_raw(acc, file_id)
-    norm = _normalize_rest_entry(raw)
+    norm = _normalize_rest_entry(raw, force_type="folder" if is_folder_hint else None)
     return {
         "id": norm["id"],
         "name": norm["name"],
@@ -734,14 +935,32 @@ def create_folder(parent_id, name, account_id=None):
 
     base = _rest_base(acc)
     headers = _rest_headers(acc, "application/json")
-    body = {"name": name}
-    if parent_id and parent_id not in ("root", "/", "0"):
-        body["parentId"] = parent_id
-    r = requests.post(f"{base}/api/v1/folders", headers=headers, json=body, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    folder = data.get("folder") or data.get("fileEntry") or data.get("data") or data
-    return str(folder.get("id") or folder.get("hash") or name)
+    _, clean_parent = _parse_rest_id(parent_id)
+    parent_val = None
+    if clean_parent:
+        parent_val = int(clean_parent) if str(clean_parent).isdigit() else clean_parent
+
+    body = {"name": name, "parent_id": parent_val}
+    if parent_val is not None:
+        body["parentId"] = parent_val
+
+    last_resp = None
+    for ep in ("/api/folders", "/api/v1/folders"):
+        r = requests.post(f"{base}{ep}", headers=headers, json=body, timeout=20)
+        if r.status_code == 404:
+            last_resp = r
+            continue
+        r.raise_for_status()
+        data = r.json()
+        folder = data.get("data") or data.get("folder") or data.get("fileEntry") or data
+        raw_fid = folder.get("id") if isinstance(folder, dict) else None
+        if raw_fid is not None:
+            return f"folder:{raw_fid}"
+        return f"folder:{name}"
+
+    if last_resp is not None:
+        last_resp.raise_for_status()
+    raise RuntimeError("Failed to create folder on FileJump")
 
 
 def ensure_folder_path(base_folder_id, parts, account_id=None):
@@ -865,9 +1084,10 @@ def upload_file(
 
     base = _rest_base(acc)
     headers = {"Authorization": f"Bearer {acc.get('api_token') or ''}", "Accept": "application/json"}
+    _, clean_parent = _parse_rest_id(target_parent)
     form_data = {}
-    if target_parent and target_parent not in ("root", "/", "0"):
-        form_data["parentId"] = str(target_parent)
+    if clean_parent:
+        form_data["folder_id"] = str(clean_parent)
 
     if isinstance(data_or_stream, (bytes, bytearray)):
         stream_obj = io.BytesIO(data_or_stream)
@@ -875,6 +1095,8 @@ def upload_file(
             total_size = len(data_or_stream)
     else:
         stream_obj = data_or_stream
+
+    upload_url = DEFAULT_UPLOAD_URL if "filejump.com" in base else f"{base}/api/files/upload"
 
     # When total_size is known, stream multipart/form-data directly without buffering in RAM
     if total_size is not None and int(total_size) >= 0 and not hasattr(stream_obj, "seek"):
@@ -899,18 +1121,25 @@ def upload_file(
         req_headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
         req_headers["Content-Length"] = str(mp_reader.total_length)
         r = requests.post(
-            f"{base}/api/v1/uploads",
+            upload_url,
             headers=req_headers,
             data=mp_reader,
             timeout=(20, 14400),
         )
         r.raise_for_status()
         resp = r.json()
-        entry = resp.get("fileEntry") or resp.get("data") or resp
-        return str(entry.get("id") or entry.get("hash") or actual_name)
+        entry = resp.get("data") or resp.get("file") or resp.get("fileEntry") or resp
+        return str((entry.get("id") if isinstance(entry, dict) else None) or actual_name)
 
+    candidate_upload_urls = [
+        upload_url,
+        f"{base}/api/files/upload",
+        f"{base}/api/files",
+        f"{base}/api/v1/files/upload",
+        f"{base}/api/v1/uploads",
+    ]
     last_err = None
-    for ep in ("/api/v1/uploads", "/api/v1/file-entries", "/api/v1/files"):
+    for u_url in candidate_upload_urls:
         try:
             if hasattr(stream_obj, "seek"):
                 try:
@@ -918,20 +1147,19 @@ def upload_file(
                 except Exception:
                     pass
             files = {"file": (actual_name, stream_obj, mime_type or "application/octet-stream")}
-            r = requests.post(f"{base}{ep}", headers=headers, data=form_data, files=files, timeout=(20, 14400))
+            r = requests.post(u_url, headers=headers, data=form_data, files=files, timeout=(20, 14400))
             if r.status_code == 404:
                 continue
             r.raise_for_status()
             resp = r.json()
-            entry = resp.get("fileEntry") or resp.get("data") or resp
-            return str(entry.get("id") or entry.get("hash") or actual_name)
+            entry = resp.get("data") or resp.get("file") or resp.get("fileEntry") or resp
+            return str((entry.get("id") if isinstance(entry, dict) else None) or actual_name)
         except Exception as e:
             last_err = e
             continue
     if last_err:
         raise last_err
     raise RuntimeError("FileJump upload failed")
-
 
 
 def update_file_content(file_id, data_or_stream, mime_type="text/plain; charset=utf-8", account_id=None):
@@ -956,7 +1184,7 @@ def update_file_content(file_id, data_or_stream, mime_type="text/plain; charset=
         return {"id": _webdav_norm_path(file_id), "size": len(raw_bytes)}
 
     raw_entry = _rest_get_entry_raw(acc, file_id)
-    parent_id = raw_entry.get("parent_id") or "root"
+    parent_id = raw_entry.get("folder_id") or raw_entry.get("parent_id") or "root"
     name = raw_entry.get("name") or raw_entry.get("file_name") or "file.txt"
     new_id = upload_file(parent_id, name, raw_bytes, mime_type=mime_type, account_id=account_id)
     if str(new_id) != str(file_id):
@@ -990,15 +1218,38 @@ def move_file(file_id, dest_folder_id, account_id=None):
 
     base = _rest_base(acc)
     headers = _rest_headers(acc, "application/json")
-    dest_val = None if (not dest_folder_id or dest_folder_id in ("root", "/", "0")) else dest_folder_id
-    r = requests.post(
-        f"{base}/api/v1/file-entries/move",
-        headers=headers,
-        json={"entryIds": [file_id], "destinationId": dest_val},
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()
+    is_folder_hint, clean_id = _parse_rest_id(file_id)
+    _, clean_dest = _parse_rest_id(dest_folder_id)
+    dest_val = None
+    if clean_dest:
+        dest_val = int(clean_dest) if str(clean_dest).isdigit() else clean_dest
+
+    q_id = quote(str(clean_id))
+    if is_folder_hint:
+        endpoints = [
+            (f"/api/folders/{q_id}/move", {"parent_id": dest_val}),
+            (f"/api/v1/folders/{q_id}/move", {"parent_id": dest_val}),
+        ]
+    else:
+        endpoints = [
+            (f"/api/files/{q_id}/move", {"folder_id": dest_val, "workspace_id": None}),
+            (f"/api/v1/files/{q_id}/move", {"folder_id": dest_val, "workspace_id": None}),
+            (f"/api/folders/{q_id}/move", {"parent_id": dest_val}),
+            ("/api/v1/file-entries/move", {"entryIds": [clean_id], "destinationId": dest_val}),
+        ]
+
+    last_resp = None
+    for ep, payload in endpoints:
+        r = requests.post(f"{base}{ep}", headers=headers, json=payload, timeout=30)
+        if r.status_code == 404:
+            last_resp = r
+            continue
+        r.raise_for_status()
+        return r.json()
+
+    if last_resp is not None:
+        last_resp.raise_for_status()
+    raise RuntimeError(f"Failed to move FileJump item '{file_id}'")
 
 
 def rename_file(file_id, new_name, account_id=None):
@@ -1024,16 +1275,25 @@ def rename_file(file_id, new_name, account_id=None):
 
     base = _rest_base(acc)
     headers = _rest_headers(acc, "application/json")
-    for method in ("put", "patch", "post"):
-        r = getattr(requests, method)(
-            f"{base}/api/v1/file-entries/{quote(str(file_id))}",
-            headers=headers,
-            json={"name": new_name},
-            timeout=20,
-        )
+    is_folder_hint, clean_id = _parse_rest_id(file_id)
+    q_id = quote(str(clean_id))
+    if is_folder_hint:
+        endpoints = [f"/api/folders/{q_id}", f"/api/v1/folders/{q_id}", f"/api/v1/file-entries/{q_id}"]
+    else:
+        endpoints = [f"/api/files/{q_id}", f"/api/v1/files/{q_id}", f"/api/folders/{q_id}", f"/api/v1/file-entries/{q_id}"]
+
+    last_resp = None
+    for ep in endpoints:
+        r = requests.put(f"{base}{ep}", headers=headers, json={"name": new_name}, timeout=20)
+        if r.status_code == 404:
+            last_resp = r
+            continue
         if r.status_code < 400:
             return r.json()
-    r.raise_for_status()
+        last_resp = r
+    if last_resp is not None:
+        last_resp.raise_for_status()
+    raise RuntimeError(f"Failed to rename FileJump item '{file_id}'")
 
 
 def delete_file(file_id, account_id=None):
@@ -1047,15 +1307,30 @@ def delete_file(file_id, account_id=None):
 
     base = _rest_base(acc)
     headers = _rest_headers(acc, "application/json")
-    for ep, method, payload in (
-        ("/api/v1/file-entries/delete", "post", {"entryIds": [file_id], "deleteForever": False}),
-        ("/api/v1/file-entries", "delete", {"entryIds": [file_id]}),
-        (f"/api/v1/file-entries/{quote(str(file_id))}", "delete", None),
-    ):
+    is_folder_hint, clean_id = _parse_rest_id(file_id)
+    q_id = quote(str(clean_id))
+    if is_folder_hint:
+        candidates = [
+            (f"/api/folders/{q_id}", "delete", None),
+            (f"/api/v1/folders/{q_id}", "delete", None),
+        ]
+    else:
+        candidates = [
+            (f"/api/files/{q_id}", "delete", None),
+            (f"/api/v1/files/{q_id}", "delete", None),
+            (f"/api/folders/{q_id}", "delete", None),
+            ("/api/v1/file-entries/delete", "post", {"entryIds": [clean_id], "deleteForever": False}),
+            (f"/api/v1/file-entries/{q_id}", "delete", None),
+        ]
+
+    last_resp = None
+    for ep, method, payload in candidates:
         r = getattr(requests, method)(f"{base}{ep}", headers=headers, json=payload, timeout=30)
-        if r.status_code < 400 or r.status_code == 404:
+        if r.status_code < 400:
             return
-    r.raise_for_status()
+        last_resp = r
+    if last_resp is not None and last_resp.status_code != 404:
+        last_resp.raise_for_status()
 
 
 def _add_filejump_item_to_zip(zf, file_id, arc_prefix="", account_id=None):

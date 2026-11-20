@@ -7083,10 +7083,10 @@ function showAddFileJumpModal() {
           </span>
         </div>
         <div class="form-group">
-          <label class="form-label" for="fj-base-url">FileJump Server URL</label>
+          <label class="form-label" for="fj-base-url">FileJump API URL</label>
           <input class="form-input" id="fj-base-url" type="text"
-                 value="https://filejump.com"
-                 placeholder="https://filejump.com" />
+                 value="https://filejump.com/api"
+                 placeholder="https://filejump.com/api" />
         </div>
       </div>
       <div id="fj-webdav-fields" style="display:none;flex-direction:column;gap:var(--space-3)">
@@ -7147,7 +7147,7 @@ async function doConnectFileJump() {
     body.password = document.getElementById('fj-webdav-pass')?.value || '';
   } else {
     body.api_token = (document.getElementById('fj-api-token')?.value || '').trim();
-    body.base_url = (document.getElementById('fj-base-url')?.value || 'https://filejump.com').trim();
+    body.base_url = (document.getElementById('fj-base-url')?.value || 'https://filejump.com/api').trim();
   }
   if (btn) {
     btn.disabled = true;

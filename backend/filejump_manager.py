@@ -18,7 +18,7 @@ import requests
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 ACCOUNTS_FILE = DATA_DIR / "filejump_accounts.json"
 
-DEFAULT_REST_BASE = os.getenv("FILEJUMP_API_URL", "https://filejump.com").rstrip("/")
+DEFAULT_REST_BASE = os.getenv("FILEJUMP_API_URL", "https://filejump.com/api").rstrip("/")
 DEFAULT_UPLOAD_URL = os.getenv("FILEJUMP_UPLOAD_URL", "https://uploads.filejump.com/api/upload").rstrip("/")
 DEFAULT_WEBDAV_BASE = os.getenv("FILEJUMP_WEBDAV_URL", "https://uploads.filejump.com/dav").rstrip("/")
 
@@ -27,6 +27,8 @@ LEGACY_FILEJUMP_HOSTS = {
     "http://drive.filejump.com",
     "https://app.filejump.com",
     "http://app.filejump.com",
+    "https://filejump.com",
+    "http://filejump.com",
 }
 
 RESERVED_SMB_NAMES = {"global", "homes", "printers", "print$", "ipc$"}
@@ -39,7 +41,10 @@ def sanitize_smb_share_name(raw_name, fallback="FileJump"):
     return cleaned[:32]
 
 
-def _normalize_rest_base(url_str):
+def _normalize_rest_api_url(url_str):
+    """
+    Normalizes any FileJump REST URL to the canonical API root (https://filejump.com/api).
+    """
     raw = str(url_str or DEFAULT_REST_BASE).strip().rstrip("/")
     if not raw:
         raw = DEFAULT_REST_BASE
@@ -50,8 +55,19 @@ def _normalize_rest_base(url_str):
             raw = raw[:-len(suffix)]
     raw = raw.rstrip("/")
     if raw.lower() in LEGACY_FILEJUMP_HOSTS:
-        return "https://filejump.com"
-    return raw
+        return "https://filejump.com/api"
+    return f"{raw}/api"
+
+
+def _normalize_rest_base(url_str):
+    """
+    Returns the host origin without trailing /api (e.g. https://filejump.com)
+    so callers that append /api/... always target https://filejump.com/api/...
+    """
+    api_url = _normalize_rest_api_url(url_str)
+    if api_url.endswith("/api"):
+        return api_url[:-4]
+    return api_url
 
 
 def _normalize_webdav_base(url_str):
@@ -69,9 +85,12 @@ def _ensure_smb_proxy_fields(accounts):
     for idx, acc in enumerate(accounts):
         if acc.get("auth_type", "token") != "webdav":
             cur_url = str(acc.get("api_url") or "").strip().rstrip("/")
-            norm_url = _normalize_rest_base(cur_url)
+            norm_url = _normalize_rest_api_url(cur_url)
             if cur_url != norm_url:
                 acc["api_url"] = norm_url
+                changed = True
+            if acc.get("upload_url") != DEFAULT_UPLOAD_URL:
+                acc["upload_url"] = DEFAULT_UPLOAD_URL
                 changed = True
         if "smb_enabled" not in acc:
             acc["smb_enabled"] = True
@@ -125,14 +144,20 @@ def list_accounts():
     accounts = _load_accounts_raw()
     out = []
     for a in accounts:
+        auth_t = a.get("auth_type", "token")
         out.append({
             "id": a.get("id", "default"),
             "name": a.get("custom_name") or a.get("name") or "FileJump",
             "custom_name": a.get("custom_name", ""),
             "original_name": a.get("original_name") or a.get("name") or "FileJump",
             "email": a.get("email", ""),
-            "auth_type": a.get("auth_type", "token"),
-            "api_url": a.get("api_url") or (DEFAULT_WEBDAV_BASE if a.get("auth_type") == "webdav" else DEFAULT_REST_BASE),
+            "auth_type": auth_t,
+            "api_url": (
+                _normalize_webdav_base(a.get("api_url"))
+                if auth_t == "webdav"
+                else _normalize_rest_api_url(a.get("api_url"))
+            ),
+            "upload_url": DEFAULT_UPLOAD_URL if auth_t != "webdav" else "",
             "smb_enabled": bool(a.get("smb_enabled", True)),
             "smb_share_name": a.get("smb_share_name") or "FileJump",
         })
@@ -237,72 +262,56 @@ def is_authenticated(account_id=None):
 
 
 def _probe_rest_account(api_token, base_url=None, email_hint=""):
-    candidates = []
-    if base_url:
-        norm = _normalize_rest_base(base_url)
-        if norm not in candidates:
-            candidates.append(norm)
-    for default_host in ("https://filejump.com", "https://drive.filejump.com"):
-        if default_host not in candidates:
-            candidates.append(default_host)
-
+    api_base = _normalize_rest_api_url(base_url or DEFAULT_REST_BASE)
     headers = {
         "Authorization": f"Bearer {api_token}",
         "Accept": "application/json",
     }
 
     last_err = None
-    for host in candidates:
-        for probe_ep in (
-            "/api/auth/user",
-            "/api/files?per_page=1",
-            "/api/folders",
-            "/api/v1/auth/user",
-            "/api/v1/files?per_page=1",
-            "/api/v1/drive/file-entries?perPage=1",
-        ):
-            try:
-                r = requests.get(f"{host}{probe_ep}", headers=headers, timeout=12)
-                if r.status_code in (401, 403):
-                    last_err = f"FileJump API rejected token ({r.status_code})"
-                    continue
-                if r.status_code < 400:
-                    data = {}
-                    try:
-                        data = r.json()
-                    except Exception:
-                        pass
-                    user_obj = None
-                    if isinstance(data, dict):
-                        if isinstance(data.get("user"), dict):
-                            user_obj = data["user"]
-                        elif isinstance(data.get("data"), dict) and ("email" in data["data"] or "name" in data["data"]):
-                            user_obj = data["data"]
-                        elif "email" in data:
-                            user_obj = data
-                    detected_email = email_hint
-                    detected_name = ""
-                    if isinstance(user_obj, dict):
-                        detected_email = user_obj.get("email") or detected_email
-                        detected_name = (
-                            user_obj.get("name")
-                            or user_obj.get("display_name")
-                            or user_obj.get("first_name")
-                            or ""
-                        )
-                    return {
-                        "api_url": host,
-                        "email": detected_email or "",
-                        "display_name": detected_name,
-                    }
-            except Exception as e:
-                last_err = str(e)
+    for probe_ep in ("/auth/user", "/files?per_page=1", "/folders"):
+        try:
+            r = requests.get(f"{api_base}{probe_ep}", headers=headers, timeout=12)
+            if r.status_code in (401, 403):
+                last_err = f"FileJump API rejected token ({r.status_code})"
                 continue
+            if r.status_code < 400:
+                data = {}
+                try:
+                    data = r.json()
+                except Exception:
+                    pass
+                user_obj = None
+                if isinstance(data, dict):
+                    if isinstance(data.get("user"), dict):
+                        user_obj = data["user"]
+                    elif isinstance(data.get("data"), dict) and ("email" in data["data"] or "name" in data["data"]):
+                        user_obj = data["data"]
+                    elif "email" in data:
+                        user_obj = data
+                detected_email = email_hint
+                detected_name = ""
+                if isinstance(user_obj, dict):
+                    detected_email = user_obj.get("email") or detected_email
+                    detected_name = (
+                        user_obj.get("name")
+                        or user_obj.get("display_name")
+                        or user_obj.get("first_name")
+                        or ""
+                    )
+                return {
+                    "api_url": api_base,
+                    "email": detected_email or "",
+                    "display_name": detected_name,
+                }
+        except Exception as e:
+            last_err = str(e)
+            continue
 
     if last_err and "rejected token" in last_err:
         raise ValueError(last_err)
     return {
-        "api_url": candidates[0] if candidates else DEFAULT_REST_BASE,
+        "api_url": api_base,
         "email": email_hint or "",
         "display_name": "",
     }
@@ -367,6 +376,8 @@ def add_account(auth_type="token", api_token="", email="", api_url="", custom_na
         target["auth_type"] = auth_type
         target["api_token"] = api_token
         target["api_url"] = resolved_url
+        if auth_type != "webdav":
+            target["upload_url"] = DEFAULT_UPLOAD_URL
         if resolved_email:
             target["email"] = resolved_email
         if custom_name:
@@ -390,6 +401,7 @@ def add_account(auth_type="token", api_token="", email="", api_url="", custom_na
             "auth_type": auth_type,
             "api_token": api_token,
             "api_url": resolved_url,
+            "upload_url": DEFAULT_UPLOAD_URL if auth_type != "webdav" else "",
             "smb_enabled": True,
         }
         accounts.append(target)
@@ -403,6 +415,7 @@ def add_account(auth_type="token", api_token="", email="", api_url="", custom_na
         "email": target.get("email", ""),
         "auth_type": target.get("auth_type", "token"),
         "api_url": target.get("api_url", resolved_url),
+        "upload_url": target.get("upload_url", DEFAULT_UPLOAD_URL if auth_type != "webdav" else ""),
         "smb_enabled": bool(target.get("smb_enabled", True)),
         "smb_share_name": target.get("smb_share_name") or "FileJump",
     }
@@ -516,6 +529,10 @@ def _rest_base(acc):
     return _normalize_rest_base(acc.get("api_url") or DEFAULT_REST_BASE)
 
 
+def _rest_upload_url(acc):
+    return str(acc.get("upload_url") or DEFAULT_UPLOAD_URL).strip().rstrip("/") or DEFAULT_UPLOAD_URL
+
+
 def _parse_rest_id(raw_id):
     """
     Returns (is_explicit_folder: bool, clean_id: str | None).
@@ -608,17 +625,11 @@ def _rest_get_entry_raw(acc, file_id):
     if is_folder_hint:
         endpoints = [
             (f"/api/folders/{q_id}", "folder"),
-            (f"/api/v1/folders/{q_id}", "folder"),
-            (f"/api/v1/file-entries/{q_id}", "folder"),
-            (f"/api/v1/drive/file-entries/{q_id}", "folder"),
         ]
     else:
         endpoints = [
             (f"/api/files/{q_id}", "file"),
-            (f"/api/v1/files/{q_id}", "file"),
             (f"/api/folders/{q_id}", "folder"),
-            (f"/api/v1/file-entries/{q_id}", None),
-            (f"/api/v1/drive/file-entries/{q_id}", None),
         ]
 
     for ep, ftype in endpoints:
@@ -660,9 +671,6 @@ def _rest_open_download_response(acc, file_id, range_header=None):
     candidate_urls = [
         f"{base}/api/files/{q_id}/download",
         f"{base}/api/files/download/{q_id}",
-        f"{base}/api/v1/files/{q_id}/download",
-        f"{base}/api/v1/files/download/{q_id}",
-        f"{base}/api/v1/file-entries/download/{q_id}",
     ]
 
     last_resp = None
@@ -727,111 +735,81 @@ def list_files(folder_id="root", account_id=None):
     headers = _rest_headers(acc)
     _, clean_parent_id = _parse_rest_id(folder_id)
 
-    # 1. Official FileJump REST API (/api/folders + /api/files)
+    # Official FileJump REST API (https://filejump.com/api/folders + https://filejump.com/api/files)
     folder_params = {}
     if clean_parent_id:
         folder_params["parent_id"] = clean_parent_id
 
     r_folders = requests.get(f"{base}/api/folders", headers=headers, params=folder_params, timeout=30)
-    if r_folders.status_code != 404:
-        r_folders.raise_for_status()
-        raw_folders = _extract_list_from_payload(r_folders.json(), "folders", "entries")
+    r_folders.raise_for_status()
+    raw_folders = _extract_list_from_payload(r_folders.json(), "folders", "entries")
 
-        # If inside a subfolder and /api/folders?parent_id=... returned empty, also check /api/folders/all
-        if clean_parent_id and not raw_folders:
-            try:
-                r_all_f = requests.get(f"{base}/api/folders/all", headers=headers, timeout=20)
-                if r_all_f.status_code < 400:
-                    raw_folders = _extract_list_from_payload(r_all_f.json(), "folders", "entries")
-            except Exception:
-                pass
+    # If inside a subfolder and /api/folders?parent_id=... returned empty, also check /api/folders/all
+    if clean_parent_id and not raw_folders:
+        try:
+            r_all_f = requests.get(f"{base}/api/folders/all", headers=headers, timeout=20)
+            if r_all_f.status_code < 400:
+                raw_folders = _extract_list_from_payload(r_all_f.json(), "folders", "entries")
+        except Exception:
+            pass
 
-        out = []
-        seen_ids = set()
-        for raw_f in raw_folders:
-            if not isinstance(raw_f, dict):
-                continue
-            if "parent_id" in raw_f or "parentId" in raw_f:
-                f_parent = raw_f.get("parent_id") if "parent_id" in raw_f else raw_f.get("parentId")
-                if clean_parent_id is None:
-                    if f_parent not in (None, "", 0, "0", "root"):
-                        continue
-                else:
-                    if str(f_parent) != str(clean_parent_id):
-                        continue
-            norm = _normalize_rest_entry(raw_f, force_type="folder")
-            if norm and norm["id"] not in seen_ids:
-                seen_ids.add(norm["id"])
-                out.append({
-                    "id": norm["id"],
-                    "name": norm["name"],
-                    "type": "folder",
-                    "size": 0,
-                    "modified": norm["modified"],
-                    "mimeType": norm["mimeType"],
-                })
-
-        file_params = {"per_page": 500}
-        if clean_parent_id:
-            file_params["folder_id"] = clean_parent_id
-        r_files = requests.get(f"{base}/api/files", headers=headers, params=file_params, timeout=30)
-        r_files.raise_for_status()
-        raw_files = _extract_list_from_payload(r_files.json(), "files", "fileEntries", "entries")
-
-        for raw_item in raw_files:
-            if not isinstance(raw_item, dict):
-                continue
-            if "folder_id" in raw_item or "folderId" in raw_item:
-                item_folder = raw_item.get("folder_id") if "folder_id" in raw_item else raw_item.get("folderId")
-                if clean_parent_id is None:
-                    if item_folder not in (None, "", 0, "0", "root"):
-                        continue
-                else:
-                    if str(item_folder) != str(clean_parent_id):
-                        continue
-            norm = _normalize_rest_entry(raw_item, force_type="file")
-            if norm and norm["id"] not in seen_ids:
-                seen_ids.add(norm["id"])
-                out.append({
-                    "id": norm["id"],
-                    "name": norm["name"],
-                    "type": norm["type"],
-                    "size": norm["size"],
-                    "modified": norm["modified"],
-                    "mimeType": norm["mimeType"],
-                })
-
-        out.sort(key=lambda x: (0 if x["type"] == "folder" else 1, x["name"].lower()))
-        return out
-
-    # 2. Fallback for legacy / self-hosted instances
-    params = {"perPage": 500}
-    if clean_parent_id:
-        params["folderId"] = clean_parent_id
-        params["parentIds"] = clean_parent_id
-
-    for ep in ("/api/v1/drive/file-entries", "/api/v1/file-entries"):
-        r = requests.get(f"{base}{ep}", headers=headers, params=params, timeout=30)
-        if r.status_code == 404:
+    out = []
+    seen_ids = set()
+    for raw_f in raw_folders:
+        if not isinstance(raw_f, dict):
             continue
-        r.raise_for_status()
-        raw_list = _extract_list_from_payload(r.json(), "fileEntries", "entries")
-        out = []
-        for raw_item in raw_list:
-            norm = _normalize_rest_entry(raw_item)
-            if norm:
-                out.append({
-                    "id": norm["id"],
-                    "name": norm["name"],
-                    "type": norm["type"],
-                    "size": norm["size"],
-                    "modified": norm["modified"],
-                    "mimeType": norm["mimeType"],
-                })
-        out.sort(key=lambda x: (0 if x["type"] == "folder" else 1, x["name"].lower()))
-        return out
+        if "parent_id" in raw_f or "parentId" in raw_f:
+            f_parent = raw_f.get("parent_id") if "parent_id" in raw_f else raw_f.get("parentId")
+            if clean_parent_id is None:
+                if f_parent not in (None, "", 0, "0", "root"):
+                    continue
+            else:
+                if str(f_parent) != str(clean_parent_id):
+                    continue
+        norm = _normalize_rest_entry(raw_f, force_type="folder")
+        if norm and norm["id"] not in seen_ids:
+            seen_ids.add(norm["id"])
+            out.append({
+                "id": norm["id"],
+                "name": norm["name"],
+                "type": "folder",
+                "size": 0,
+                "modified": norm["modified"],
+                "mimeType": norm["mimeType"],
+            })
 
-    return []
+    file_params = {"per_page": 500}
+    if clean_parent_id:
+        file_params["folder_id"] = clean_parent_id
+    r_files = requests.get(f"{base}/api/files", headers=headers, params=file_params, timeout=30)
+    r_files.raise_for_status()
+    raw_files = _extract_list_from_payload(r_files.json(), "files", "fileEntries", "entries")
+
+    for raw_item in raw_files:
+        if not isinstance(raw_item, dict):
+            continue
+        if "folder_id" in raw_item or "folderId" in raw_item:
+            item_folder = raw_item.get("folder_id") if "folder_id" in raw_item else raw_item.get("folderId")
+            if clean_parent_id is None:
+                if item_folder not in (None, "", 0, "0", "root"):
+                    continue
+            else:
+                if str(item_folder) != str(clean_parent_id):
+                    continue
+        norm = _normalize_rest_entry(raw_item, force_type="file")
+        if norm and norm["id"] not in seen_ids:
+            seen_ids.add(norm["id"])
+            out.append({
+                "id": norm["id"],
+                "name": norm["name"],
+                "type": norm["type"],
+                "size": norm["size"],
+                "modified": norm["modified"],
+                "mimeType": norm["mimeType"],
+            })
+
+    out.sort(key=lambda x: (0 if x["type"] == "folder" else 1, x["name"].lower()))
+    return out
 
 
 def get_file_meta(file_id, account_id=None):
@@ -941,26 +919,14 @@ def create_folder(parent_id, name, account_id=None):
         parent_val = int(clean_parent) if str(clean_parent).isdigit() else clean_parent
 
     body = {"name": name, "parent_id": parent_val}
-    if parent_val is not None:
-        body["parentId"] = parent_val
-
-    last_resp = None
-    for ep in ("/api/folders", "/api/v1/folders"):
-        r = requests.post(f"{base}{ep}", headers=headers, json=body, timeout=20)
-        if r.status_code == 404:
-            last_resp = r
-            continue
-        r.raise_for_status()
-        data = r.json()
-        folder = data.get("data") or data.get("folder") or data.get("fileEntry") or data
-        raw_fid = folder.get("id") if isinstance(folder, dict) else None
-        if raw_fid is not None:
-            return f"folder:{raw_fid}"
-        return f"folder:{name}"
-
-    if last_resp is not None:
-        last_resp.raise_for_status()
-    raise RuntimeError("Failed to create folder on FileJump")
+    r = requests.post(f"{base}/api/folders", headers=headers, json=body, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    folder = data.get("data") or data.get("folder") or data.get("fileEntry") or data
+    raw_fid = folder.get("id") if isinstance(folder, dict) else None
+    if raw_fid is not None:
+        return f"folder:{raw_fid}"
+    return f"folder:{name}"
 
 
 def ensure_folder_path(base_folder_id, parts, account_id=None):
@@ -1082,7 +1048,7 @@ def upload_file(
         r.raise_for_status()
         return dest_norm
 
-    base = _rest_base(acc)
+    upload_url = _rest_upload_url(acc)
     headers = {"Authorization": f"Bearer {acc.get('api_token') or ''}", "Accept": "application/json"}
     _, clean_parent = _parse_rest_id(target_parent)
     form_data = {}
@@ -1096,9 +1062,7 @@ def upload_file(
     else:
         stream_obj = data_or_stream
 
-    upload_url = DEFAULT_UPLOAD_URL if "filejump.com" in base else f"{base}/api/files/upload"
-
-    # When total_size is known, stream multipart/form-data directly without buffering in RAM
+    # When total_size is known, stream multipart/form-data directly to https://uploads.filejump.com/api/upload
     if total_size is not None and int(total_size) >= 0 and not hasattr(stream_obj, "seek"):
         boundary = f"----SageDriveBoundary{secrets.token_hex(12)}"
         parts_buf = []
@@ -1131,35 +1095,17 @@ def upload_file(
         entry = resp.get("data") or resp.get("file") or resp.get("fileEntry") or resp
         return str((entry.get("id") if isinstance(entry, dict) else None) or actual_name)
 
-    candidate_upload_urls = [
-        upload_url,
-        f"{base}/api/files/upload",
-        f"{base}/api/files",
-        f"{base}/api/v1/files/upload",
-        f"{base}/api/v1/uploads",
-    ]
-    last_err = None
-    for u_url in candidate_upload_urls:
+    if hasattr(stream_obj, "seek"):
         try:
-            if hasattr(stream_obj, "seek"):
-                try:
-                    stream_obj.seek(0)
-                except Exception:
-                    pass
-            files = {"file": (actual_name, stream_obj, mime_type or "application/octet-stream")}
-            r = requests.post(u_url, headers=headers, data=form_data, files=files, timeout=(20, 14400))
-            if r.status_code == 404:
-                continue
-            r.raise_for_status()
-            resp = r.json()
-            entry = resp.get("data") or resp.get("file") or resp.get("fileEntry") or resp
-            return str((entry.get("id") if isinstance(entry, dict) else None) or actual_name)
-        except Exception as e:
-            last_err = e
-            continue
-    if last_err:
-        raise last_err
-    raise RuntimeError("FileJump upload failed")
+            stream_obj.seek(0)
+        except Exception:
+            pass
+    files = {"file": (actual_name, stream_obj, mime_type or "application/octet-stream")}
+    r = requests.post(upload_url, headers=headers, data=form_data, files=files, timeout=(20, 14400))
+    r.raise_for_status()
+    resp = r.json()
+    entry = resp.get("data") or resp.get("file") or resp.get("fileEntry") or resp
+    return str((entry.get("id") if isinstance(entry, dict) else None) or actual_name)
 
 
 def update_file_content(file_id, data_or_stream, mime_type="text/plain; charset=utf-8", account_id=None):
@@ -1228,14 +1174,11 @@ def move_file(file_id, dest_folder_id, account_id=None):
     if is_folder_hint:
         endpoints = [
             (f"/api/folders/{q_id}/move", {"parent_id": dest_val}),
-            (f"/api/v1/folders/{q_id}/move", {"parent_id": dest_val}),
         ]
     else:
         endpoints = [
             (f"/api/files/{q_id}/move", {"folder_id": dest_val, "workspace_id": None}),
-            (f"/api/v1/files/{q_id}/move", {"folder_id": dest_val, "workspace_id": None}),
             (f"/api/folders/{q_id}/move", {"parent_id": dest_val}),
-            ("/api/v1/file-entries/move", {"entryIds": [clean_id], "destinationId": dest_val}),
         ]
 
     last_resp = None
@@ -1278,9 +1221,9 @@ def rename_file(file_id, new_name, account_id=None):
     is_folder_hint, clean_id = _parse_rest_id(file_id)
     q_id = quote(str(clean_id))
     if is_folder_hint:
-        endpoints = [f"/api/folders/{q_id}", f"/api/v1/folders/{q_id}", f"/api/v1/file-entries/{q_id}"]
+        endpoints = [f"/api/folders/{q_id}"]
     else:
-        endpoints = [f"/api/files/{q_id}", f"/api/v1/files/{q_id}", f"/api/folders/{q_id}", f"/api/v1/file-entries/{q_id}"]
+        endpoints = [f"/api/files/{q_id}", f"/api/folders/{q_id}"]
 
     last_resp = None
     for ep in endpoints:
@@ -1312,15 +1255,11 @@ def delete_file(file_id, account_id=None):
     if is_folder_hint:
         candidates = [
             (f"/api/folders/{q_id}", "delete", None),
-            (f"/api/v1/folders/{q_id}", "delete", None),
         ]
     else:
         candidates = [
             (f"/api/files/{q_id}", "delete", None),
-            (f"/api/v1/files/{q_id}", "delete", None),
             (f"/api/folders/{q_id}", "delete", None),
-            ("/api/v1/file-entries/delete", "post", {"entryIds": [clean_id], "deleteForever": False}),
-            (f"/api/v1/file-entries/{q_id}", "delete", None),
         ]
 
     last_resp = None

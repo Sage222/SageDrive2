@@ -2858,7 +2858,7 @@ function listFileJumpAccounts() {
     original_name: a.original_name || a.name || 'FileJump',
     email: a.email || '',
     auth_type: a.auth_type || 'token',
-    api_url: a.api_url || (a.auth_type === 'webdav' ? 'https://uploads.filejump.com/dav' : 'https://filejump.com'),
+    api_url: a.api_url || (a.auth_type === 'webdav' ? 'https://uploads.filejump.com/dav' : 'https://filejump.com/api'),
     smb_enabled: Boolean(a.smb_enabled ?? true),
     smb_share_name: a.smb_share_name || 'FileJump',
   }));
@@ -3038,7 +3038,7 @@ app.post('/api/filejump/connect', requireAdmin, (req, res) => {
   }
 
   const resolvedUrl =
-    rawUrl || (authType === 'webdav' ? 'https://uploads.filejump.com/dav' : 'https://filejump.com');
+    rawUrl || (authType === 'webdav' ? 'https://uploads.filejump.com/dav' : 'https://filejump.com/api');
 
   const accounts = loadFileJumpAccountsRaw();
   let target = accountId ? accounts.find((a) => a.id === accountId) : null;

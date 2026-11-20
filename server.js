@@ -1560,12 +1560,31 @@ app.put('/api/smb/content/:share_id', requireAdmin, (req, res) => {
   }
 });
 
+function generateUniqueName(desiredName, existingNamesIter) {
+  const existingLower = new Set(Array.from(existingNamesIter || [], (n) => String(n || '').toLowerCase()));
+  if (!existingLower.has(String(desiredName || '').toLowerCase())) {
+    return desiredName;
+  }
+  const dotIdx = desiredName.lastIndexOf('.');
+  const stem = dotIdx > 0 ? desiredName.slice(0, dotIdx) : desiredName;
+  const ext = dotIdx > 0 ? desiredName.slice(dotIdx) : '';
+  let counter = 1;
+  while (true) {
+    const candidate = `${stem} (${counter})${ext}`;
+    if (!existingLower.has(candidate.toLowerCase())) {
+      return candidate;
+    }
+    counter++;
+  }
+}
+
 app.post('/api/smb/rename/:share_id', requireAdmin, (req, res) => {
   const { share_id } = req.params;
   const b = req.body || {};
   const oldPath = String(b.path || '').replace(/\/+$/, '');
-  const newName = String(b.new_name || '').trim();
-  if (!oldPath || !newName) {
+  const rawNewName = String(b.new_name || '').trim();
+  const conflictAction = String(b.conflict_action || b.conflictAction || 'replace').trim().toLowerCase();
+  if (!oldPath || !rawNewName) {
     return res.status(400).json({ error: 'path and new_name are required' });
   }
   const entries = ensureShareFS(share_id);
@@ -1574,15 +1593,36 @@ app.post('/api/smb/rename/:share_id', requireAdmin, (req, res) => {
     return res.status(404).json({ error: 'Item not found' });
   }
   const parentDir = path.posix.dirname(oldPath);
-  const newPath = parentDir === '/' ? `/${newName}` : `${parentDir}/${newName}`;
-  if (entries[newPath] && newPath !== oldPath) {
-    return res.status(400).json({ error: 'An item with that name already exists' });
+  const siblingEntry = Object.values(entries).find(
+    (e) => e.path !== oldPath && path.posix.dirname(e.path) === parentDir && e.name.toLowerCase() === rawNewName.toLowerCase()
+  );
+
+  let finalName = rawNewName;
+  if (siblingEntry) {
+    if (conflictAction === 'skip') {
+      return res.json({ ok: true, skipped: true, path: oldPath, name: item.name });
+    }
+    if (conflictAction === 'keep_both') {
+      const siblingNames = Object.values(entries)
+        .filter((e) => e.path !== oldPath && path.posix.dirname(e.path) === parentDir)
+        .map((e) => e.name);
+      finalName = generateUniqueName(rawNewName, siblingNames);
+    } else {
+      delete entries[siblingEntry.path];
+      if (siblingEntry.type === 'folder') {
+        const sibPrefix = siblingEntry.path + '/';
+        for (const k of Object.keys(entries)) {
+          if (k.startsWith(sibPrefix)) delete entries[k];
+        }
+      }
+    }
   }
 
+  const newPath = parentDir === '/' ? `/${finalName}` : `${parentDir}/${finalName}`;
   delete entries[oldPath];
   entries[newPath] = {
     ...item,
-    name: newName,
+    name: finalName,
     path: newPath,
     modified: Math.floor(Date.now() / 1000),
   };
@@ -1603,7 +1643,7 @@ app.post('/api/smb/rename/:share_id', requireAdmin, (req, res) => {
   }
 
   saveSmbFS();
-  return res.json({ ok: true, path: newPath });
+  return res.json({ ok: true, path: newPath, name: finalName });
 });
 
 app.post('/api/smb/zip/:share_id', requireAuth, (req, res) => {
@@ -2165,6 +2205,7 @@ app.post('/api/gdrive/rename/:file_id', requireAdmin, (req, res) => {
   const { file_id } = req.params;
   const b = req.body || {};
   const newName = String(b.name || b.new_name || '').trim();
+  const conflictAction = String(b.conflict_action || b.conflictAction || 'replace').trim().toLowerCase();
   if (!newName) {
     return res.status(400).json({ error: 'New name is required' });
   }
@@ -2172,10 +2213,26 @@ app.post('/api/gdrive/rename/:file_id', requireAdmin, (req, res) => {
   if (!item) {
     return res.status(404).json({ error: 'File not found' });
   }
-  item.name = newName;
+  const accId = item.accountId || 'default';
+  const siblings = Object.values(gdriveFSData).filter(
+    (f) => f.id !== file_id && (f.accountId || 'default') === accId && f.parent === item.parent
+  );
+  const conflict = siblings.find((f) => f.name.toLowerCase() === newName.toLowerCase());
+  let finalName = newName;
+  if (conflict) {
+    if (conflictAction === 'skip') {
+      return res.json({ ok: true, skipped: true, id: item.id, name: item.name });
+    }
+    if (conflictAction === 'keep_both') {
+      finalName = generateUniqueName(newName, siblings.map((s) => s.name));
+    } else {
+      deleteGDriveRecursive(conflict.id);
+    }
+  }
+  item.name = finalName;
   item.modified = new Date().toISOString();
   saveGDriveFS();
-  return res.json({ ok: true });
+  return res.json({ ok: true, id: item.id, name: finalName });
 });
 
 app.post('/api/gdrive/zip', requireAuth, (req, res) => {
@@ -2695,6 +2752,7 @@ app.post('/api/onedrive/rename/:file_id', requireAdmin, (req, res) => {
   const { file_id } = req.params;
   const b = req.body || {};
   const newName = String(b.name || b.new_name || '').trim();
+  const conflictAction = String(b.conflict_action || b.conflictAction || 'replace').trim().toLowerCase();
   if (!newName) {
     return res.status(400).json({ error: 'New name is required' });
   }
@@ -2702,10 +2760,26 @@ app.post('/api/onedrive/rename/:file_id', requireAdmin, (req, res) => {
   if (!item) {
     return res.status(404).json({ error: 'File not found' });
   }
-  item.name = newName;
+  const accId = item.accountId || 'default';
+  const siblings = Object.values(onedriveFSData).filter(
+    (f) => f.id !== file_id && (f.accountId || 'default') === accId && f.parent === item.parent
+  );
+  const conflict = siblings.find((f) => f.name.toLowerCase() === newName.toLowerCase());
+  let finalName = newName;
+  if (conflict) {
+    if (conflictAction === 'skip') {
+      return res.json({ ok: true, skipped: true, id: item.id, name: item.name });
+    }
+    if (conflictAction === 'keep_both') {
+      finalName = generateUniqueName(newName, siblings.map((s) => s.name));
+    } else {
+      deleteOneDriveRecursive(conflict.id);
+    }
+  }
+  item.name = finalName;
   item.modified = new Date().toISOString();
   saveOneDriveFS();
-  return res.json({ ok: true });
+  return res.json({ ok: true, id: item.id, name: finalName });
 });
 
 app.post('/api/onedrive/zip', requireAuth, (req, res) => {
@@ -3197,6 +3271,7 @@ app.post('/api/filejump/rename/:file_id', requireAdmin, (req, res) => {
   const { file_id } = req.params;
   const b = req.body || {};
   const newName = String(b.name || b.new_name || '').trim();
+  const conflictAction = String(b.conflict_action || b.conflictAction || 'replace').trim().toLowerCase();
   if (!newName) {
     return res.status(400).json({ error: 'New name is required' });
   }
@@ -3204,10 +3279,26 @@ app.post('/api/filejump/rename/:file_id', requireAdmin, (req, res) => {
   if (!item) {
     return res.status(404).json({ error: 'File not found' });
   }
-  item.name = newName;
+  const accId = item.accountId || 'default';
+  const siblings = Object.values(filejumpFSData).filter(
+    (f) => f.id !== file_id && (f.accountId || 'default') === accId && f.parent === item.parent
+  );
+  const conflict = siblings.find((f) => f.name.toLowerCase() === newName.toLowerCase());
+  let finalName = newName;
+  if (conflict) {
+    if (conflictAction === 'skip') {
+      return res.json({ ok: true, skipped: true, id: item.id, name: item.name });
+    }
+    if (conflictAction === 'keep_both') {
+      finalName = generateUniqueName(newName, siblings.map((s) => s.name));
+    } else {
+      deleteFileJumpRecursive(conflict.id);
+    }
+  }
+  item.name = finalName;
   item.modified = new Date().toISOString();
   saveFileJumpFS();
-  return res.json({ ok: true });
+  return res.json({ ok: true, id: item.id, name: finalName });
 });
 
 app.post('/api/filejump/zip', requireAuth, (req, res) => {
@@ -3302,6 +3393,107 @@ function getUploadSessionPaths(sessionId) {
   };
 }
 
+function findExistingCloudFolderPath(store, baseFolderId, parts, accId) {
+  let currId = baseFolderId || 'root';
+  for (const part of parts) {
+    if (!part) continue;
+    const found = Object.values(store).find(
+      (f) =>
+        (f.accountId || 'default') === accId &&
+        f.parent === currId &&
+        f.type === 'folder' &&
+        f.name.toLowerCase() === String(part).toLowerCase()
+    );
+    if (!found) return null;
+    currId = found.id;
+  }
+  return currId;
+}
+
+app.post('/api/transfers/check-conflicts', requireAuth, (req, res) => {
+  const b = req.body || {};
+  const driveType = String(b.driveType || b.drive_type || '').trim().toLowerCase();
+  const driveId = String(b.driveId || b.drive_id || 'default').trim();
+  const folder = String(b.folder || b.path || (driveType === 'smb' ? '/' : 'root')).trim();
+  const files = Array.isArray(b.files) ? b.files : [];
+
+  if (!['smb', 'gdrive', 'onedrive', 'filejump'].includes(driveType)) {
+    return res.status(400).json({ error: 'Invalid target drive type' });
+  }
+
+  const conflicts = [];
+  if (driveType === 'smb') {
+    const entries = ensureShareFS(driveId);
+    const baseDir = (folder || '/').replace(/\/+$/, '');
+    for (const f of files) {
+      const rel = String(f.relativePath || f.relative_path || f.name || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+      if (!rel) continue;
+      const targetPath = `${baseDir}/${rel}`;
+      const targetDir = path.posix.dirname(targetPath);
+      const leafName = path.posix.basename(targetPath);
+      const found = Object.values(entries).find(
+        (e) => path.posix.dirname(e.path) === targetDir && e.name.toLowerCase() === leafName.toLowerCase()
+      );
+      if (found) {
+        conflicts.push({
+          name: leafName,
+          relativePath: rel,
+          existing: {
+            name: found.name,
+            type: found.type || 'file',
+            size: found.size || 0,
+            modified: found.modified,
+          },
+        });
+      }
+    }
+  } else {
+    const store =
+      driveType === 'onedrive' ? onedriveFSData : driveType === 'filejump' ? filejumpFSData : gdriveFSData;
+    const accId =
+      driveType === 'onedrive'
+        ? resolveOneDriveAccountId(driveId)
+        : driveType === 'filejump'
+        ? resolveFileJumpAccountId(driveId)
+        : resolveGDriveAccountId(driveId);
+    if (driveType === 'onedrive') ensureOneDriveAccountSeeded(accId);
+    else if (driveType === 'filejump') ensureFileJumpAccountSeeded(accId);
+    else ensureGDriveAccountSeeded(accId);
+
+    for (const f of files) {
+      const rel = String(f.relativePath || f.relative_path || f.name || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+      if (!rel) continue;
+      const parts = rel.split('/').filter(Boolean);
+      const leafName = parts[parts.length - 1];
+      const subParts = parts.slice(0, -1);
+      const targetParent = subParts.length
+        ? findExistingCloudFolderPath(store, folder || 'root', subParts, accId)
+        : folder || 'root';
+      if (!targetParent) continue;
+      const found = Object.values(store).find(
+        (it) =>
+          (it.accountId || 'default') === accId &&
+          it.parent === targetParent &&
+          it.name.toLowerCase() === leafName.toLowerCase()
+      );
+      if (found) {
+        conflicts.push({
+          name: leafName,
+          relativePath: rel,
+          existing: {
+            name: found.name,
+            type: found.type || 'file',
+            size: found.size || 0,
+            modified: found.modified,
+          },
+        });
+      }
+    }
+  }
+
+  return res.json({ conflicts });
+});
+
 app.post('/api/transfers/upload/init', requireAdmin, (req, res) => {
   const b = req.body || {};
   const driveType = String(b.driveType || b.drive_type || '').trim().toLowerCase();
@@ -3312,12 +3504,23 @@ app.post('/api/transfers/upload/init', requireAdmin, (req, res) => {
   const totalSize = parseInt((b.totalSize !== undefined ? b.totalSize : b.total_size) || '0', 10) || 0;
   const mimeType = String(b.mimeType || b.mime_type || 'application/octet-stream').trim();
   const clientKey = String(b.clientKey || b.client_key || '').trim();
+  const conflictAction = String(b.conflictAction || b.conflict_action || 'replace').trim().toLowerCase();
 
   if (!['smb', 'gdrive', 'onedrive', 'filejump'].includes(driveType)) {
     return res.status(400).json({ error: 'Invalid target drive type' });
   }
   if (!fileName) {
     return res.status(400).json({ error: 'fileName is required' });
+  }
+  if (conflictAction === 'skip') {
+    return res.json({
+      sessionId: '',
+      upload_id: '',
+      offset: totalSize,
+      totalSize,
+      total_size: totalSize,
+      skipped: true,
+    });
   }
 
   const sessionId = clientKey
@@ -3336,6 +3539,7 @@ app.post('/api/transfers/upload/init', requireAdmin, (req, res) => {
       const actualOffset = fs.statSync(partPath).size;
       if (actualOffset <= totalSize) {
         meta.offset = actualOffset;
+        meta.conflictAction = conflictAction;
         fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf-8');
         return res.json({
           sessionId,
@@ -3359,6 +3563,7 @@ app.post('/api/transfers/upload/init', requireAdmin, (req, res) => {
     relativePath,
     totalSize,
     mimeType,
+    conflictAction,
     offset: 0,
     createdAt: Date.now(),
   };
@@ -3441,6 +3646,9 @@ app.post('/api/transfers/upload/complete', requireAdmin, (req, res) => {
     }
     const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
     const { driveType, driveId, folder, fileName, relativePath, mimeType } = meta;
+    const conflictAction = String(
+      b.conflictAction || b.conflict_action || meta.conflictAction || 'replace'
+    ).trim().toLowerCase();
     const ext = path.extname(fileName || '') || '';
     const finalBlobPath = path.join(BLOBS_DIR, `upload_${Date.now()}_${crypto.randomBytes(6).toString('hex')}${ext}`);
     fs.renameSync(partPath, finalBlobPath);
@@ -3451,9 +3659,28 @@ app.post('/api/transfers/upload/complete', requireAdmin, (req, res) => {
       const entries = ensureShareFS(driveId);
       const destDir = (folder || '/').replace(/\/+$/, '');
       const subPath = relClean || fileName;
-      const fullPath = `${destDir}/${subPath}`;
+      let fullPath = `${destDir}/${subPath}`;
       ensureSmbParentDirs(entries, fullPath);
-      const actualName = path.posix.basename(fullPath);
+      const parentDir = path.posix.dirname(fullPath);
+      let actualName = path.posix.basename(fullPath);
+      const existing = Object.values(entries).find(
+        (e) => path.posix.dirname(e.path) === parentDir && e.name.toLowerCase() === actualName.toLowerCase()
+      );
+      if (existing) {
+        if (conflictAction === 'skip') {
+          try { if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath); } catch (_) {}
+          return res.json({ ok: true, skipped: true });
+        }
+        if (conflictAction === 'keep_both') {
+          const siblingNames = Object.values(entries)
+            .filter((e) => path.posix.dirname(e.path) === parentDir)
+            .map((e) => e.name);
+          actualName = generateUniqueName(actualName, siblingNames);
+          fullPath = parentDir === '/' ? `/${actualName}` : `${parentDir}/${actualName}`;
+        } else if (existing.path !== fullPath) {
+          delete entries[existing.path];
+        }
+      }
       entries[fullPath] = {
         name: actualName,
         type: 'file',
@@ -3464,21 +3691,55 @@ app.post('/api/transfers/upload/complete', requireAdmin, (req, res) => {
         mimeType: getMimeType(actualName, mimeType),
       };
       saveSmbFS();
-    } else if (driveType === 'gdrive') {
-      const accId = resolveGDriveAccountId(driveId);
+    } else if (driveType === 'gdrive' || driveType === 'onedrive' || driveType === 'filejump') {
+      const store =
+        driveType === 'onedrive' ? onedriveFSData : driveType === 'filejump' ? filejumpFSData : gdriveFSData;
+      const accId =
+        driveType === 'onedrive'
+          ? resolveOneDriveAccountId(driveId)
+          : driveType === 'filejump'
+          ? resolveFileJumpAccountId(driveId)
+          : resolveGDriveAccountId(driveId);
+      const ensurePathFn =
+        driveType === 'onedrive'
+          ? ensureOneDriveFolderPath
+          : driveType === 'filejump'
+          ? ensureFileJumpFolderPath
+          : ensureGDriveFolderPath;
+      const saveFn =
+        driveType === 'onedrive' ? saveOneDriveFS : driveType === 'filejump' ? saveFileJumpFS : saveGDriveFS;
+      const prefix = driveType === 'onedrive' ? 'od-file-' : driveType === 'filejump' ? 'fj-file-' : 'file-';
+
       let targetParent = folder || 'root';
       let actualName = fileName;
       if (relClean) {
         const parts = relClean.split('/').filter(Boolean);
         if (parts.length > 1) {
-          targetParent = ensureGDriveFolderPath(targetParent, parts.slice(0, -1), accId);
+          targetParent = ensurePathFn(targetParent, parts.slice(0, -1), accId);
           actualName = parts[parts.length - 1];
         } else if (parts.length === 1) {
           actualName = parts[0];
         }
       }
-      const id = 'file-' + crypto.randomBytes(6).toString('hex');
-      gdriveFSData[id] = {
+      const siblings = Object.values(store).filter(
+        (f) => (f.accountId || 'default') === accId && f.parent === targetParent
+      );
+      const matches = siblings.filter((f) => f.name.toLowerCase() === actualName.toLowerCase());
+      if (matches.length) {
+        if (conflictAction === 'skip') {
+          try { if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath); } catch (_) {}
+          return res.json({ ok: true, skipped: true });
+        }
+        if (conflictAction === 'keep_both') {
+          actualName = generateUniqueName(actualName, siblings.map((s) => s.name));
+        } else {
+          for (const m of matches) {
+            delete store[m.id];
+          }
+        }
+      }
+      const id = prefix + crypto.randomBytes(6).toString('hex');
+      store[id] = {
         id,
         accountId: accId,
         name: actualName,
@@ -3489,59 +3750,7 @@ app.post('/api/transfers/upload/complete', requireAdmin, (req, res) => {
         parent: targetParent,
         blobPath: finalBlobPath,
       };
-      saveGDriveFS();
-    } else if (driveType === 'onedrive') {
-      const accId = resolveOneDriveAccountId(driveId);
-      let targetParent = folder || 'root';
-      let actualName = fileName;
-      if (relClean) {
-        const parts = relClean.split('/').filter(Boolean);
-        if (parts.length > 1) {
-          targetParent = ensureOneDriveFolderPath(targetParent, parts.slice(0, -1), accId);
-          actualName = parts[parts.length - 1];
-        } else if (parts.length === 1) {
-          actualName = parts[0];
-        }
-      }
-      const id = 'od-file-' + crypto.randomBytes(6).toString('hex');
-      onedriveFSData[id] = {
-        id,
-        accountId: accId,
-        name: actualName,
-        type: 'file',
-        size: finalSize,
-        modified: new Date().toISOString(),
-        mimeType: getMimeType(actualName, mimeType),
-        parent: targetParent,
-        blobPath: finalBlobPath,
-      };
-      saveOneDriveFS();
-    } else if (driveType === 'filejump') {
-      const accId = resolveFileJumpAccountId(driveId);
-      let targetParent = folder || 'root';
-      let actualName = fileName;
-      if (relClean) {
-        const parts = relClean.split('/').filter(Boolean);
-        if (parts.length > 1) {
-          targetParent = ensureFileJumpFolderPath(targetParent, parts.slice(0, -1), accId);
-          actualName = parts[parts.length - 1];
-        } else if (parts.length === 1) {
-          actualName = parts[0];
-        }
-      }
-      const id = 'fj-file-' + crypto.randomBytes(6).toString('hex');
-      filejumpFSData[id] = {
-        id,
-        accountId: accId,
-        name: actualName,
-        type: 'file',
-        size: finalSize,
-        modified: new Date().toISOString(),
-        mimeType: getMimeType(actualName, mimeType),
-        parent: targetParent,
-        blobPath: finalBlobPath,
-      };
-      saveFileJumpFS();
+      saveFn();
     }
 
     try {
@@ -3613,99 +3822,114 @@ function readSourceNode(srcType, srcDrive, itemRef) {
   return { name: item.name, type: 'file', srcItem: item };
 }
 
-function writeDestNode(node, destType, destDrive, destFolder) {
+function writeDestNode(node, destType, destDrive, destFolder, conflictAction = 'replace') {
   if (!node) return;
   if (destType === 'smb') {
     const entries = ensureShareFS(destDrive);
     const baseDir = (destFolder || '/').replace(/\/+$/, '');
-    const targetPath = `${baseDir}/${node.name}`;
+    let targetName = node.name;
+    let targetPath = `${baseDir}/${targetName}`;
     ensureSmbParentDirs(entries, targetPath);
+    const parentDir = path.posix.dirname(targetPath);
+    const existing = Object.values(entries).find(
+      (e) => path.posix.dirname(e.path) === parentDir && e.name.toLowerCase() === targetName.toLowerCase()
+    );
+    if (existing) {
+      if (conflictAction === 'skip') return;
+      if (conflictAction === 'keep_both') {
+        const siblingNames = Object.values(entries)
+          .filter((e) => path.posix.dirname(e.path) === parentDir)
+          .map((e) => e.name);
+        targetName = generateUniqueName(targetName, siblingNames);
+        targetPath = parentDir === '/' ? `/${targetName}` : `${parentDir}/${targetName}`;
+      } else if (existing.path !== targetPath && node.type !== 'folder') {
+        delete entries[existing.path];
+      }
+    }
     if (node.type === 'folder') {
       entries[targetPath] = {
-        name: node.name,
+        name: targetName,
         type: 'folder',
         size: 0,
         modified: Math.floor(Date.now() / 1000),
         path: targetPath,
       };
       for (const ch of node.children || []) {
-        writeDestNode(ch, 'smb', destDrive, targetPath);
+        writeDestNode(ch, 'smb', destDrive, targetPath, conflictAction);
       }
     } else {
-      const { blobPath, size } = copyBlobFile(node.srcItem, node.name);
+      const { blobPath, size } = copyBlobFile(node.srcItem, targetName);
       entries[targetPath] = {
-        name: node.name,
+        name: targetName,
         type: 'file',
         size,
         modified: Math.floor(Date.now() / 1000),
         path: targetPath,
         blobPath,
-        mimeType: getMimeType(node.name, node.srcItem?.mimeType),
+        mimeType: getMimeType(targetName, node.srcItem?.mimeType),
       };
     }
-  } else if (destType === 'gdrive') {
-    const accId = resolveGDriveAccountId(destDrive);
+  } else if (destType === 'gdrive' || destType === 'onedrive' || destType === 'filejump') {
+    const store =
+      destType === 'onedrive' ? onedriveFSData : destType === 'filejump' ? filejumpFSData : gdriveFSData;
+    const accId =
+      destType === 'onedrive'
+        ? resolveOneDriveAccountId(destDrive)
+        : destType === 'filejump'
+        ? resolveFileJumpAccountId(destDrive)
+        : resolveGDriveAccountId(destDrive);
+    const ensurePathFn =
+      destType === 'onedrive'
+        ? ensureOneDriveFolderPath
+        : destType === 'filejump'
+        ? ensureFileJumpFolderPath
+        : ensureGDriveFolderPath;
+    const prefix = destType === 'onedrive' ? 'od-file-' : destType === 'filejump' ? 'fj-file-' : 'file-';
+
     if (node.type === 'folder') {
-      const newFolderId = ensureGDriveFolderPath(destFolder || 'root', [node.name], accId);
+      let folderName = node.name;
+      const siblings = Object.values(store).filter(
+        (f) => (f.accountId || 'default') === accId && f.parent === (destFolder || 'root')
+      );
+      const existingFolder = siblings.find((f) => f.name.toLowerCase() === folderName.toLowerCase());
+      if (existingFolder) {
+        if (conflictAction === 'skip') return;
+        if (conflictAction === 'keep_both') {
+          folderName = generateUniqueName(folderName, siblings.map((s) => s.name));
+        }
+      }
+      const newFolderId = ensurePathFn(destFolder || 'root', [folderName], accId);
       for (const ch of node.children || []) {
-        writeDestNode(ch, 'gdrive', accId, newFolderId);
+        writeDestNode(ch, destType, accId, newFolderId, conflictAction);
       }
     } else {
-      const { blobPath, size } = copyBlobFile(node.srcItem, node.name);
-      const id = 'file-' + crypto.randomBytes(6).toString('hex');
-      gdriveFSData[id] = {
+      let fileName = node.name;
+      const targetParent = destFolder || 'root';
+      const siblings = Object.values(store).filter(
+        (f) => (f.accountId || 'default') === accId && f.parent === targetParent
+      );
+      const matches = siblings.filter((f) => f.name.toLowerCase() === fileName.toLowerCase());
+      if (matches.length) {
+        if (conflictAction === 'skip') return;
+        if (conflictAction === 'keep_both') {
+          fileName = generateUniqueName(fileName, siblings.map((s) => s.name));
+        } else {
+          for (const m of matches) {
+            delete store[m.id];
+          }
+        }
+      }
+      const { blobPath, size } = copyBlobFile(node.srcItem, fileName);
+      const id = prefix + crypto.randomBytes(6).toString('hex');
+      store[id] = {
         id,
         accountId: accId,
-        name: node.name,
+        name: fileName,
         type: 'file',
         size,
         modified: new Date().toISOString(),
-        mimeType: getMimeType(node.name, node.srcItem?.mimeType),
-        parent: destFolder || 'root',
-        blobPath,
-      };
-    }
-  } else if (destType === 'onedrive') {
-    const accId = resolveOneDriveAccountId(destDrive);
-    if (node.type === 'folder') {
-      const newFolderId = ensureOneDriveFolderPath(destFolder || 'root', [node.name], accId);
-      for (const ch of node.children || []) {
-        writeDestNode(ch, 'onedrive', accId, newFolderId);
-      }
-    } else {
-      const { blobPath, size } = copyBlobFile(node.srcItem, node.name);
-      const id = 'od-file-' + crypto.randomBytes(6).toString('hex');
-      onedriveFSData[id] = {
-        id,
-        accountId: accId,
-        name: node.name,
-        type: 'file',
-        size,
-        modified: new Date().toISOString(),
-        mimeType: getMimeType(node.name, node.srcItem?.mimeType),
-        parent: destFolder || 'root',
-        blobPath,
-      };
-    }
-  } else if (destType === 'filejump') {
-    const accId = resolveFileJumpAccountId(destDrive);
-    if (node.type === 'folder') {
-      const newFolderId = ensureFileJumpFolderPath(destFolder || 'root', [node.name], accId);
-      for (const ch of node.children || []) {
-        writeDestNode(ch, 'filejump', accId, newFolderId);
-      }
-    } else {
-      const { blobPath, size } = copyBlobFile(node.srcItem, node.name);
-      const id = 'fj-file-' + crypto.randomBytes(6).toString('hex');
-      filejumpFSData[id] = {
-        id,
-        accountId: accId,
-        name: node.name,
-        type: 'file',
-        size,
-        modified: new Date().toISOString(),
-        mimeType: getMimeType(node.name, node.srcItem?.mimeType),
-        parent: destFolder || 'root',
+        mimeType: getMimeType(fileName, node.srcItem?.mimeType),
+        parent: targetParent,
         blobPath,
       };
     }
@@ -3755,22 +3979,38 @@ function deleteFileJumpRecursive(fid) {
   delete filejumpFSData[fid];
 }
 
-function moveSmbPathSameShare(shareId, oldPath, destDir) {
+function moveSmbPathSameShare(shareId, oldPath, destDir, conflictAction = 'replace') {
   const entries = ensureShareFS(shareId);
   const normOld = sanitizeSmbPath(oldPath, false);
   const normDestDir = sanitizeSmbPath(destDir, true);
   const item = entries[normOld];
   if (!item) throw new Error('Source item not found');
-  const baseName = path.posix.basename(normOld);
-  const newPath = normDestDir === '/' ? `/${baseName}` : `${normDestDir.replace(/\/+$/, '')}/${baseName}`;
+  let baseName = path.posix.basename(normOld);
+  let newPath = normDestDir === '/' ? `/${baseName}` : `${normDestDir.replace(/\/+$/, '')}/${baseName}`;
   if (newPath === normOld) return newPath;
   if (newPath.startsWith(normOld + '/')) {
     throw new Error('Cannot move a folder into itself');
+  }
+  const existing = Object.values(entries).find(
+    (e) => e.path !== normOld && path.posix.dirname(e.path) === normDestDir && e.name.toLowerCase() === baseName.toLowerCase()
+  );
+  if (existing) {
+    if (conflictAction === 'skip') return null;
+    if (conflictAction === 'keep_both') {
+      const siblingNames = Object.values(entries)
+        .filter((e) => path.posix.dirname(e.path) === normDestDir)
+        .map((e) => e.name);
+      baseName = generateUniqueName(baseName, siblingNames);
+      newPath = normDestDir === '/' ? `/${baseName}` : `${normDestDir.replace(/\/+$/, '')}/${baseName}`;
+    } else {
+      deleteSmbPathRecursive(shareId, existing.path);
+    }
   }
   ensureSmbParentDirs(entries, newPath);
   delete entries[normOld];
   entries[newPath] = {
     ...item,
+    name: baseName,
     path: newPath,
     modified: Math.floor(Date.now() / 1000),
   };
@@ -3801,6 +4041,7 @@ app.post('/api/transfer', requireAdmin, (req, res) => {
   const destDrive = b.dest_drive;
   const destFolder = b.dest_folder || (destType === 'smb' ? '/' : 'root');
   const items = Array.isArray(b.items) ? b.items : [];
+  const defaultConflictAction = String(b.conflict_action || b.conflictAction || 'replace').trim().toLowerCase();
 
   if (!items.length) {
     return res.status(400).json({ error: 'No items selected for transfer' });
@@ -3813,30 +4054,51 @@ app.post('/api/transfer', requireAdmin, (req, res) => {
   try {
     let count = 0;
     for (const it of items) {
+      const itemConflictAction = String(it.conflict_action || it.conflictAction || defaultConflictAction).trim().toLowerCase();
+      if (itemConflictAction === 'skip') continue;
+
       if (isMove && srcType === 'smb' && destType === 'smb' && srcDrive === destDrive) {
-        moveSmbPathSameShare(srcDrive, it.path, destFolder);
-      } else if (isMove && srcType === 'gdrive' && destType === 'gdrive' && resolveGDriveAccountId(srcDrive) === resolveGDriveAccountId(destDrive)) {
-        const gdItem = gdriveFSData[it.id];
-        if (!gdItem) throw new Error('Source file not found');
+        const movedPath = moveSmbPathSameShare(srcDrive, it.path, destFolder, itemConflictAction);
+        if (!movedPath) continue;
+      } else if (
+        isMove &&
+        srcType === destType &&
+        ['gdrive', 'onedrive', 'filejump'].includes(srcType) &&
+        ((srcType === 'gdrive' && resolveGDriveAccountId(srcDrive) === resolveGDriveAccountId(destDrive)) ||
+          (srcType === 'onedrive' && resolveOneDriveAccountId(srcDrive) === resolveOneDriveAccountId(destDrive)) ||
+          (srcType === 'filejump' && resolveFileJumpAccountId(srcDrive) === resolveFileJumpAccountId(destDrive)))
+      ) {
+        const store =
+          srcType === 'onedrive' ? onedriveFSData : srcType === 'filejump' ? filejumpFSData : gdriveFSData;
+        const delFn =
+          srcType === 'onedrive'
+            ? deleteOneDriveRecursive
+            : srcType === 'filejump'
+            ? deleteFileJumpRecursive
+            : deleteGDriveRecursive;
+        const cloudItem = store[it.id];
+        if (!cloudItem) throw new Error('Source file not found');
         if (it.id === destFolder) throw new Error('Cannot move a folder into itself');
-        gdItem.parent = destFolder || 'root';
-        gdItem.modified = new Date().toISOString();
-      } else if (isMove && srcType === 'onedrive' && destType === 'onedrive' && resolveOneDriveAccountId(srcDrive) === resolveOneDriveAccountId(destDrive)) {
-        const odItem = onedriveFSData[it.id];
-        if (!odItem) throw new Error('Source file not found');
-        if (it.id === destFolder) throw new Error('Cannot move a folder into itself');
-        odItem.parent = destFolder || 'root';
-        odItem.modified = new Date().toISOString();
-      } else if (isMove && srcType === 'filejump' && destType === 'filejump' && resolveFileJumpAccountId(srcDrive) === resolveFileJumpAccountId(destDrive)) {
-        const fjItem = filejumpFSData[it.id];
-        if (!fjItem) throw new Error('Source file not found');
-        if (it.id === destFolder) throw new Error('Cannot move a folder into itself');
-        fjItem.parent = destFolder || 'root';
-        fjItem.modified = new Date().toISOString();
+        const targetParent = destFolder || 'root';
+        const accId = cloudItem.accountId || 'default';
+        const siblings = Object.values(store).filter(
+          (f) => f.id !== it.id && (f.accountId || 'default') === accId && f.parent === targetParent
+        );
+        const matches = siblings.filter((f) => f.name.toLowerCase() === cloudItem.name.toLowerCase());
+        if (matches.length) {
+          if (itemConflictAction === 'skip') continue;
+          if (itemConflictAction === 'keep_both') {
+            cloudItem.name = generateUniqueName(cloudItem.name, siblings.map((s) => s.name));
+          } else {
+            for (const m of matches) delFn(m.id);
+          }
+        }
+        cloudItem.parent = targetParent;
+        cloudItem.modified = new Date().toISOString();
       } else {
         const node = readSourceNode(srcType, srcDrive, it);
         if (!node) throw new Error('Source item not found');
-        writeDestNode(node, destType, destDrive, destFolder);
+        writeDestNode(node, destType, destDrive, destFolder, itemConflictAction);
         if (isMove) {
           if (srcType === 'smb') deleteSmbPathRecursive(srcDrive, it.path);
           else if (srcType === 'gdrive') deleteGDriveRecursive(it.id);

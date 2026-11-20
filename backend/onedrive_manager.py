@@ -11,9 +11,42 @@ SCOPES = ["Files.ReadWrite.All", "offline_access", "User.Read"]
 _creds_lock = threading.Lock()
 _meta_cache = {}
 _META_TTL = 120.0
+_META_MAX_ENTRIES = 4000
 _PENDING_OAUTH = {}
+_OAUTH_TTL = 1800.0
 
 _RESERVED_SMB_NAMES = {"global", "homes", "printers", "print$", "ipc$"}
+
+
+def _prune_caches(now=None):
+    now = now or time.time()
+    expired_meta = [k for k, v in list(_meta_cache.items()) if (now - v[0]) >= _META_TTL]
+    for k in expired_meta:
+        _meta_cache.pop(k, None)
+    if len(_meta_cache) > _META_MAX_ENTRIES:
+        sorted_keys = sorted(_meta_cache.keys(), key=lambda k: _meta_cache[k][0])
+        for k in sorted_keys[: len(_meta_cache) - _META_MAX_ENTRIES]:
+            _meta_cache.pop(k, None)
+    expired_oauth = [k for k, v in list(_PENDING_OAUTH.items()) if (now - v.get("ts", 0)) >= _OAUTH_TTL]
+    for k in expired_oauth:
+        _PENDING_OAUTH.pop(k, None)
+
+
+def generate_unique_name(desired_name, existing_names):
+    lower_set = {str(n).lower() for n in existing_names if n}
+    if desired_name.lower() not in lower_set:
+        return desired_name
+    if "." in desired_name and not desired_name.startswith("."):
+        base, ext = desired_name.rsplit(".", 1)
+        ext = "." + ext
+    else:
+        base, ext = desired_name, ""
+    idx = 1
+    while True:
+        cand = f"{base} ({idx}){ext}"
+        if cand.lower() not in lower_set:
+            return cand
+        idx += 1
 
 
 def _env_defaults():
@@ -215,6 +248,7 @@ def is_authenticated(account_id=None):
 
 
 def get_auth_url(custom_name=None, account_id=None):
+    _prune_caches()
     cfg = get_config()
     tenant = (cfg.get("tenant_id") or "common").strip()
     state = secrets.token_urlsafe(24)
@@ -236,6 +270,7 @@ def get_auth_url(custom_name=None, account_id=None):
 
 
 def handle_callback(code, state):
+    _prune_caches()
     cfg = get_config()
     tenant = (cfg.get("tenant_id") or "common").strip()
     token_url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
@@ -445,42 +480,50 @@ def _cache_key(account_id, file_id):
 
 
 def list_files(folder_id="root", account_id=None):
+    _prune_caches()
     if not folder_id or folder_id == "root":
-        ep = "/me/drive/root/children?$top=200"
+        next_url = "/me/drive/root/children?$top=500"
     else:
-        ep = f"/me/drive/items/{folder_id}/children?$top=200"
-    r = _graph_request("GET", ep, account_id=account_id)
-    data = r.json()
+        next_url = f"/me/drive/items/{folder_id}/children?$top=500"
     out = []
     now = time.time()
-    for item in data.get("value", []):
-        is_folder = "folder" in item
-        size_val = int(item.get("size", 0) or 0)
-        file_obj = item.get("file") or {}
-        mime = "application/vnd.ms-folder" if is_folder else (file_obj.get("mimeType") or "application/octet-stream")
-        dl_url = item.get("@microsoft.graph.downloadUrl") or ""
-        info = {
-            "name": item.get("name", "item"),
-            "mimeType": mime,
-            "size": size_val,
-            "downloadUrl": dl_url,
-            "isFolder": is_folder,
-        }
-        _meta_cache[_cache_key(account_id, item["id"])] = (now, info)
-        _meta_cache[item["id"]] = (now, info)
-        out.append({
-            "id": item["id"],
-            "name": item.get("name", "item"),
-            "type": "folder" if is_folder else "file",
-            "size": size_val,
-            "modified": item.get("lastModifiedDateTime", ""),
-            "mimeType": mime,
-        })
+    pages = 0
+    while next_url and pages < 50:
+        pages += 1
+        r = _graph_request("GET", next_url, account_id=account_id)
+        data = r.json()
+        for item in data.get("value", []):
+            is_folder = "folder" in item
+            size_val = int(item.get("size", 0) or 0)
+            file_obj = item.get("file") or {}
+            mime = "application/vnd.ms-folder" if is_folder else (file_obj.get("mimeType") or "application/octet-stream")
+            dl_url = item.get("@microsoft.graph.downloadUrl") or ""
+            parent_ref = item.get("parentReference") or {}
+            info = {
+                "name": item.get("name", "item"),
+                "mimeType": mime,
+                "size": size_val,
+                "downloadUrl": dl_url,
+                "isFolder": is_folder,
+                "parentId": parent_ref.get("id") or "root",
+            }
+            _meta_cache[_cache_key(account_id, item["id"])] = (now, info)
+            _meta_cache[item["id"]] = (now, info)
+            out.append({
+                "id": item["id"],
+                "name": item.get("name", "item"),
+                "type": "folder" if is_folder else "file",
+                "size": size_val,
+                "modified": item.get("lastModifiedDateTime", ""),
+                "mimeType": mime,
+            })
+        next_url = data.get("@odata.nextLink")
     return out
 
 
 def get_file_meta(file_id, account_id=None, require_download_url=False):
     now = time.time()
+    _prune_caches(now)
     ck = _cache_key(account_id, file_id)
     cached = _meta_cache.get(ck) or _meta_cache.get(file_id)
     if cached and (now - cached[0]) < _META_TTL:
@@ -491,12 +534,14 @@ def get_file_meta(file_id, account_id=None, require_download_url=False):
     is_folder = "folder" in meta
     file_obj = meta.get("file") or {}
     mime = "application/vnd.ms-folder" if is_folder else (file_obj.get("mimeType") or "application/octet-stream")
+    parent_ref = meta.get("parentReference") or {}
     info = {
         "name": meta.get("name", "download"),
         "mimeType": mime,
         "size": int(meta.get("size", 0) or 0),
         "downloadUrl": meta.get("@microsoft.graph.downloadUrl") or "",
         "isFolder": is_folder,
+        "parentId": parent_ref.get("id") or "root",
     }
     _meta_cache[ck] = (now, info)
     _meta_cache[file_id] = (now, info)
@@ -625,6 +670,19 @@ def ensure_folder_path(base_folder_id, parts, account_id=None):
     return curr_id
 
 
+def find_existing_folder_path(base_folder_id, parts, account_id=None):
+    curr_id = base_folder_id or "root"
+    for part in parts:
+        if not part:
+            continue
+        children = list_files(curr_id, account_id=account_id)
+        existing = next((c for c in children if c["type"] == "folder" and c["name"].lower() == part.lower()), None)
+        if not existing:
+            return None
+        curr_id = existing["id"]
+    return curr_id
+
+
 def resolve_upload_target(parent_id, filename, relative_path=None, account_id=None):
     target_parent = parent_id or "root"
     actual_name = filename
@@ -641,10 +699,15 @@ def resolve_upload_target(parent_id, filename, relative_path=None, account_id=No
     return target_parent, actual_name
 
 
-def start_resumable_upload(parent_id, filename, relative_path=None, account_id=None):
+def start_resumable_upload(parent_id, filename, relative_path=None, account_id=None, conflict_action="replace"):
     target_parent, actual_name = resolve_upload_target(
         parent_id, filename, relative_path=relative_path, account_id=account_id
     )
+    action = (conflict_action or "replace").strip().lower()
+    graph_behavior = "rename" if action == "keep_both" else "replace"
+    if action == "keep_both":
+        siblings = list_files(target_parent, account_id=account_id)
+        actual_name = generate_unique_name(actual_name, [s["name"] for s in siblings])
     safe_name = requests.utils.quote(actual_name)
     if target_parent == "root":
         sess_ep = f"/me/drive/root:/{safe_name}:/createUploadSession"
@@ -654,7 +717,7 @@ def start_resumable_upload(parent_id, filename, relative_path=None, account_id=N
         "POST",
         sess_ep,
         account_id=account_id,
-        json={"item": {"@microsoft.graph.conflictBehavior": "replace", "name": actual_name}},
+        json={"item": {"@microsoft.graph.conflictBehavior": graph_behavior, "name": actual_name}},
     )
     return sess_resp.json()["uploadUrl"]
 
@@ -705,10 +768,20 @@ def upload_file(
     relative_path=None,
     account_id=None,
     total_size=None,
+    conflict_action="replace",
 ):
     target_parent, actual_name = resolve_upload_target(
         parent_id, filename, relative_path=relative_path, account_id=account_id
     )
+    action = (conflict_action or "replace").strip().lower()
+    if action in ("skip", "keep_both"):
+        siblings = list_files(target_parent, account_id=account_id)
+        existing_names = [s["name"] for s in siblings]
+        if action == "skip" and any(n.lower() == actual_name.lower() for n in existing_names):
+            return
+        if action == "keep_both":
+            actual_name = generate_unique_name(actual_name, existing_names)
+
     if isinstance(data_or_stream, (bytes, bytearray)):
         raw_bytes = bytes(data_or_stream)
         total_size = len(raw_bytes)
@@ -761,17 +834,17 @@ def upload_file(
         )
         return
 
-    # Stream directly to OneDrive UploadSession in memory without touching disk
     if target_parent == "root":
         sess_ep = f"/me/drive/root:/{safe_name}:/createUploadSession"
     else:
         sess_ep = f"/me/drive/items/{target_parent}:/{safe_name}:/createUploadSession"
 
+    graph_behavior = "rename" if action == "keep_both" else "replace"
     sess_resp = _graph_request(
         "POST",
         sess_ep,
         account_id=account_id,
-        json={"item": {"@microsoft.graph.conflictBehavior": "replace", "name": actual_name}},
+        json={"item": {"@microsoft.graph.conflictBehavior": graph_behavior, "name": actual_name}},
     )
     upload_url = sess_resp.json()["uploadUrl"]
 
@@ -790,7 +863,6 @@ def upload_file(
             offset = push_resumable_chunk(upload_url, bytes(buf), offset, known_total)
         return
 
-    # Fallback when caller did not provide total_size: read chunks in memory
     chunks = [bytes(first_chunk)]
     while True:
         buf = bytearray()
@@ -806,7 +878,6 @@ def upload_file(
     offset = 0
     for c in chunks:
         offset = push_resumable_chunk(upload_url, c, offset, computed_total)
-
 
 
 def update_file_content(file_id, data_or_stream, mime_type="text/plain; charset=utf-8", account_id=None):
@@ -826,25 +897,62 @@ def update_file_content(file_id, data_or_stream, mime_type="text/plain; charset=
     return r.json()
 
 
-def move_file(file_id, dest_folder_id, account_id=None):
+def move_file(file_id, dest_folder_id, account_id=None, conflict_action="replace"):
     dest_id = dest_folder_id or "root"
     if file_id == dest_id:
         raise ValueError("Cannot move a folder into itself")
+    meta = get_file_meta(file_id, account_id=account_id)
+    item_name = meta.get("name") or "item"
+    action = (conflict_action or "replace").strip().lower()
+    dest_items = list_files(dest_id, account_id=account_id)
+    conflicts = [it for it in dest_items if it["id"] != file_id and it["name"].lower() == item_name.lower()]
+    patch_body = {}
+    if conflicts:
+        if action == "skip":
+            return {"id": file_id, "name": item_name, "skipped": True}
+        elif action == "keep_both":
+            patch_body["name"] = generate_unique_name(item_name, [it["name"] for it in dest_items if it["id"] != file_id])
+        elif action == "replace":
+            for c_it in conflicts:
+                try:
+                    delete_file(c_it["id"], account_id=account_id)
+                except Exception:
+                    pass
     _meta_cache.pop(_cache_key(account_id, file_id), None)
     _meta_cache.pop(file_id, None)
     if dest_id == "root":
         root_r = _graph_request("GET", "/me/drive/root", account_id=account_id)
         dest_id = root_r.json()["id"]
+    patch_body["parentReference"] = {"id": dest_id}
     r = _graph_request(
         "PATCH",
         f"/me/drive/items/{file_id}",
         account_id=account_id,
-        json={"parentReference": {"id": dest_id}},
+        json=patch_body,
     )
     return r.json()
 
 
-def rename_file(file_id, new_name, account_id=None):
+def rename_file(file_id, new_name, account_id=None, conflict_action="replace"):
+    new_name = (new_name or "").strip()
+    if not new_name:
+        raise ValueError("New name is required")
+    meta = get_file_meta(file_id, account_id=account_id)
+    parent_id = meta.get("parentId") or "root"
+    action = (conflict_action or "replace").strip().lower()
+    siblings = list_files(parent_id, account_id=account_id)
+    conflicts = [it for it in siblings if it["id"] != file_id and it["name"].lower() == new_name.lower()]
+    if conflicts:
+        if action == "skip":
+            return {"id": file_id, "name": meta.get("name"), "skipped": True}
+        elif action == "keep_both":
+            new_name = generate_unique_name(new_name, [it["name"] for it in siblings if it["id"] != file_id])
+        elif action == "replace":
+            for c_it in conflicts:
+                try:
+                    delete_file(c_it["id"], account_id=account_id)
+                except Exception:
+                    pass
     _meta_cache.pop(_cache_key(account_id, file_id), None)
     _meta_cache.pop(file_id, None)
     r = _graph_request(
@@ -863,28 +971,39 @@ def delete_file(file_id, account_id=None):
 
 
 def create_zip_tmpfile(file_ids, account_id=None):
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    """
+    Creates a temporary .zip archive containing the specified OneDrive files
+    and folders by streaming 256 KiB chunks directly into the ZIP compressor
+    without loading whole files into RAM.
+    """
+    tmp = tempfile.NamedTemporaryFile(prefix="sagedrive_od_zip_", delete=False, suffix=".zip")
     tmp.close()
 
     def _add_item(zf, fid, arc_prefix):
         meta = get_file_meta(fid, account_id=account_id)
         name = meta["name"]
         is_folder = meta.get("isFolder") or meta.get("mimeType") == "application/vnd.ms-folder"
-        arc_path = f"{arc_prefix}/{name}" if arc_prefix else name
+        arc_path = f"{arc_prefix}/{name}".lstrip("/") if arc_prefix else name
         if is_folder:
             children = list_files(fid, account_id=account_id)
             if not children:
-                zf.writestr(arc_path.rstrip("/") + "/", b"")
+                zinfo = zipfile.ZipInfo(arc_path.rstrip("/") + "/")
+                zf.writestr(zinfo, b"")
             for ch in children:
                 _add_item(zf, ch["id"], arc_path)
         else:
-            data, _, _ = download_file(fid, account_id=account_id)
-            zf.writestr(arc_path, data)
+            zinfo = zipfile.ZipInfo(arc_path)
+            zinfo.compress_type = zipfile.ZIP_DEFLATED
+            with zf.open(zinfo, mode="w", force_zip64=True) as dest:
+                for chunk in stream_file_range(fid, start=0, end=None, account_id=account_id):
+                    if chunk:
+                        dest.write(chunk)
 
     try:
-        with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zf:
+        with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
             for fid in file_ids:
-                _add_item(zf, fid, "")
+                if fid:
+                    _add_item(zf, fid, "")
         size = os.path.getsize(tmp.name)
         return tmp.name, size
     except Exception:

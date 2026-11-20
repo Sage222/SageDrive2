@@ -70,919 +70,45 @@ def _auth_login_with_status(username, password):
 
 auth.login_with_status = _auth_login_with_status
 
-# ── Self-contained Multi-SMB Share & Custom Name Support ──────────────────────
-def _smb_add_share(name, host, share, username="", password="", port=445, custom_name=""):
-    shares = smb_manager._load()
-    base_sid = re.sub(r"[^a-z0-9_]+", "_", name.strip().lower()).strip("_") or "smb_share"
-    sid = base_sid
-    conflict = next((s for s in shares if s["id"] == sid and (s.get("host") != host or s.get("share") != share)), None)
-    if conflict:
-        sid = f"{base_sid}_{secrets.token_hex(2)}"
-    shares = [s for s in shares if s["id"] != sid]
-    disp_name = (custom_name or name).strip()
-    entry = {
-        "id": sid,
-        "name": disp_name,
-        "custom_name": custom_name.strip() if custom_name else "",
-        "original_name": name.strip(),
-        "host": host,
-        "share": share,
-        "username": username,
-        "password": password,
-        "port": int(port or 445),
-    }
-    shares.append(entry)
-    smb_manager._save(shares)
-    return entry
-
-def _smb_rename_share(share_id, new_name):
-    new_name = (new_name or "").strip()
-    if not new_name:
-        raise ValueError("Custom name cannot be empty")
-    shares = smb_manager._load()
-    target = None
-    for s in shares:
-        if s["id"] == share_id:
-            if not s.get("original_name"):
-                s["original_name"] = s.get("name", s["share"])
-            s["name"] = new_name
-            s["custom_name"] = new_name
-            target = s
-            break
-    if not target:
-        raise ValueError(f"Share {share_id!r} not found")
-    smb_manager._save(shares)
-    return target
-
-smb_manager.add_share = _smb_add_share
-smb_manager.rename_share = _smb_rename_share
-
-# ── Multi-Account Google Drive Manager with Token Persistence & 401 Retry ─────
-_gd_creds_lock = threading.Lock()
-_gd_meta_cache = getattr(gdrive_manager, "_meta_cache", {})
-_GD_META_TTL = 120.0
-_GD_ACCOUNTS_FILE = gdrive_manager.DATA_DIR / "gdrive_accounts.json"
-_GD_PENDING_OAUTH = {}
+# ── Bounded In-Memory Caches & SMB Path Alias ─────────────────────────────────
 _SMB_SIZE_CACHE = {}
 _SMB_SIZE_TTL = 60.0
+_SMB_SIZE_MAX_ENTRIES = 4000
 _PROBE_CACHE = {}
 _PROBE_TTL = 600.0
+_PROBE_MAX_ENTRIES = 1000
 
-def _gd_parse_expiry(raw_expiry):
-    if not raw_expiry:
-        return None
-    try:
-        dt = datetime.fromisoformat(str(raw_expiry).replace("Z", "+00:00"))
-        if dt.tzinfo is not None:
-            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-        return dt
-    except Exception:
-        return None
-
-def _gd_creds_to_dict(c):
-    expiry_str = None
-    if getattr(c, "expiry", None) is not None:
-        expiry_str = c.expiry.isoformat()
-    return {
-        "token": c.token,
-        "refresh_token": c.refresh_token,
-        "token_uri": c.token_uri,
-        "client_id": c.client_id,
-        "client_secret": c.client_secret,
-        "scopes": list(c.scopes or gdrive_manager.SCOPES),
-        "expiry": expiry_str,
-    }
-
-_RESERVED_SMB_NAMES = {"global", "homes", "printers", "print$", "ipc$"}
-
-def _gd_sanitize_smb_share_name(raw_name, fallback="GoogleDrive"):
-    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", (raw_name or "").strip()).strip("_-")
-    if not cleaned or cleaned.lower() in _RESERVED_SMB_NAMES:
-        cleaned = fallback
-    return cleaned[:32]
-
-def _gd_ensure_smb_fields(accounts):
-    used = set()
-    changed = False
-    for idx, a in enumerate(accounts):
-        if "smb_enabled" not in a:
-            a["smb_enabled"] = True
-            changed = True
-        raw_share = (a.get("smb_share_name") or "").strip()
-        if not raw_share:
-            default_base = "GoogleDrive" if (idx == 0 or a.get("id") == "default") else (
-                a.get("custom_name") or a.get("name") or f"GoogleDrive_{idx + 1}"
-            )
-            candidate = _gd_sanitize_smb_share_name(default_base, fallback=f"GoogleDrive_{idx + 1}")
-            base_cand = candidate
-            suffix = 2
-            while candidate.lower() in used:
-                candidate = f"{base_cand[:28]}_{suffix}"
-                suffix += 1
-            a["smb_share_name"] = candidate
-            changed = True
-        else:
-            sanitized = _gd_sanitize_smb_share_name(raw_share, fallback=f"GoogleDrive_{idx + 1}")
-            if sanitized.lower() in used:
-                sanitized = f"{sanitized[:28]}_{idx + 1}"
-            if sanitized != raw_share:
-                a["smb_share_name"] = sanitized
-                changed = True
-        used.add(a["smb_share_name"].lower())
-    return changed
-
-def _gd_load_accounts_raw():
-    if _GD_ACCOUNTS_FILE.exists():
-        try:
-            data = json.loads(_GD_ACCOUNTS_FILE.read_text())
-            if isinstance(data, list):
-                if _gd_ensure_smb_fields(data):
-                    _GD_ACCOUNTS_FILE.write_text(json.dumps(data, indent=2))
-                return data
-        except Exception:
-            pass
-    if gdrive_manager.CREDS_FILE.exists():
-        try:
-            legacy = json.loads(gdrive_manager.CREDS_FILE.read_text())
-            if legacy and (legacy.get("token") or legacy.get("refresh_token")):
-                migrated = [{
-                    "id": "default",
-                    "name": "Google Drive",
-                    "custom_name": "",
-                    "original_name": "Google Drive",
-                    "email": legacy.get("email", ""),
-                    "smb_enabled": True,
-                    "smb_share_name": "GoogleDrive",
-                    "creds": legacy,
-                }]
-                _GD_ACCOUNTS_FILE.write_text(json.dumps(migrated, indent=2))
-                return migrated
-        except Exception:
-            pass
-    return []
-
-def _gd_save_accounts_raw(accounts):
-    _gd_ensure_smb_fields(accounts)
-    _GD_ACCOUNTS_FILE.write_text(json.dumps(accounts, indent=2))
-    if accounts and accounts[0].get("creds"):
-        gdrive_manager.CREDS_FILE.write_text(json.dumps(accounts[0]["creds"], indent=2))
-    elif not accounts and gdrive_manager.CREDS_FILE.exists():
-        gdrive_manager.CREDS_FILE.unlink(missing_ok=True)
-
-def _gd_list_accounts():
-    accounts = _gd_load_accounts_raw()
-    return [{
-        "id": a["id"],
-        "name": a.get("custom_name") or a.get("name") or "Google Drive",
-        "custom_name": a.get("custom_name", ""),
-        "original_name": a.get("original_name") or a.get("name") or "Google Drive",
-        "email": a.get("email", ""),
-        "smb_enabled": bool(a.get("smb_enabled", True)),
-        "smb_share_name": a.get("smb_share_name") or "GoogleDrive",
-    } for a in accounts]
-
-def _gd_resolve_account_entry(account_id=None):
-    accounts = _gd_load_accounts_raw()
-    if not accounts:
-        return None, accounts
-    if not account_id or account_id in ("root", "default"):
-        for a in accounts:
-            if a["id"] == "default":
-                return a, accounts
-        return accounts[0], accounts
-    for a in accounts:
-        if a["id"] == account_id:
-            return a, accounts
-    return accounts[0], accounts
-
-def _gd_save_creds(c, account_id=None, custom_name=None, email=None):
-    with _gd_creds_lock:
-        accounts = _gd_load_accounts_raw()
-        c_dict = _gd_creds_to_dict(c)
-        target = None
-        if account_id:
-            target = next((a for a in accounts if a["id"] == account_id), None)
-        if not target and email:
-            target = next((a for a in accounts if a.get("email") and a.get("email") == email), None)
-        if target:
-            target["creds"] = c_dict
-            if email:
-                target["email"] = email
-            if custom_name:
-                target["custom_name"] = custom_name.strip()
-                target["name"] = custom_name.strip()
-        else:
-            new_id = "default" if not accounts else f"gdrive_{secrets.token_hex(3)}"
-            default_label = "Google Drive" if not accounts else f"Google Drive {len(accounts) + 1}"
-            if email and not custom_name:
-                default_label = f"Google Drive ({email.split('@')[0]})"
-            disp_name = (custom_name or "").strip() or default_label
-            base_smb = "GoogleDrive" if not accounts else _gd_sanitize_smb_share_name(disp_name, fallback=f"GoogleDrive_{len(accounts) + 1}")
-            accounts.append({
-                "id": new_id,
-                "name": disp_name,
-                "custom_name": (custom_name or "").strip(),
-                "original_name": default_label,
-                "email": email or "",
-                "smb_enabled": True,
-                "smb_share_name": base_smb,
-                "creds": c_dict,
-            })
-        _gd_save_accounts_raw(accounts)
-
-def _gd_load_creds(force_refresh=False, account_id=None):
-    with _gd_creds_lock:
-        acc, accounts = _gd_resolve_account_entry(account_id)
-        if not acc:
-            return None
-        d = acc.get("creds") or {}
-        cfg = gdrive_manager.get_config()
-        expiry_dt = _gd_parse_expiry(d.get("expiry"))
-        c = Credentials(
-            token=d.get("token"),
-            refresh_token=d.get("refresh_token"),
-            token_uri=d.get("token_uri", "https://oauth2.googleapis.com/token"),
-            client_id=d.get("client_id", cfg["client_id"]),
-            client_secret=d.get("client_secret", cfg["client_secret"]),
-            scopes=d.get("scopes", gdrive_manager.SCOPES),
-            expiry=expiry_dt,
-        )
-        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
-        needs_refresh = (
-            force_refresh
-            or not c.token
-            or expiry_dt is None
-            or not c.valid
-            or (expiry_dt - now_utc).total_seconds() < 300
-        )
-        if needs_refresh and c.refresh_token:
-            c.refresh(Request())
-            acc["creds"] = _gd_creds_to_dict(c)
-            _gd_save_accounts_raw(accounts)
-        return c if (c.token or c.valid) else None
-
-def _gd_is_authenticated(account_id=None):
-    accounts = _gd_load_accounts_raw()
-    if not accounts:
-        return False
-    try:
-        c = _gd_load_creds(account_id=account_id)
-        return c is not None and (c.valid or bool(c.refresh_token) or bool(c.token))
-    except Exception:
-        return False
-
-def _gd_rename_account(account_id, new_name):
-    new_name = (new_name or "").strip()
-    if not new_name:
-        raise ValueError("Custom name cannot be empty")
-    with _gd_creds_lock:
-        accounts = _gd_load_accounts_raw()
-        target = None
-        for a in accounts:
-            if a["id"] == account_id or (account_id in ("root", "default") and a == accounts[0]):
-                if not a.get("original_name"):
-                    a["original_name"] = a.get("name", "Google Drive")
-                a["name"] = new_name
-                a["custom_name"] = new_name
-                target = a
-                break
-        if not target:
-            raise ValueError(f"Google Drive account {account_id!r} not found")
-        _gd_save_accounts_raw(accounts)
-        return {
-            "id": target["id"],
-            "name": target["name"],
-            "custom_name": target.get("custom_name", ""),
-            "email": target.get("email", ""),
-            "smb_enabled": bool(target.get("smb_enabled", True)),
-            "smb_share_name": target.get("smb_share_name") or "GoogleDrive",
-        }
-
-def _gd_update_account_smb_proxy(account_id, smb_enabled=None, smb_share_name=None):
-    with _gd_creds_lock:
-        accounts = _gd_load_accounts_raw()
-        target = None
-        for a in accounts:
-            if a["id"] == account_id or (account_id in ("root", "default") and a == accounts[0]):
-                target = a
-                break
-        if not target:
-            raise ValueError(f"Google Drive account {account_id!r} not found")
-        if smb_share_name is not None:
-            raw = str(smb_share_name).strip()
-            if not raw:
-                raise ValueError("SMB share name cannot be empty")
-            cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", raw).strip("_-")[:32]
-            if not cleaned or cleaned.lower() in _RESERVED_SMB_NAMES:
-                raise ValueError(f"Invalid or reserved SMB share name: {raw!r}")
-            for other in accounts:
-                if other["id"] != target["id"] and (other.get("smb_share_name") or "").lower() == cleaned.lower():
-                    raise ValueError(f"SMB share name '{cleaned}' is already used by another Google Drive")
-            target["smb_share_name"] = cleaned
-        if smb_enabled is not None:
-            target["smb_enabled"] = bool(smb_enabled)
-        _gd_save_accounts_raw(accounts)
-        return {
-            "id": target["id"],
-            "name": target.get("custom_name") or target.get("name") or "Google Drive",
-            "email": target.get("email", ""),
-            "smb_enabled": bool(target.get("smb_enabled", True)),
-            "smb_share_name": target.get("smb_share_name") or "GoogleDrive",
-        }
-
-def _gd_remove_account(account_id=None):
-    _gd_meta_cache.clear()
-    with _gd_creds_lock:
-        accounts = _gd_load_accounts_raw()
-        if not account_id:
-            _gd_save_accounts_raw([])
-            return
-        accounts = [a for a in accounts if a["id"] != account_id]
-        _gd_save_accounts_raw(accounts)
-
-def _gd_get_auth_url(custom_name=None, account_id=None):
-    cfg = gdrive_manager.get_config()
-    flow = Flow.from_client_config(gdrive_manager._client_config(), scopes=gdrive_manager.SCOPES, redirect_uri=cfg["redirect_uri"])
-    url, state = flow.authorization_url(access_type="offline", prompt="select_account consent")
-    if state:
-        _GD_PENDING_OAUTH[state] = {
-            "custom_name": (custom_name or "").strip(),
-            "account_id": (account_id or "").strip(),
-            "ts": time.time(),
-        }
-    return url
-
-def _gd_handle_callback(code, state):
-    cfg = gdrive_manager.get_config()
-    flow = Flow.from_client_config(gdrive_manager._client_config(), scopes=gdrive_manager.SCOPES, redirect_uri=cfg["redirect_uri"])
-    flow.fetch_token(code=code)
-    c = flow.credentials
-    pending = _GD_PENDING_OAUTH.pop(state, {}) if state else {}
-    email = ""
-    try:
-        svc = build("drive", "v3", credentials=c, cache_discovery=False)
-        about = svc.about().get(fields="user(displayName,emailAddress)").execute()
-        email = (about.get("user") or {}).get("emailAddress", "")
-    except Exception:
-        pass
-    _gd_save_creds(
-        c,
-        account_id=pending.get("account_id") or None,
-        custom_name=pending.get("custom_name") or None,
-        email=email,
-    )
-
-def _gd_svc(account_id=None):
-    c = _gd_load_creds(account_id=account_id)
-    if not c:
-        raise RuntimeError("Not authenticated with Google Drive")
-    return build("drive", "v3", credentials=c, cache_discovery=False)
-
-def _gd_cache_key(account_id, file_id):
-    return f"{account_id or 'default'}:{file_id}"
-
-def _gd_list_files(folder_id="root", account_id=None):
-    res = _gd_svc(account_id=account_id).files().list(
-        q=f"'{folder_id}' in parents and trashed=false",
-        fields="files(id,name,mimeType,size,modifiedTime,parents)",
-        pageSize=200,
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True,
-    ).execute()
-    out = []
-    now = time.time()
-    for f in res.get("files", []):
-        is_folder = f["mimeType"] == "application/vnd.google-apps.folder"
-        size_val = int(f.get("size", 0) or 0)
-        info = {
-            "name": f["name"],
-            "mimeType": f["mimeType"],
-            "size": size_val,
-        }
-        _gd_meta_cache[_gd_cache_key(account_id, f["id"])] = (now, info)
-        _gd_meta_cache[f["id"]] = (now, info)
-        out.append({
-            "id": f["id"],
-            "name": f["name"],
-            "type": "folder" if is_folder else "file",
-            "size": size_val,
-            "modified": f.get("modifiedTime", ""),
-            "mimeType": f["mimeType"],
-        })
-    return out
-
-def _gd_get_file_meta(file_id, account_id=None):
-    now = time.time()
-    ck = _gd_cache_key(account_id, file_id)
-    cached = _gd_meta_cache.get(ck) or _gd_meta_cache.get(file_id)
-    if cached and (now - cached[0]) < _GD_META_TTL:
-        return cached[1]
-    svc = _gd_svc(account_id=account_id)
-    meta = svc.files().get(
-        fileId=file_id,
-        fields="name,mimeType,size",
-        supportsAllDrives=True,
-    ).execute()
-    info = {
-        "name": meta.get("name", "download"),
-        "mimeType": meta.get("mimeType", "application/octet-stream"),
-        "size": int(meta.get("size", 0) or 0),
-    }
-    _gd_meta_cache[ck] = (now, info)
-    _gd_meta_cache[file_id] = (now, info)
-    return info
-
-def _gd_open_media_response(file_id, start=None, end=None, account_id=None):
-    url = (
-        f"https://www.googleapis.com/drive/v3/files/{file_id}"
-        f"?alt=media&supportsAllDrives=true&acknowledgeAbuse=true"
-    )
-    for attempt in range(2):
-        c = _gd_load_creds(force_refresh=(attempt > 0), account_id=account_id)
-        if not c:
-            raise RuntimeError("Not authenticated with Google Drive")
-        headers = {"Authorization": f"Bearer {c.token}"}
-        if start is not None and end is not None:
-            headers["Range"] = f"bytes={start}-{end}"
-        elif start:
-            headers["Range"] = f"bytes={start}-"
-        r = requests.get(url, headers=headers, stream=True, timeout=(15, 300))
-        if r.status_code in (401, 403) and attempt == 0:
-            r.close()
-            continue
-        if not r.ok:
-            err_body = ""
-            try:
-                err_body = r.text[:300]
-            except Exception:
-                pass
-            r.close()
-            raise RuntimeError(f"Google Drive stream failed ({r.status_code}): {err_body}")
-        return r
-    raise RuntimeError("Google Drive authentication failed after token refresh")
-
-def _gd_stream_file_range(file_id, start=0, end=None, chunk_size=262144, account_id=None):
-    def _gen():
-        curr_start = int(start or 0)
-        retries = 0
-        while True:
-            if end is not None and curr_start > end:
-                break
-            r = None
-            prev_start = curr_start
-            try:
-                r = _gd_open_media_response(file_id, start=curr_start, end=end, account_id=account_id)
-                for chunk in r.iter_content(chunk_size=chunk_size):
-                    if chunk:
-                        curr_start += len(chunk)
-                        yield chunk
-                        if end is not None and curr_start > end:
-                            break
-                break
-            except GeneratorExit:
-                break
-            except Exception:
-                if end is not None and curr_start > end:
-                    break
-                if curr_start > prev_start:
-                    retries = 0
-                else:
-                    retries += 1
-                if retries > 4:
-                    raise
-            finally:
-                if r is not None:
-                    try:
-                        r.close()
-                    except Exception:
-                        pass
-    return _gen()
-
-def _gd_download_file(file_id, account_id=None):
-    svc = _gd_svc(account_id=account_id)
-    meta = svc.files().get(
-        fileId=file_id,
-        fields="name,mimeType",
-        supportsAllDrives=True,
-    ).execute()
-    name, mime = meta["name"], meta["mimeType"]
-    export_map = {
-        "application/vnd.google-apps.document":
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "application/vnd.google-apps.spreadsheet":
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "application/vnd.google-apps.presentation":
-            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    }
-    buf = io.BytesIO()
-    req = svc.files().export_media(fileId=file_id, mimeType=export_map[mime]) \
-        if mime in export_map else svc.files().get_media(fileId=file_id, supportsAllDrives=True)
-    dl = MediaIoBaseDownload(buf, req)
-    done = False
-    while not done:
-        _, done = dl.next_chunk()
-    return buf.getvalue(), name, mime
-
-def _gd_ensure_folder_path(base_folder_id, parts, account_id=None):
-    svc = _gd_svc(account_id=account_id)
-    curr_id = base_folder_id or "root"
-    for part in parts:
-        if not part:
-            continue
-        safe_part = part.replace("'", "\\'")
-        q = (
-            f"'{curr_id}' in parents and name = '{safe_part}' "
-            f"and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-        )
-        res = svc.files().list(
-            q=q,
-            fields="files(id)",
-            pageSize=1,
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-        ).execute()
-        files = res.get("files", [])
-        if files:
-            curr_id = files[0]["id"]
-        else:
-            created = svc.files().create(
-                body={
-                    "name": part,
-                    "parents": [curr_id],
-                    "mimeType": "application/vnd.google-apps.folder",
-                },
-                fields="id",
-                supportsAllDrives=True,
-            ).execute()
-            curr_id = created["id"]
-    return curr_id
-
-def _gd_resolve_upload_target(parent_id, filename, relative_path=None, account_id=None):
-    target_parent = parent_id or "root"
-    actual_name = filename
-    if relative_path:
-        norm_rel = relative_path.replace("\x00", "").replace("\\", "/").lstrip("/")
-        segments = [s for s in norm_rel.split("/") if s and s != "."]
-        if any(s == ".." for s in segments):
-            raise ValueError("Invalid relative_path: path traversal ('..') is not allowed")
-        if len(segments) > 1:
-            target_parent = _gd_ensure_folder_path(target_parent, segments[:-1], account_id=account_id)
-            actual_name = segments[-1]
-        elif segments:
-            actual_name = segments[0]
-    return target_parent, actual_name
-
-def _gd_start_resumable_upload(
-    parent_id,
-    filename,
-    mime_type="application/octet-stream",
-    total_size=None,
-    relative_path=None,
-    account_id=None,
-):
-    target_parent, actual_name = _gd_resolve_upload_target(
-        parent_id, filename, relative_path=relative_path, account_id=account_id
-    )
-    url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true"
-    for attempt in range(2):
-        c = _gd_load_creds(force_refresh=(attempt > 0), account_id=account_id)
-        if not c:
-            raise RuntimeError("Not authenticated with Google Drive")
-        headers = {
-            "Authorization": f"Bearer {c.token}",
-            "Content-Type": "application/json; charset=UTF-8",
-            "X-Upload-Content-Type": mime_type or "application/octet-stream",
-        }
-        if total_size is not None and int(total_size) >= 0:
-            headers["X-Upload-Content-Length"] = str(int(total_size))
-        r = requests.post(
-            url,
-            headers=headers,
-            json={"name": actual_name, "parents": [target_parent]},
-            timeout=30,
-        )
-        if r.status_code in (401, 403) and attempt == 0:
-            continue
-        if not r.ok:
-            raise RuntimeError(f"Google Drive resumable init failed ({r.status_code}): {r.text[:300]}")
-        loc = r.headers.get("Location")
-        if not loc:
-            raise RuntimeError("Google Drive did not return a resumable upload Location header")
-        return loc
-    raise RuntimeError("Google Drive authentication failed after token refresh")
-
-def _gd_push_resumable_chunk(resumable_uri, chunk_bytes, offset, total_size=None):
-    chunk_len = len(chunk_bytes)
-    if chunk_len == 0:
-        return int(offset or 0)
-    end_byte = int(offset) + chunk_len - 1
-    total_str = str(int(total_size)) if (total_size is not None and int(total_size) > 0) else "*"
-    headers = {
-        "Content-Length": str(chunk_len),
-        "Content-Range": f"bytes {int(offset)}-{end_byte}/{total_str}",
-    }
-    r = requests.put(resumable_uri, data=chunk_bytes, headers=headers, timeout=300)
-    if r.status_code not in (200, 201, 308):
-        raise RuntimeError(f"Google Drive chunk upload failed ({r.status_code}): {r.text[:300]}")
-    return int(offset) + chunk_len
-
-def _gd_query_resumable_offset(resumable_uri, total_size=None):
-    total_str = str(int(total_size)) if (total_size is not None and int(total_size) > 0) else "*"
-    headers = {
-        "Content-Length": "0",
-        "Content-Range": f"bytes */{total_str}",
-    }
-    r = requests.put(resumable_uri, headers=headers, timeout=20)
-    if r.status_code in (200, 201):
-        return int(total_size or 0)
-    if r.status_code == 308:
-        rng = r.headers.get("Range") or ""
-        if "-" in rng:
-            try:
-                return int(rng.split("-")[-1].strip()) + 1
-            except Exception:
-                pass
-        return 0
-    raise RuntimeError(f"Google Drive session check failed ({r.status_code})")
-
-def _gd_cancel_resumable_upload(resumable_uri):
-    if not resumable_uri:
-        return
-    try:
-        requests.delete(resumable_uri, timeout=15)
-    except Exception:
-        pass
-
-def _gd_upload_file(
-    parent_id,
-    filename,
-    data_or_stream,
-    mime_type="application/octet-stream",
-    relative_path=None,
-    account_id=None,
-    total_size=None,
-):
-    if isinstance(data_or_stream, (bytes, bytearray)):
-        raw_bytes = bytes(data_or_stream)
-        total_size = len(raw_bytes)
-        stream_obj = io.BytesIO(raw_bytes)
-    elif hasattr(data_or_stream, "read"):
-        stream_obj = data_or_stream
-    else:
-        raw_bytes = str(data_or_stream).encode("utf-8")
-        total_size = len(raw_bytes)
-        stream_obj = io.BytesIO(raw_bytes)
-
-    resumable_uri = _gd_start_resumable_upload(
-        parent_id,
-        filename,
-        mime_type=mime_type,
-        total_size=total_size,
-        relative_path=relative_path,
-        account_id=account_id,
-    )
-    if total_size is not None and int(total_size) == 0:
-        r = requests.put(
-            resumable_uri,
-            data=b"",
-            headers={"Content-Length": "0", "Content-Range": "bytes */0"},
-            timeout=60,
-        )
-        if r.status_code not in (200, 201):
-            raise RuntimeError(f"Google Drive empty file upload failed ({r.status_code}): {r.text[:300]}")
-        return
-
-    chunk_unit = 5 * 1024 * 1024  # 5 MiB (multiple of 256 KiB required by Google Drive)
-    offset = 0
-    while True:
-        buf = bytearray()
-        while len(buf) < chunk_unit:
-            part = stream_obj.read(chunk_unit - len(buf))
-            if not part:
-                break
-            buf.extend(part)
-        if not buf:
-            if offset == 0:
-                requests.put(
-                    resumable_uri,
-                    data=b"",
-                    headers={"Content-Length": "0", "Content-Range": "bytes */0"},
-                    timeout=60,
-                )
-            break
-        is_last = len(buf) < chunk_unit
-        final_total = (offset + len(buf)) if (is_last and total_size is None) else total_size
-        offset = _gd_push_resumable_chunk(resumable_uri, bytes(buf), offset, total_size=final_total)
-        if is_last:
-            break
+_sanitize_smb_path = smb_manager.sanitize_smb_path
 
 
-def _gd_update_file_content(file_id, data_or_stream, mime_type="text/plain; charset=utf-8", account_id=None):
-    _gd_meta_cache.pop(_gd_cache_key(account_id, file_id), None)
-    _gd_meta_cache.pop(file_id, None)
-    svc = _gd_svc(account_id=account_id)
-    stream_obj = data_or_stream if hasattr(data_or_stream, "read") else io.BytesIO(
-        data_or_stream if isinstance(data_or_stream, (bytes, bytearray)) else str(data_or_stream).encode("utf-8")
-    )
-    media = MediaIoBaseUpload(stream_obj, mimetype=mime_type, chunksize=8 * 1024 * 1024, resumable=True)
-    return svc.files().update(
-        fileId=file_id,
-        media_body=media,
-        fields="id,name,size,modifiedTime",
-        supportsAllDrives=True,
-    ).execute()
+def _prune_main_caches(now=None):
+    now = now or time.time()
+    for cache_dict, ttl, max_entries in (
+        (_SMB_SIZE_CACHE, _SMB_SIZE_TTL, _SMB_SIZE_MAX_ENTRIES),
+        (_PROBE_CACHE, _PROBE_TTL, _PROBE_MAX_ENTRIES),
+    ):
+        expired = [k for k, v in list(cache_dict.items()) if (now - v[0]) >= ttl]
+        for k in expired:
+            cache_dict.pop(k, None)
+        if len(cache_dict) > max_entries:
+            oldest = sorted(cache_dict.keys(), key=lambda k: cache_dict[k][0])
+            for k in oldest[: len(cache_dict) - max_entries]:
+                cache_dict.pop(k, None)
 
-def _gd_move_file(file_id, dest_folder_id, account_id=None):
-    dest_id = dest_folder_id or "root"
-    if file_id == dest_id:
-        raise ValueError("Cannot move a folder into itself")
-    _gd_meta_cache.pop(_gd_cache_key(account_id, file_id), None)
-    _gd_meta_cache.pop(file_id, None)
-    svc = _gd_svc(account_id=account_id)
-    meta = svc.files().get(
-        fileId=file_id,
-        fields="id,name,parents",
-        supportsAllDrives=True,
-    ).execute()
-    prev_parents = ",".join(meta.get("parents") or [])
-    return svc.files().update(
-        fileId=file_id,
-        addParents=dest_id,
-        removeParents=prev_parents,
-        fields="id,name,parents",
-        supportsAllDrives=True,
-    ).execute()
+    with _auth_lock:
+        expired_locks = [
+            k for k, rec in list(_AUTH_UNKNOWN_LOCKOUTS.items())
+            if float(rec.get("locked_until", 0) or 0) > 0 and float(rec.get("locked_until", 0)) <= now
+        ]
+        for k in expired_locks:
+            _AUTH_UNKNOWN_LOCKOUTS.pop(k, None)
 
-def _gd_rename_file(file_id, new_name, account_id=None):
-    _gd_meta_cache.pop(_gd_cache_key(account_id, file_id), None)
-    _gd_meta_cache.pop(file_id, None)
-    return _gd_svc(account_id=account_id).files().update(
-        fileId=file_id,
-        body={"name": new_name},
-        fields="id,name",
-        supportsAllDrives=True,
-    ).execute()
-
-def _gd_delete_file(file_id, account_id=None):
-    _gd_meta_cache.pop(_gd_cache_key(account_id, file_id), None)
-    _gd_meta_cache.pop(file_id, None)
-    _gd_svc(account_id=account_id).files().delete(fileId=file_id, supportsAllDrives=True).execute()
-
-def _gd_create_folder(parent_id, name, account_id=None):
-    f = _gd_svc(account_id=account_id).files().create(
-        body={
-            "name": name,
-            "parents": [parent_id],
-            "mimeType": "application/vnd.google-apps.folder",
-        },
-        fields="id",
-        supportsAllDrives=True,
-    ).execute()
-    return f["id"]
-
-def _gd_create_zip_tmpfile(file_ids, account_id=None):
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
-    tmp.close()
-
-    def _add_item(zf, fid, arc_prefix):
-        meta = _gd_get_file_meta(fid, account_id=account_id)
-        name = meta["name"]
-        mime = meta["mimeType"]
-        arc_path = f"{arc_prefix}/{name}" if arc_prefix else name
-        if mime == "application/vnd.google-apps.folder":
-            children = _gd_list_files(fid, account_id=account_id)
-            if not children:
-                zf.writestr(arc_path.rstrip("/") + "/", b"")
-            for ch in children:
-                _add_item(zf, ch["id"], arc_path)
-        else:
-            data, _, _ = _gd_download_file(fid, account_id=account_id)
-            zf.writestr(arc_path, data)
-
-    try:
-        with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zf:
-            for fid in file_ids:
-                _add_item(zf, fid, "")
-        size = os.path.getsize(tmp.name)
-        return tmp.name, size
-    except Exception:
-        try:
-            os.unlink(tmp.name)
-        except Exception:
-            pass
-        raise
-
-gdrive_manager._save_creds = _gd_save_creds
-gdrive_manager._load_creds = _gd_load_creds
-gdrive_manager.is_authenticated = _gd_is_authenticated
-gdrive_manager.list_accounts = _gd_list_accounts
-gdrive_manager.rename_account = _gd_rename_account
-gdrive_manager.update_account_smb_proxy = _gd_update_account_smb_proxy
-gdrive_manager.sanitize_smb_share_name = _gd_sanitize_smb_share_name
-gdrive_manager.remove_account = _gd_remove_account
-gdrive_manager.get_auth_url = _gd_get_auth_url
-gdrive_manager.handle_callback = _gd_handle_callback
-gdrive_manager.revoke = _gd_remove_account
-gdrive_manager._svc = _gd_svc
-gdrive_manager.list_files = _gd_list_files
-gdrive_manager.get_file_meta = _gd_get_file_meta
-gdrive_manager.stream_file_range = _gd_stream_file_range
-gdrive_manager.download_file = _gd_download_file
-gdrive_manager.ensure_folder_path = _gd_ensure_folder_path
-gdrive_manager.resolve_upload_target = _gd_resolve_upload_target
-gdrive_manager.start_resumable_upload = _gd_start_resumable_upload
-gdrive_manager.push_resumable_chunk = _gd_push_resumable_chunk
-gdrive_manager.query_resumable_offset = _gd_query_resumable_offset
-gdrive_manager.cancel_resumable_upload = _gd_cancel_resumable_upload
-gdrive_manager.upload_file = _gd_upload_file
-gdrive_manager.update_file_content = _gd_update_file_content
-gdrive_manager.move_file = _gd_move_file
-gdrive_manager.rename_file = _gd_rename_file
-gdrive_manager.delete_file = _gd_delete_file
-gdrive_manager.create_folder = _gd_create_folder
-gdrive_manager.create_zip_tmpfile = _gd_create_zip_tmpfile
-
-# ── Ensure smb_manager has path sanitization, streaming upload, move, & size cache ─
-def _sanitize_smb_path(path, allow_root=True):
-    raw = str(path or "").replace("\x00", "").replace("\\", "/").strip()
-    parts = []
-    for seg in raw.split("/"):
-        seg = seg.strip()
-        if not seg or seg == ".":
-            continue
-        if seg == "..":
-            raise ValueError("Invalid SMB path: path traversal ('..') is not allowed")
-        parts.append(seg)
-    if not parts:
-        if allow_root:
-            return "/"
-        raise ValueError("SMB path cannot be empty")
-    return "/" + "/".join(parts)
-
-def _smb_upload_file(share_id, dest_path, data_or_stream):
-    norm_path = _sanitize_smb_path(dest_path, allow_root=False)
-    cfg = smb_manager._cfg(share_id)
-    c = smb_manager._conn(cfg)
-    try:
-        parent = "/".join(norm_path.split("/")[:-1])
-        if parent and parent != "/":
-            smb_manager._ensure_dirs_on_conn(c, cfg["share"], parent)
-        file_obj = data_or_stream if hasattr(data_or_stream, "read") else io.BytesIO(
-            data_or_stream if isinstance(data_or_stream, (bytes, bytearray)) else str(data_or_stream).encode("utf-8")
-        )
-        c.storeFile(cfg["share"], norm_path, file_obj)
-    finally:
-        c.close()
-
-def _smb_upload_chunk(share_id, dest_path, chunk_bytes, offset=0, truncate=False):
-    norm_path = _sanitize_smb_path(dest_path, allow_root=False)
-    cfg = smb_manager._cfg(share_id)
-    c = smb_manager._conn(cfg)
-    try:
-        if offset == 0:
-            parent = "/".join(norm_path.split("/")[:-1])
-            if parent and parent != "/":
-                smb_manager._ensure_dirs_on_conn(c, cfg["share"], parent)
-        bio = io.BytesIO(chunk_bytes if isinstance(chunk_bytes, (bytes, bytearray)) else bytes(chunk_bytes))
-        c.storeFileFromOffset(
-            cfg["share"],
-            norm_path,
-            bio,
-            offset=int(offset or 0),
-            truncate=bool(truncate),
-            timeout=300,
-        )
-    finally:
-        c.close()
-
-def _smb_move_path(share_id, old_path, dest_dir):
-    norm_old = _sanitize_smb_path(old_path, allow_root=False)
-    norm_dest_dir = _sanitize_smb_path(dest_dir, allow_root=True)
-    base_name = norm_old.rstrip("/").split("/")[-1]
-    new_path = (norm_dest_dir.rstrip("/") + "/" + base_name) if norm_dest_dir != "/" else ("/" + base_name)
-    if new_path == norm_old:
-        return new_path
-    if new_path.startswith(norm_old.rstrip("/") + "/"):
-        raise ValueError("Cannot move a folder into itself")
-    cfg = smb_manager._cfg(share_id)
-    c = smb_manager._conn(cfg)
-    try:
-        if norm_dest_dir != "/":
-            smb_manager._ensure_dirs_on_conn(c, cfg["share"], norm_dest_dir)
-        c.rename(cfg["share"], norm_old, new_path)
-        return new_path
-    finally:
-        c.close()
-
-smb_manager.sanitize_smb_path = _sanitize_smb_path
-smb_manager.upload_file = _smb_upload_file
-smb_manager.upload_chunk = _smb_upload_chunk
-smb_manager.move_path = _smb_move_path
 
 def _get_smb_file_size(share_id, path):
     norm_path = _sanitize_smb_path(path, allow_root=False)
     key = f"{share_id}:{norm_path}"
     now = time.time()
+    _prune_main_caches(now)
     cached = _SMB_SIZE_CACHE.get(key)
     if cached and (now - cached[0]) < _SMB_SIZE_TTL:
         return cached[1]
@@ -990,141 +116,6 @@ def _get_smb_file_size(share_id, path):
     _SMB_SIZE_CACHE[key] = (now, sz)
     return sz
 
-def _smb_stream_file_range(share_id, path, start=0, length=None, chunk_size=262144):
-    path = _sanitize_smb_path(path, allow_root=False)
-    q = queue.Queue(maxsize=32)
-    sentinel = object()
-    aborted = threading.Event()
-    smb_op_timeout = 14400
-
-    class _AbortStream(Exception):
-        pass
-
-    class _QueueWriter:
-        def __init__(self, max_bytes):
-            self.remaining = max_bytes
-            self.written = 0
-            self.buf = bytearray()
-
-        def write(self, data):
-            if aborted.is_set():
-                raise _AbortStream()
-            if not data:
-                return 0
-            if self.remaining is not None:
-                if self.remaining <= 0:
-                    raise _AbortStream()
-                if len(data) > self.remaining:
-                    data = data[:self.remaining]
-                self.remaining -= len(data)
-            self.written += len(data)
-            self.buf.extend(data)
-            while len(self.buf) >= chunk_size:
-                if aborted.is_set():
-                    raise _AbortStream()
-                try:
-                    q.put(bytes(self.buf[:chunk_size]), timeout=0.5)
-                    del self.buf[:chunk_size]
-                except queue.Full:
-                    if aborted.is_set():
-                        raise _AbortStream()
-            return len(data)
-
-        def flush(self):
-            while self.buf and not aborted.is_set():
-                try:
-                    q.put(bytes(self.buf), timeout=0.5)
-                    self.buf.clear()
-                except queue.Full:
-                    if aborted.is_set():
-                        break
-
-    def _producer():
-        cfg = None
-        writer = _QueueWriter(length)
-        retries = 0
-        try:
-            cfg = smb_manager._cfg(share_id)
-            while not aborted.is_set():
-                if writer.remaining is not None and writer.remaining <= 0:
-                    break
-                c = None
-                prev_written = writer.written
-                try:
-                    c = smb_manager._conn(cfg)
-                    curr_offset = start + writer.written
-                    if curr_offset == 0 and writer.remaining is None:
-                        c.retrieveFile(cfg["share"], path, writer, timeout=smb_op_timeout)
-                    else:
-                        max_len = writer.remaining if (writer.remaining is not None and writer.remaining > 0) else -1
-                        c.retrieveFileFromOffset(
-                            cfg["share"],
-                            path,
-                            writer,
-                            offset=curr_offset,
-                            max_length=max_len,
-                            timeout=smb_op_timeout,
-                        )
-                    writer.flush()
-                    break
-                except _AbortStream:
-                    break
-                except Exception as e:
-                    if aborted.is_set():
-                        break
-                    if writer.remaining is not None and writer.remaining <= 0:
-                        writer.flush()
-                        break
-                    if writer.written > prev_written:
-                        retries = 0
-                    else:
-                        retries += 1
-                    if retries > 4:
-                        try:
-                            writer.flush()
-                        except Exception:
-                            pass
-                        try:
-                            q.put(e, timeout=1.0)
-                        except Exception:
-                            pass
-                        break
-                finally:
-                    if c is not None:
-                        try:
-                            c.close()
-                        except Exception:
-                            pass
-        except Exception as outer_e:
-            if not aborted.is_set():
-                try:
-                    q.put(outer_e, timeout=1.0)
-                except Exception:
-                    pass
-        finally:
-            try:
-                q.put(sentinel, timeout=1.0)
-            except Exception:
-                pass
-
-    threading.Thread(target=_producer, daemon=True).start()
-
-    try:
-        sent = 0
-        while True:
-            item = q.get()
-            if item is sentinel:
-                break
-            if isinstance(item, Exception):
-                raise item
-            sent += len(item)
-            yield item
-            if length is not None and sent >= length:
-                break
-    finally:
-        aborted.set()
-
-smb_manager.stream_file_range = _smb_stream_file_range
 
 # ── Internal Loopback HTTP Range Server for FFmpeg & FFprobe ──────────────────
 class _InternalMediaRangeHandler(BaseHTTPRequestHandler):
@@ -1605,6 +596,7 @@ def _analyze_probe_data(data, filename=""):
 def probe_media_info(cache_key, internal_url, filename="", fallback_gen_fn=None):
     cache_key = f"v3:{cache_key}"
     now = time.time()
+    _prune_main_caches(now)
     cached = _PROBE_CACHE.get(cache_key)
     if cached and (now - cached[0]) < _PROBE_TTL:
         return cached[1]
@@ -2302,6 +1294,7 @@ def smb_download(share_id):
 def smb_upload(share_id):
     dest = request.args.get("path", "/")
     rel_path = (request.form.get("relative_path") or request.args.get("relative_path") or "").strip()
+    conflict_action = (request.form.get("conflict_action") or request.args.get("conflict_action") or "replace").strip().lower()
     f = request.files.get("file")
     if not f:
         return jsonify({"error": "No file provided"}), 400
@@ -2309,9 +1302,11 @@ def smb_upload(share_id):
         norm_dest = _sanitize_smb_path(dest, allow_root=True)
         sub_path = (rel_path or f.filename or "").lstrip("/")
         target_path = _sanitize_smb_path(norm_dest.rstrip("/") + "/" + sub_path, allow_root=False)
-        smb_manager.upload_file(share_id, target_path, f.stream)
+        saved_path = smb_manager.upload_file(share_id, target_path, f.stream, conflict_action=conflict_action)
         _SMB_SIZE_CACHE.pop(f"{share_id}:{target_path}", None)
-        return jsonify({"ok": True})
+        if saved_path:
+            _SMB_SIZE_CACHE.pop(f"{share_id}:{saved_path}", None)
+        return jsonify({"ok": True, "path": saved_path})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
@@ -2328,7 +1323,7 @@ def smb_save_content(share_id):
     try:
         target_path = _sanitize_smb_path(raw_path, allow_root=False)
         encoded = str(content).encode("utf-8")
-        smb_manager.upload_file(share_id, target_path, io.BytesIO(encoded))
+        smb_manager.upload_file(share_id, target_path, io.BytesIO(encoded), conflict_action="replace")
         _SMB_SIZE_CACHE[f"{share_id}:{target_path}"] = (time.time(), len(encoded))
         return jsonify({"ok": True, "path": target_path, "size": len(encoded)})
     except ValueError as e:
@@ -2341,13 +1336,15 @@ def smb_save_content(share_id):
 def smb_rename(share_id):
     b = request.get_json(force=True) or {}
     old_path = (b.get("path") or "").strip()
-    new_name = (b.get("new_name") or "").strip()
+    new_name = (b.get("new_name") or b.get("name") or "").strip()
+    conflict_action = (b.get("conflict_action") or b.get("conflictAction") or "replace").strip().lower()
     if not old_path or not new_name:
         return jsonify({"error": "path and new_name are required"}), 400
     try:
         norm_old = _sanitize_smb_path(old_path, allow_root=False)
-        new_path = smb_manager.rename_path(share_id, norm_old, new_name)
+        new_path = smb_manager.rename_path(share_id, norm_old, new_name, conflict_action=conflict_action)
         _SMB_SIZE_CACHE.pop(f"{share_id}:{norm_old}", None)
+        _SMB_SIZE_CACHE.pop(f"{share_id}:{new_path}", None)
         return jsonify({"ok": True, "path": new_path})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -2672,6 +1669,7 @@ def gdrive_upload():
     folder_id = request.args.get("folder","root")
     account_id = request.args.get("account_id", "").strip() or None
     rel_path = (request.form.get("relative_path") or request.args.get("relative_path") or "").strip()
+    conflict_action = (request.form.get("conflict_action") or request.args.get("conflict_action") or "replace").strip().lower()
     f = request.files.get("file")
     if not f:
         return jsonify({"error": "No file provided"}), 400
@@ -2683,6 +1681,7 @@ def gdrive_upload():
             f.content_type or "application/octet-stream",
             relative_path=rel_path or None,
             account_id=account_id,
+            conflict_action=conflict_action,
         )
         return jsonify({"ok": True})
     except ValueError as e:
@@ -2720,11 +1719,12 @@ def gdrive_rename(file_id):
     b = request.get_json(force=True) or {}
     account_id = (request.args.get("account_id") or b.get("account_id") or "").strip() or None
     new_name = (b.get("name") or b.get("new_name") or "").strip()
+    conflict_action = (b.get("conflict_action") or b.get("conflictAction") or "replace").strip().lower()
     if not new_name:
         return jsonify({"error": "New name is required"}), 400
     try:
-        gdrive_manager.rename_file(file_id, new_name, account_id=account_id)
-        return jsonify({"ok": True})
+        res = gdrive_manager.rename_file(file_id, new_name, account_id=account_id, conflict_action=conflict_action)
+        return jsonify({"ok": True, "file": res})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -3029,6 +2029,7 @@ def onedrive_upload():
     folder_id = request.args.get("folder", "root")
     account_id = request.args.get("account_id", "").strip() or None
     rel_path = (request.form.get("relative_path") or request.args.get("relative_path") or "").strip()
+    conflict_action = (request.form.get("conflict_action") or request.args.get("conflict_action") or "replace").strip().lower()
     f = request.files.get("file")
     if not f:
         return jsonify({"error": "No file provided"}), 400
@@ -3040,6 +2041,7 @@ def onedrive_upload():
             f.content_type or "application/octet-stream",
             relative_path=rel_path or None,
             account_id=account_id,
+            conflict_action=conflict_action,
         )
         return jsonify({"ok": True})
     except ValueError as e:
@@ -3077,11 +2079,12 @@ def onedrive_rename(file_id):
     b = request.get_json(force=True) or {}
     account_id = (request.args.get("account_id") or b.get("account_id") or "").strip() or None
     new_name = (b.get("name") or b.get("new_name") or "").strip()
+    conflict_action = (b.get("conflict_action") or b.get("conflictAction") or "replace").strip().lower()
     if not new_name:
         return jsonify({"error": "New name is required"}), 400
     try:
-        onedrive_manager.rename_file(file_id, new_name, account_id=account_id)
-        return jsonify({"ok": True})
+        res = onedrive_manager.rename_file(file_id, new_name, account_id=account_id, conflict_action=conflict_action)
+        return jsonify({"ok": True, "file": res})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -3379,6 +2382,7 @@ def filejump_upload():
     folder_id = request.args.get("folder", "root")
     account_id = request.args.get("account_id", "").strip() or None
     rel_path = (request.form.get("relative_path") or request.args.get("relative_path") or "").strip()
+    conflict_action = (request.form.get("conflict_action") or request.args.get("conflict_action") or "replace").strip().lower()
     f = request.files.get("file")
     if not f:
         return jsonify({"error": "No file provided"}), 400
@@ -3390,6 +2394,7 @@ def filejump_upload():
             f.content_type or "application/octet-stream",
             relative_path=rel_path or None,
             account_id=account_id,
+            conflict_action=conflict_action,
         )
         return jsonify({"ok": True})
     except ValueError as e:
@@ -3427,11 +2432,12 @@ def filejump_rename(file_id):
     b = request.get_json(force=True) or {}
     account_id = (request.args.get("account_id") or b.get("account_id") or "").strip() or None
     new_name = (b.get("name") or b.get("new_name") or "").strip()
+    conflict_action = (b.get("conflict_action") or b.get("conflictAction") or "replace").strip().lower()
     if not new_name:
         return jsonify({"error": "New name is required"}), 400
     try:
-        filejump_manager.rename_file(file_id, new_name, account_id=account_id)
-        return jsonify({"ok": True})
+        res = filejump_manager.rename_file(file_id, new_name, account_id=account_id, conflict_action=conflict_action)
+        return jsonify({"ok": True, "file": res})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -3614,6 +2620,7 @@ def _start_filejump_pipe_worker(sess):
     actual_name = sess.get("resolvedName") or sess["fileName"]
     mime_type = sess["mimeType"]
     total_size = sess["totalSize"]
+    conflict_action = sess.get("conflictAction") or "replace"
 
     def _worker():
         try:
@@ -3625,6 +2632,7 @@ def _start_filejump_pipe_worker(sess):
                 relative_path=None,
                 account_id=drive_id,
                 total_size=total_size,
+                conflict_action=conflict_action,
             )
             pipe.result = res
         except Exception as exc:
@@ -3642,8 +2650,9 @@ def _start_filejump_pipe_worker(sess):
 
 def _cleanup_expired_upload_sessions():
     now = time.time()
+    _prune_main_caches(now)
     expired = [
-        sid for sid, s in _UPLOAD_SESSIONS.items()
+        sid for sid, s in list(_UPLOAD_SESSIONS.items())
         if now - s.get("updatedAt", s.get("createdAt", now)) > 14400
     ]
     for sid in expired:
@@ -3653,6 +2662,97 @@ def _cleanup_expired_upload_sessions():
                 s["pipe"].abort()
             except Exception:
                 pass
+
+
+@app.post("/api/transfers/check-conflicts")
+@auth.require_auth
+def check_transfer_conflicts():
+    """
+    Checks a batch of candidate files/folders against a target destination folder
+    (including nested relativePaths) and returns any items that already exist.
+    """
+    b = request.get_json(force=True, silent=True) or {}
+    drive_type = str(b.get("driveType") or b.get("drive_type") or "").strip().lower()
+    drive_id = str(b.get("driveId") or b.get("drive_id") or "default").strip()
+    base_folder = str(b.get("folder") or b.get("path") or ("/" if drive_type == "smb" else "root")).strip()
+    items = b.get("items") or []
+
+    if drive_type not in ("smb", "gdrive", "onedrive", "filejump"):
+        return jsonify({"error": "Invalid target drive type"}), 400
+    if not items:
+        return jsonify({"conflicts": []})
+
+    folder_listing_cache = {}
+    subpath_id_cache = {(): base_folder}
+
+    def _list_target_folder(fld_id):
+        if fld_id in folder_listing_cache:
+            return folder_listing_cache[fld_id]
+        try:
+            if drive_type == "smb":
+                entries = smb_manager.browse(drive_id, fld_id)
+            elif drive_type == "gdrive":
+                entries = gdrive_manager.list_files(fld_id, account_id=drive_id)
+            elif drive_type == "onedrive":
+                entries = onedrive_manager.list_files(fld_id, account_id=drive_id)
+            elif drive_type == "filejump":
+                entries = filejump_manager.list_files(fld_id, account_id=drive_id)
+            else:
+                entries = []
+        except Exception:
+            entries = []
+        by_lower = {str(e.get("name") or "").lower(): e for e in entries if e.get("name")}
+        folder_listing_cache[fld_id] = by_lower
+        return by_lower
+
+    def _resolve_existing_subfolder(segments_tuple):
+        if segments_tuple in subpath_id_cache:
+            return subpath_id_cache[segments_tuple]
+        parent_tuple = segments_tuple[:-1]
+        parent_id = _resolve_existing_subfolder(parent_tuple)
+        if parent_id is None:
+            subpath_id_cache[segments_tuple] = None
+            return None
+        seg_name = segments_tuple[-1]
+        parent_map = _list_target_folder(parent_id)
+        match = parent_map.get(seg_name.lower())
+        if match and match.get("type") == "folder":
+            resolved = match.get("path") if drive_type == "smb" else match.get("id")
+            subpath_id_cache[segments_tuple] = resolved
+            return resolved
+        subpath_id_cache[segments_tuple] = None
+        return None
+
+    conflicts = []
+    for idx, it in enumerate(items):
+        raw_name = str(it.get("name") or it.get("fileName") or "").strip()
+        rel_path = str(it.get("relativePath") or it.get("relative_path") or "").strip()
+        if rel_path:
+            norm_rel = rel_path.replace("\\", "/").strip("/")
+            parts = [p for p in norm_rel.split("/") if p and p not in (".", "..")]
+        else:
+            parts = [raw_name] if raw_name else []
+        if not parts:
+            continue
+        leaf_name = parts[-1]
+        dir_tuple = tuple(parts[:-1])
+        target_folder_id = _resolve_existing_subfolder(dir_tuple)
+        if target_folder_id is None:
+            continue
+        listing_map = _list_target_folder(target_folder_id)
+        existing = listing_map.get(leaf_name.lower())
+        if existing:
+            conflicts.append({
+                "index": idx,
+                "key": rel_path or raw_name,
+                "name": leaf_name,
+                "relativePath": rel_path or leaf_name,
+                "existingId": existing.get("path") if drive_type == "smb" else existing.get("id"),
+                "existingType": existing.get("type", "file"),
+                "existingSize": existing.get("size", 0),
+            })
+
+    return jsonify({"conflicts": conflicts})
 
 
 @app.post("/api/transfers/upload/init")
@@ -3667,6 +2767,9 @@ def init_resumable_upload():
     total_size = int(b.get("totalSize") if b.get("totalSize") is not None else (b.get("total_size") or 0))
     mime_type = str(b.get("mimeType") or b.get("mime_type") or "application/octet-stream").strip()
     client_key = str(b.get("clientKey") or b.get("client_key") or "").strip()
+    conflict_action = str(b.get("conflictAction") or b.get("conflict_action") or "replace").strip().lower()
+    if conflict_action not in ("replace", "skip", "keep_both"):
+        conflict_action = "replace"
 
     if drive_type not in ("smb", "gdrive", "onedrive", "filejump"):
         return jsonify({"error": "Invalid target drive type"}), 400
@@ -3678,7 +2781,7 @@ def init_resumable_upload():
             _cleanup_expired_upload_sessions()
             if client_key:
                 session_id = "up_" + hashlib.sha256(
-                    f"{drive_type}:{drive_id}:{folder}:{relative_path or file_name}:{total_size}:{client_key}".encode("utf-8")
+                    f"{drive_type}:{drive_id}:{folder}:{relative_path or file_name}:{total_size}:{client_key}:{conflict_action}".encode("utf-8")
                 ).hexdigest()[:24]
             else:
                 session_id = f"up_{secrets.token_hex(12)}"
@@ -3727,7 +2830,6 @@ def init_resumable_upload():
                         "resumed": True,
                     })
 
-        # Prepare target destination metadata / upstream session outside the lock
         sess = {
             "sessionId": session_id,
             "driveType": drive_type,
@@ -3737,6 +2839,7 @@ def init_resumable_upload():
             "relativePath": relative_path,
             "totalSize": total_size,
             "mimeType": mime_type or guess_media_mime(file_name),
+            "conflictAction": conflict_action,
             "offset": 0,
             "createdAt": time.time(),
             "updatedAt": time.time(),
@@ -3746,10 +2849,43 @@ def init_resumable_upload():
         if drive_type == "smb":
             sub = relative_path if relative_path else file_name
             dest_full = _sanitize_smb_path(folder.rstrip("/") + "/" + sub.lstrip("/"), allow_root=False)
+            if conflict_action in ("skip", "keep_both"):
+                parent_dir = "/".join(dest_full.split("/")[:-1]) or "/"
+                leaf = dest_full.split("/")[-1]
+                try:
+                    siblings = [e["name"] for e in smb_manager.browse(drive_id, parent_dir)]
+                except Exception:
+                    siblings = []
+                if any(s.lower() == leaf.lower() for s in siblings):
+                    if conflict_action == "skip":
+                        return jsonify({
+                            "sessionId": session_id,
+                            "upload_id": session_id,
+                            "offset": total_size,
+                            "totalSize": total_size,
+                            "total_size": total_size,
+                            "skipped": True,
+                        })
+                    elif conflict_action == "keep_both":
+                        unique_leaf = smb_manager.generate_unique_name(leaf, siblings)
+                        dest_full = _sanitize_smb_path(parent_dir.rstrip("/") + "/" + unique_leaf, allow_root=False)
             sess["destFull"] = dest_full
             if total_size == 0:
                 smb_manager.upload_chunk(drive_id, dest_full, b"", offset=0, truncate=True)
         elif drive_type == "gdrive":
+            if conflict_action == "skip":
+                target_parent, actual_name = gdrive_manager.resolve_upload_target(
+                    folder or "root", file_name, relative_path=relative_path or None, account_id=drive_id
+                )
+                if gdrive_manager.find_items_by_name(target_parent, actual_name, account_id=drive_id):
+                    return jsonify({
+                        "sessionId": session_id,
+                        "upload_id": session_id,
+                        "offset": total_size,
+                        "totalSize": total_size,
+                        "total_size": total_size,
+                        "skipped": True,
+                    })
             if total_size > 0:
                 sess["resumableUri"] = gdrive_manager.start_resumable_upload(
                     folder or "root",
@@ -3758,14 +2894,30 @@ def init_resumable_upload():
                     total_size=total_size,
                     relative_path=relative_path or None,
                     account_id=drive_id,
+                    conflict_action=conflict_action,
                 )
         elif drive_type == "onedrive":
+            if conflict_action == "skip":
+                target_parent, actual_name = onedrive_manager.resolve_upload_target(
+                    folder or "root", file_name, relative_path=relative_path or None, account_id=drive_id
+                )
+                siblings = onedrive_manager.list_files(target_parent, account_id=drive_id)
+                if any(s["name"].lower() == actual_name.lower() for s in siblings):
+                    return jsonify({
+                        "sessionId": session_id,
+                        "upload_id": session_id,
+                        "offset": total_size,
+                        "totalSize": total_size,
+                        "total_size": total_size,
+                        "skipped": True,
+                    })
             if total_size > 0:
                 sess["uploadUrl"] = onedrive_manager.start_resumable_upload(
                     folder or "root",
                     file_name,
                     relative_path=relative_path or None,
                     account_id=drive_id,
+                    conflict_action=conflict_action,
                 )
         elif drive_type == "filejump":
             target_parent, actual_name = filejump_manager.resolve_upload_target(
@@ -3774,6 +2926,23 @@ def init_resumable_upload():
                 relative_path=relative_path or None,
                 account_id=drive_id,
             )
+            if conflict_action in ("skip", "keep_both"):
+                try:
+                    siblings = filejump_manager.list_files(target_parent, account_id=drive_id)
+                except Exception:
+                    siblings = []
+                if any(s["name"].lower() == actual_name.lower() for s in siblings):
+                    if conflict_action == "skip":
+                        return jsonify({
+                            "sessionId": session_id,
+                            "upload_id": session_id,
+                            "offset": total_size,
+                            "totalSize": total_size,
+                            "total_size": total_size,
+                            "skipped": True,
+                        })
+                    elif conflict_action == "keep_both":
+                        actual_name = filejump_manager.generate_unique_name(actual_name, [s["name"] for s in siblings])
             sess["resolvedParent"] = target_parent
             sess["resolvedName"] = actual_name
 
@@ -3875,6 +3044,7 @@ def chunk_resumable_upload():
             drive_type = sess["driveType"]
             drive_id = sess["driveId"]
             total_size = sess["totalSize"]
+            conflict_action = sess.get("conflictAction") or "replace"
 
             if drive_type == "filejump":
                 pipe = sess.get("pipe")
@@ -3913,6 +3083,7 @@ def chunk_resumable_upload():
                         total_size=total_size,
                         relative_path=sess["relativePath"] or None,
                         account_id=drive_id,
+                        conflict_action=conflict_action,
                     )
                 new_offset = gdrive_manager.push_resumable_chunk(
                     sess["resumableUri"],
@@ -3927,6 +3098,7 @@ def chunk_resumable_upload():
                         sess["fileName"],
                         relative_path=sess["relativePath"] or None,
                         account_id=drive_id,
+                        conflict_action=conflict_action,
                     )
                 new_offset = onedrive_manager.push_resumable_chunk(
                     sess["uploadUrl"],
@@ -3975,6 +3147,7 @@ def complete_resumable_upload():
             rel_path = sess.get("relativePath") or ""
             mime_type = sess.get("mimeType") or guess_media_mime(file_name)
             total_size = int(sess.get("totalSize") or 0)
+            conflict_action = sess.get("conflictAction") or "replace"
 
             if drive_type == "smb":
                 dest_full = sess.get("destFull")
@@ -3990,6 +3163,7 @@ def complete_resumable_upload():
                         relative_path=rel_path or None,
                         account_id=drive_id,
                         total_size=0,
+                        conflict_action=conflict_action,
                     )
             elif drive_type == "onedrive":
                 if total_size == 0 and int(sess.get("offset") or 0) == 0:
@@ -4001,6 +3175,7 @@ def complete_resumable_upload():
                         relative_path=rel_path or None,
                         account_id=drive_id,
                         total_size=0,
+                        conflict_action=conflict_action,
                     )
             elif drive_type == "filejump":
                 pipe = sess.get("pipe")
@@ -4015,6 +3190,7 @@ def complete_resumable_upload():
                         relative_path=None,
                         account_id=drive_id,
                         total_size=0,
+                        conflict_action=conflict_action,
                     )
 
         with _upload_sessions_lock:
@@ -4166,8 +3342,9 @@ def _read_source_item_tree(src_type, src_drive, item):
     raise ValueError(f"Unsupported source drive type: {src_type!r}")
 
 
-def _copy_item_across_drives(src_type, src_drive, item, dest_type, dest_drive, dest_folder):
+def _copy_item_across_drives(src_type, src_drive, item, dest_type, dest_drive, dest_folder, conflict_action="replace"):
     name, is_folder, children, open_fn = _read_source_item_tree(src_type, src_drive, item)
+    action = (conflict_action or "replace").strip().lower()
     if is_folder:
         if dest_type == "smb":
             norm_dest = _sanitize_smb_path(dest_folder, allow_root=True)
@@ -4182,19 +3359,19 @@ def _copy_item_across_drives(src_type, src_drive, item, dest_type, dest_drive, d
         else:
             raise ValueError(f"Unsupported destination drive type: {dest_type!r}")
         for ch in (children or []):
-            _copy_item_across_drives(src_type, src_drive, ch, dest_type, dest_drive, next_dest)
+            _copy_item_across_drives(src_type, src_drive, ch, dest_type, dest_drive, next_dest, conflict_action=action)
     else:
         stream_obj, mime, total_size = open_fn()
         if dest_type == "smb":
             norm_dest = _sanitize_smb_path(dest_folder, allow_root=True)
             target_path = _sanitize_smb_path(norm_dest.rstrip("/") + "/" + name, allow_root=False)
-            smb_manager.upload_file(dest_drive, target_path, stream_obj)
+            smb_manager.upload_file(dest_drive, target_path, stream_obj, conflict_action=action)
         elif dest_type == "gdrive":
-            gdrive_manager.upload_file(dest_folder, name, stream_obj, mime, account_id=dest_drive, total_size=total_size)
+            gdrive_manager.upload_file(dest_folder, name, stream_obj, mime, account_id=dest_drive, total_size=total_size, conflict_action=action)
         elif dest_type == "onedrive":
-            onedrive_manager.upload_file(dest_folder, name, stream_obj, mime, account_id=dest_drive, total_size=total_size)
+            onedrive_manager.upload_file(dest_folder, name, stream_obj, mime, account_id=dest_drive, total_size=total_size, conflict_action=action)
         elif dest_type == "filejump":
-            filejump_manager.upload_file(dest_folder, name, stream_obj, mime, account_id=dest_drive, total_size=total_size)
+            filejump_manager.upload_file(dest_folder, name, stream_obj, mime, account_id=dest_drive, total_size=total_size, conflict_action=action)
         else:
             raise ValueError(f"Unsupported destination drive type: {dest_type!r}")
 
@@ -4211,6 +3388,7 @@ def transfer_items():
     dest_drive = b.get("dest_drive")
     dest_folder = b.get("dest_folder") or ("/" if dest_type == "smb" else "root")
     items = b.get("items") or []
+    default_conflict_action = (b.get("conflict_action") or b.get("conflictAction") or "replace").strip().lower()
 
     if not items:
         return jsonify({"error": "No items selected for transfer"}), 400
@@ -4222,21 +3400,26 @@ def transfer_items():
         if dest_type == "smb":
             dest_folder = _sanitize_smb_path(dest_folder, allow_root=True)
         count = 0
+        skipped = 0
         for item in items:
+            item_action = (item.get("conflict_action") or item.get("conflictAction") or default_conflict_action or "replace").strip().lower()
+            if item_action == "skip":
+                skipped += 1
+                continue
             is_folder = item.get("type") == "folder"
             if is_move and src_type == dest_type and src_drive == dest_drive:
                 if src_type == "smb":
                     src_path = _sanitize_smb_path(item["path"], allow_root=False)
-                    smb_manager.move_path(src_drive, src_path, dest_folder)
+                    smb_manager.move_path(src_drive, src_path, dest_folder, conflict_action=item_action)
                     _SMB_SIZE_CACHE.pop(f"{src_drive}:{src_path}", None)
                 elif src_type == "gdrive":
-                    gdrive_manager.move_file(item["id"], dest_folder, account_id=src_drive)
+                    gdrive_manager.move_file(item["id"], dest_folder, account_id=src_drive, conflict_action=item_action)
                 elif src_type == "onedrive":
-                    onedrive_manager.move_file(item["id"], dest_folder, account_id=src_drive)
+                    onedrive_manager.move_file(item["id"], dest_folder, account_id=src_drive, conflict_action=item_action)
                 elif src_type == "filejump":
-                    filejump_manager.move_file(item["id"], dest_folder, account_id=src_drive)
+                    filejump_manager.move_file(item["id"], dest_folder, account_id=src_drive, conflict_action=item_action)
             else:
-                _copy_item_across_drives(src_type, src_drive, item, dest_type, dest_drive, dest_folder)
+                _copy_item_across_drives(src_type, src_drive, item, dest_type, dest_drive, dest_folder, conflict_action=item_action)
                 if is_move:
                     if src_type == "smb":
                         src_path = _sanitize_smb_path(item["path"], allow_root=False)
@@ -4249,7 +3432,13 @@ def transfer_items():
                     elif src_type == "filejump":
                         filejump_manager.delete_file(item["id"], account_id=src_drive)
             count += 1
-        return jsonify({"ok": True, "copied": count, "moved": count if is_move else 0, "operation": "move" if is_move else "copy"})
+        return jsonify({
+            "ok": True,
+            "copied": count,
+            "moved": count if is_move else 0,
+            "skipped": skipped,
+            "operation": "move" if is_move else "copy",
+        })
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
@@ -4300,7 +3489,7 @@ def _rclone_obscure_password(raw_pw):
 
 def _reconcile_smb_proxy():
     with _smb_proxy_lock:
-        gd_accounts = _gd_load_accounts_raw()
+        gd_accounts = gdrive_manager._load_accounts_raw()
         od_accounts = onedrive_manager._load_accounts_raw()
         fj_accounts = filejump_manager._load_accounts_raw()
         gd_cfg = gdrive_manager.get_config()
@@ -4494,7 +3683,7 @@ def _reconcile_smb_proxy():
         for acc in gd_accounts:
             if not bool(acc.get("smb_enabled", True)):
                 continue
-            share_name = _gd_sanitize_smb_share_name(acc.get("smb_share_name") or "GoogleDrive")
+            share_name = gdrive_manager.sanitize_smb_share_name(acc.get("smb_share_name") or "GoogleDrive")
             while share_name.lower() in used_share_names:
                 share_name = f"{share_name[:28]}_gd"
             used_share_names.add(share_name.lower())
@@ -4599,7 +3788,7 @@ def _get_smb_proxy_status_unlocked():
             configured = True
         except Exception:
             pass
-    gd_accounts = _gd_load_accounts_raw()
+    gd_accounts = gdrive_manager._load_accounts_raw()
     od_accounts = onedrive_manager._load_accounts_raw()
     fj_accounts = filejump_manager._load_accounts_raw()
     mounted_paths = _get_active_mount_points()

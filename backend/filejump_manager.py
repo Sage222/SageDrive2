@@ -714,6 +714,34 @@ def _rest_open_download_response(acc, file_id, range_header=None):
     raise RuntimeError(f"Unable to stream FileJump file '{file_id}'")
 
 
+def generate_unique_name(desired_name, existing_names):
+    lower_set = {str(n).lower() for n in existing_names if n}
+    if desired_name.lower() not in lower_set:
+        return desired_name
+    if "." in desired_name and not desired_name.startswith("."):
+        base, ext = desired_name.rsplit(".", 1)
+        ext = "." + ext
+    else:
+        base, ext = desired_name, ""
+    idx = 1
+    while True:
+        cand = f"{base} ({idx}){ext}"
+        if cand.lower() not in lower_set:
+            return cand
+        idx += 1
+
+
+def _extract_last_page(payload):
+    if not isinstance(payload, dict):
+        return 1
+    for container in (payload, payload.get("data"), payload.get("meta"), payload.get("pagination")):
+        if isinstance(container, dict):
+            lp = container.get("last_page") or container.get("lastPage") or container.get("total_pages")
+            if lp and str(lp).isdigit():
+                return max(1, int(lp))
+    return 1
+
+
 # ── Unified Public Operations ─────────────────────────────────────────────────
 def list_files(folder_id="root", account_id=None):
     acc = _require_account(account_id)
@@ -778,35 +806,50 @@ def list_files(folder_id="root", account_id=None):
                 "mimeType": norm["mimeType"],
             })
 
-    file_params = {"per_page": 500}
-    if clean_parent_id:
-        file_params["folder_id"] = clean_parent_id
-    r_files = requests.get(f"{base}/api/files", headers=headers, params=file_params, timeout=30)
-    r_files.raise_for_status()
-    raw_files = _extract_list_from_payload(r_files.json(), "files", "fileEntries", "entries")
+    page = 1
+    max_pages = 50
+    while page <= max_pages:
+        file_params = {"per_page": 500, "page": page}
+        if clean_parent_id:
+            file_params["folder_id"] = clean_parent_id
+        r_files = requests.get(f"{base}/api/files", headers=headers, params=file_params, timeout=30)
+        r_files.raise_for_status()
+        payload = r_files.json()
+        raw_files = _extract_list_from_payload(payload, "files", "fileEntries", "entries")
+        if not raw_files:
+            break
 
-    for raw_item in raw_files:
-        if not isinstance(raw_item, dict):
-            continue
-        if "folder_id" in raw_item or "folderId" in raw_item:
-            item_folder = raw_item.get("folder_id") if "folder_id" in raw_item else raw_item.get("folderId")
-            if clean_parent_id is None:
-                if item_folder not in (None, "", 0, "0", "root"):
-                    continue
-            else:
-                if str(item_folder) != str(clean_parent_id):
-                    continue
-        norm = _normalize_rest_entry(raw_item, force_type="file")
-        if norm and norm["id"] not in seen_ids:
-            seen_ids.add(norm["id"])
-            out.append({
-                "id": norm["id"],
-                "name": norm["name"],
-                "type": norm["type"],
-                "size": norm["size"],
-                "modified": norm["modified"],
-                "mimeType": norm["mimeType"],
-            })
+        added_in_page = 0
+        for raw_item in raw_files:
+            if not isinstance(raw_item, dict):
+                continue
+            if "folder_id" in raw_item or "folderId" in raw_item:
+                item_folder = raw_item.get("folder_id") if "folder_id" in raw_item else raw_item.get("folderId")
+                if clean_parent_id is None:
+                    if item_folder not in (None, "", 0, "0", "root"):
+                        continue
+                else:
+                    if str(item_folder) != str(clean_parent_id):
+                        continue
+            norm = _normalize_rest_entry(raw_item, force_type="file")
+            if norm and norm["id"] not in seen_ids:
+                seen_ids.add(norm["id"])
+                added_in_page += 1
+                out.append({
+                    "id": norm["id"],
+                    "name": norm["name"],
+                    "type": norm["type"],
+                    "size": norm["size"],
+                    "modified": norm["modified"],
+                    "mimeType": norm["mimeType"],
+                })
+
+        last_page = _extract_last_page(payload)
+        if page >= last_page and (last_page > 1 or len(raw_files) < 500):
+            break
+        if added_in_page == 0:
+            break
+        page += 1
 
     out.sort(key=lambda x: (0 if x["type"] == "folder" else 1, x["name"].lower()))
     return out
@@ -863,6 +906,7 @@ def get_file_meta(file_id, account_id=None):
         "size": norm["size"],
         "mimeType": norm["mimeType"],
         "isFolder": norm["type"] == "folder",
+        "parentId": norm.get("parent_id"),
     }
 
 
@@ -938,13 +982,31 @@ def ensure_folder_path(base_folder_id, parts, account_id=None):
         existing = list_files(curr_id, account_id=account_id)
         found_id = None
         for item in existing:
-            if item.get("type") == "folder" and item.get("name") == part:
+            if item.get("type") == "folder" and item.get("name", "").lower() == part.lower():
                 found_id = item.get("id")
                 break
         if found_id:
             curr_id = found_id
         else:
             curr_id = create_folder(curr_id, part, account_id=account_id)
+    return curr_id
+
+
+def find_existing_folder_path(base_folder_id, parts, account_id=None):
+    curr_id = base_folder_id or "root"
+    for part in parts:
+        part = part.strip()
+        if not part or part in (".", ".."):
+            continue
+        existing = list_files(curr_id, account_id=account_id)
+        found_id = None
+        for item in existing:
+            if item.get("type") == "folder" and item.get("name", "").lower() == part.lower():
+                found_id = item.get("id")
+                break
+        if not found_id:
+            return None
+        curr_id = found_id
     return curr_id
 
 
@@ -1010,11 +1072,30 @@ def upload_file(
     relative_path=None,
     account_id=None,
     total_size=None,
+    conflict_action="replace",
 ):
     acc = _require_account(account_id)
     target_parent, actual_name = resolve_upload_target(
         parent_id, filename, relative_path=relative_path, account_id=account_id
     )
+    action = (conflict_action or "replace").strip().lower()
+    old_ids_to_replace = []
+    if action in ("skip", "keep_both", "replace"):
+        try:
+            siblings = list_files(target_parent, account_id=account_id)
+        except Exception:
+            siblings = []
+        existing_names = [s["name"] for s in siblings]
+        matching_files = [
+            s["id"] for s in siblings
+            if s.get("type") == "file" and s.get("name", "").lower() == actual_name.lower()
+        ]
+        if action == "skip" and matching_files:
+            return matching_files[0]
+        elif action == "keep_both" and matching_files:
+            actual_name = generate_unique_name(actual_name, existing_names)
+        elif action == "replace" and matching_files and acc.get("auth_type") != "webdav":
+            old_ids_to_replace = matching_files
 
     if acc.get("auth_type") == "webdav":
         base_norm = _webdav_norm_path(target_parent)
@@ -1093,7 +1174,14 @@ def upload_file(
         r.raise_for_status()
         resp = r.json()
         entry = resp.get("data") or resp.get("file") or resp.get("fileEntry") or resp
-        return str((entry.get("id") if isinstance(entry, dict) else None) or actual_name)
+        new_id = str((entry.get("id") if isinstance(entry, dict) else None) or actual_name)
+        for old_id in old_ids_to_replace:
+            if str(old_id) != new_id:
+                try:
+                    delete_file(old_id, account_id=account_id)
+                except Exception:
+                    pass
+        return new_id
 
     if hasattr(stream_obj, "seek"):
         try:
@@ -1105,7 +1193,14 @@ def upload_file(
     r.raise_for_status()
     resp = r.json()
     entry = resp.get("data") or resp.get("file") or resp.get("fileEntry") or resp
-    return str((entry.get("id") if isinstance(entry, dict) else None) or actual_name)
+    new_id = str((entry.get("id") if isinstance(entry, dict) else None) or actual_name)
+    for old_id in old_ids_to_replace:
+        if str(old_id) != new_id:
+            try:
+                delete_file(old_id, account_id=account_id)
+            except Exception:
+                pass
+    return new_id
 
 
 def update_file_content(file_id, data_or_stream, mime_type="text/plain; charset=utf-8", account_id=None):
@@ -1132,7 +1227,7 @@ def update_file_content(file_id, data_or_stream, mime_type="text/plain; charset=
     raw_entry = _rest_get_entry_raw(acc, file_id)
     parent_id = raw_entry.get("folder_id") or raw_entry.get("parent_id") or "root"
     name = raw_entry.get("name") or raw_entry.get("file_name") or "file.txt"
-    new_id = upload_file(parent_id, name, raw_bytes, mime_type=mime_type, account_id=account_id)
+    new_id = upload_file(parent_id, name, raw_bytes, mime_type=mime_type, account_id=account_id, conflict_action="replace")
     if str(new_id) != str(file_id):
         try:
             delete_file(file_id, account_id=account_id)
@@ -1141,12 +1236,23 @@ def update_file_content(file_id, data_or_stream, mime_type="text/plain; charset=
     return {"id": new_id, "size": len(raw_bytes)}
 
 
-def move_file(file_id, dest_folder_id, account_id=None):
+def move_file(file_id, dest_folder_id, account_id=None, conflict_action="replace"):
     acc = _require_account(account_id)
+    action = (conflict_action or "replace").strip().lower()
     if acc.get("auth_type") == "webdav":
         src_norm = _webdav_norm_path(file_id)
         base_name = posixpath.basename(src_norm.rstrip("/"))
         dest_dir = _webdav_norm_path(dest_folder_id)
+        try:
+            dest_siblings = list_files(dest_dir, account_id=account_id)
+        except Exception:
+            dest_siblings = []
+        conflicts = [s for s in dest_siblings if s["id"] != src_norm and s["name"].lower() == base_name.lower()]
+        if conflicts:
+            if action == "skip":
+                return {"id": src_norm, "skipped": True}
+            elif action == "keep_both":
+                base_name = generate_unique_name(base_name, [s["name"] for s in dest_siblings])
         new_norm = f"/{base_name}" if dest_dir == "/" else f"{dest_dir.rstrip('/')}/{base_name}"
         if new_norm == src_norm:
             return {"id": src_norm}
@@ -1156,11 +1262,31 @@ def move_file(file_id, dest_folder_id, account_id=None):
             "MOVE",
             src_url,
             auth=_webdav_auth(acc),
-            headers={"Destination": dest_url, "Overwrite": "T"},
+            headers={"Destination": dest_url, "Overwrite": "T" if action == "replace" else "F"},
             timeout=30,
         )
         r.raise_for_status()
         return {"id": new_norm}
+
+    meta = get_file_meta(file_id, account_id=account_id)
+    item_name = meta.get("name") or "item"
+    try:
+        dest_siblings = list_files(dest_folder_id, account_id=account_id)
+    except Exception:
+        dest_siblings = []
+    conflicts = [s for s in dest_siblings if str(s["id"]) != str(file_id) and s["name"].lower() == item_name.lower()]
+    new_rename_after = None
+    if conflicts:
+        if action == "skip":
+            return {"id": file_id, "skipped": True}
+        elif action == "keep_both":
+            new_rename_after = generate_unique_name(item_name, [s["name"] for s in dest_siblings])
+        elif action == "replace":
+            for c_it in conflicts:
+                try:
+                    delete_file(c_it["id"], account_id=account_id)
+                except Exception:
+                    pass
 
     base = _rest_base(acc)
     headers = _rest_headers(acc, "application/json")
@@ -1188,6 +1314,11 @@ def move_file(file_id, dest_folder_id, account_id=None):
             last_resp = r
             continue
         r.raise_for_status()
+        if new_rename_after:
+            try:
+                rename_file(file_id, new_rename_after, account_id=account_id, conflict_action="keep_both")
+            except Exception:
+                pass
         return r.json()
 
     if last_resp is not None:
@@ -1195,26 +1326,59 @@ def move_file(file_id, dest_folder_id, account_id=None):
     raise RuntimeError(f"Failed to move FileJump item '{file_id}'")
 
 
-def rename_file(file_id, new_name, account_id=None):
+def rename_file(file_id, new_name, account_id=None, conflict_action="replace"):
     new_name = (new_name or "").strip()
     if not new_name:
         raise ValueError("New name cannot be empty")
     acc = _require_account(account_id)
+    action = (conflict_action or "replace").strip().lower()
     if acc.get("auth_type") == "webdav":
         src_norm = _webdav_norm_path(file_id)
         parent_dir = posixpath.dirname(src_norm.rstrip("/")) or "/"
+        try:
+            siblings = list_files(parent_dir, account_id=account_id)
+        except Exception:
+            siblings = []
+        conflicts = [s for s in siblings if s["id"] != src_norm and s["name"].lower() == new_name.lower()]
+        if conflicts:
+            if action == "skip":
+                return {"id": src_norm, "name": posixpath.basename(src_norm), "skipped": True}
+            elif action == "keep_both":
+                new_name = generate_unique_name(new_name, [s["name"] for s in siblings if s["id"] != src_norm])
         new_norm = f"/{new_name}" if parent_dir == "/" else f"{parent_dir.rstrip('/')}/{new_name}"
+        if new_norm == src_norm:
+            return {"id": src_norm, "name": new_name}
         src_url = _webdav_build_url(acc, src_norm)
         dest_url = _webdav_build_url(acc, new_norm)
         r = requests.request(
             "MOVE",
             src_url,
             auth=_webdav_auth(acc),
-            headers={"Destination": dest_url, "Overwrite": "T"},
+            headers={"Destination": dest_url, "Overwrite": "T" if action == "replace" else "F"},
             timeout=30,
         )
         r.raise_for_status()
         return {"id": new_norm, "name": new_name}
+
+    meta = get_file_meta(file_id, account_id=account_id)
+    parent_id = meta.get("parentId")
+    parent_folder = f"folder:{parent_id}" if (parent_id and str(parent_id) not in ("0", "root")) else "root"
+    try:
+        siblings = list_files(parent_folder, account_id=account_id)
+    except Exception:
+        siblings = []
+    conflicts = [s for s in siblings if str(s["id"]) != str(file_id) and s["name"].lower() == new_name.lower()]
+    if conflicts:
+        if action == "skip":
+            return {"id": file_id, "name": meta.get("name"), "skipped": True}
+        elif action == "keep_both":
+            new_name = generate_unique_name(new_name, [s["name"] for s in siblings if str(s["id"]) != str(file_id)])
+        elif action == "replace":
+            for c_it in conflicts:
+                try:
+                    delete_file(c_it["id"], account_id=account_id)
+                except Exception:
+                    pass
 
     base = _rest_base(acc)
     headers = _rest_headers(acc, "application/json")

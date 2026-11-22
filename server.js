@@ -38,6 +38,8 @@ const FILEJUMP_ACCOUNTS_FILE = path.join(DATA_DIR, 'filejump_accounts.json');
 const UPLOAD_SESSIONS_DIR = path.join(DATA_DIR, 'upload_sessions');
 fs.mkdirSync(UPLOAD_SESSIONS_DIR, { recursive: true });
 const SMB_PROXY_FILE = path.join(DATA_DIR, 'smb_proxy_credentials.json');
+const ACTIVITY_LOGS_FILE = path.join(DATA_DIR, 'activity_logs.json');
+const MAX_LOG_ENTRIES = 500;
 
 const SESSION_TTL = (parseInt(process.env.SESSION_TTL_HOURS || '24', 10) || 24) * 3600 * 1000;
 const MAX_FAILED_ATTEMPTS = 5;
@@ -1208,6 +1210,129 @@ function getUserTheme(username) {
   return VALID_THEMES.has(t) ? t : DEFAULT_THEME;
 }
 
+function formatLogBytes(bytes) {
+  const n = Number(bytes || 0);
+  if (!Number.isFinite(n) || n <= 0) return '0 B';
+  if (n < 1024) return `${n} B`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let val = n;
+  for (const u of units) {
+    val /= 1024;
+    if (val < 1024 || u === 'TB') return `${val.toFixed(1)} ${u}`;
+  }
+  return `${val.toFixed(1)} TB`;
+}
+
+function loadActivityLogs() {
+  const list = loadJson(ACTIVITY_LOGS_FILE, null);
+  if (Array.isArray(list)) {
+    return list.slice(0, MAX_LOG_ENTRIES);
+  }
+  const now = Date.now();
+  const seeded = [
+    {
+      id: `log_${now}_seed1`,
+      timestamp: new Date(now - 60 * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z'),
+      epoch: now - 60 * 1000,
+      user: 'admin',
+      category: 'add',
+      action: 'System Ready',
+      drive: 'System',
+      target: 'SageDrive',
+      details: 'Initialized SageDrive storage engines (SMB, Google Drive, OneDrive, FileJump)',
+    },
+  ];
+  saveJson(ACTIVITY_LOGS_FILE, seeded);
+  return seeded;
+}
+
+function saveActivityLogs(logs) {
+  const capped = (Array.isArray(logs) ? logs : []).slice(0, MAX_LOG_ENTRIES);
+  saveJson(ACTIVITY_LOGS_FILE, capped);
+}
+
+function addActivityLog(reqOrUser, action, category, details, drive = 'System', target = '') {
+  try {
+    let uname = 'admin';
+    if (typeof reqOrUser === 'string' && reqOrUser.trim()) {
+      uname = reqOrUser.trim();
+    } else if (reqOrUser && typeof reqOrUser === 'object') {
+      if (reqOrUser.session && reqOrUser.session.username) {
+        uname = String(reqOrUser.session.username);
+      } else {
+        const tok = extractToken(reqOrUser);
+        const sess = getSession(tok);
+        if (sess && sess.username) uname = String(sess.username);
+      }
+    }
+    const nowMs = Date.now();
+    const isoTs = new Date(nowMs).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    const entry = {
+      id: `log_${nowMs}_${crypto.randomBytes(3).toString('hex')}`,
+      timestamp: isoTs,
+      epoch: nowMs,
+      user: uname,
+      category: String(category || 'change').trim().toLowerCase(),
+      action: String(action || 'Event').trim(),
+      drive: String(drive || 'System').trim(),
+      target: String(target || '').trim(),
+      details: String(details || '').trim(),
+    };
+    const logs = loadActivityLogs();
+    logs.unshift(entry);
+    saveActivityLogs(logs.slice(0, MAX_LOG_ENTRIES));
+  } catch (err) {
+    console.error('Activity log error:', err.message);
+  }
+}
+
+function escapeCsvCell(val) {
+  const s = String(val ?? '');
+  if (s.includes('"') || s.includes(',') || s.includes('\n') || s.includes('\r')) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
+}
+
+app.get('/api/logs', requireAuth, (_req, res) => {
+  const logs = loadActivityLogs();
+  return res.json({ logs: logs.slice(0, MAX_LOG_ENTRIES), max_entries: MAX_LOG_ENTRIES });
+});
+
+app.get('/api/logs/export.csv', requireAuth, (_req, res) => {
+  const logs = loadActivityLogs().slice(0, MAX_LOG_ENTRIES);
+  const rows = [
+    ['Timestamp (UTC)', 'Category', 'Action', 'User', 'Drive / Source', 'Target', 'Details'].map(escapeCsvCell).join(','),
+  ];
+  for (const item of logs) {
+    rows.push(
+      [
+        item.timestamp || '',
+        item.category || '',
+        item.action || '',
+        item.user || '',
+        item.drive || '',
+        item.target || '',
+        item.details || '',
+      ]
+        .map(escapeCsvCell)
+        .join(',')
+    );
+  }
+  const csvBody = rows.join('\r\n') + '\r\n';
+  res.writeHead(200, {
+    'Content-Type': 'text/csv; charset=utf-8',
+    'Content-Disposition': makeDispositionHeader('sagedrive_activity_logs.csv', true),
+    'Cache-Control': 'no-cache',
+  });
+  return res.end(csvBody);
+});
+
+app.delete('/api/logs', requireAdmin, (_req, res) => {
+  saveActivityLogs([]);
+  return res.json({ ok: true, logs: [] });
+});
+
 // ── Auth (with 5-Strike / 15-Minute Anti-Hammering Lockout) ───────────────────
 app.post('/api/auth/login', (req, res) => {
   const body = req.body || {};
@@ -1224,6 +1349,7 @@ app.post('/api/auth/login', (req, res) => {
   if (lockedUntil > nowSec) {
     const rem = Math.ceil(lockedUntil - nowSec);
     const mins = Math.max(1, Math.ceil(rem / 60));
+    addActivityLog(u || 'anonymous', 'Account Locked', 'security', `Blocked sign-in attempt for locked user '${u || 'unknown'}'`, 'System', u || 'unknown');
     return res.status(429).json({
       error: `Account locked due to ${MAX_FAILED_ATTEMPTS} failed login attempts. Try again in ${mins} minute${mins !== 1 ? 's' : ''} (${rem}s).`,
       locked: true,
@@ -1254,6 +1380,7 @@ app.post('/api/auth/login', (req, res) => {
       expires: Date.now() + SESSION_TTL,
     });
     persistSessions();
+    addActivityLog(u, 'Login', 'security', `User '${u}' signed in`, 'System', u);
     res.setHeader(
       'Set-Cookie',
       `sd_token=${encodeURIComponent(token)}; Path=/; Max-Age=${Math.floor(SESSION_TTL / 1000)}; HttpOnly; SameSite=Lax`
@@ -1267,6 +1394,7 @@ app.post('/api/auth/login', (req, res) => {
   if (fails >= MAX_FAILED_ATTEMPTS) {
     record.locked_until = nowSec + LOCKOUT_SECONDS;
     if (user) saveJson(USERS_FILE, users);
+    addActivityLog(u || 'anonymous', 'Account Locked', 'security', `Account '${u || 'unknown'}' locked for 15m after ${MAX_FAILED_ATTEMPTS} failed login attempts`, 'System', u || 'unknown');
     return res.status(429).json({
       error: `Account locked for 15 minutes due to ${MAX_FAILED_ATTEMPTS} incorrect login attempts.`,
       locked: true,
@@ -1277,6 +1405,7 @@ app.post('/api/auth/login', (req, res) => {
 
   if (user) saveJson(USERS_FILE, users);
   const remTries = MAX_FAILED_ATTEMPTS - fails;
+  addActivityLog(u || 'anonymous', 'Failed Login', 'security', `Failed sign-in attempt for '${u || 'unknown'}' (${remTries} attempt(s) remaining)`, 'System', u || 'unknown');
   return res.status(401).json({
     error: `Invalid credentials (${remTries} attempt${remTries !== 1 ? 's' : ''} remaining before 15m lockout)`,
     locked: false,
@@ -1285,8 +1414,10 @@ app.post('/api/auth/login', (req, res) => {
 });
 
 app.post('/api/auth/logout', requireAuth, (req, res) => {
+  const uname = req.session?.username || 'admin';
   sessionsMap.delete(req.token);
   persistSessions();
+  addActivityLog(uname, 'Logout', 'security', `User '${uname}' signed out`, 'System', uname);
   res.setHeader('Set-Cookie', 'sd_token=; Path=/; Max-Age=0');
   return res.json({ ok: true });
 });
@@ -1307,6 +1438,7 @@ app.post('/api/auth/admin-mode', requireAuth, (req, res) => {
   const pin = String(b.pin || '').trim();
   if (enabled) {
     if (pin !== ADMIN_PIN) {
+      addActivityLog(req, 'Admin PIN Failed', 'security', 'Failed Administrator PIN attempt', 'System', 'Admin Mode');
       return res.status(403).json({ error: 'Invalid Administrator PIN' });
     }
     req.session.admin_enabled = true;
@@ -1314,6 +1446,16 @@ app.post('/api/auth/admin-mode', requireAuth, (req, res) => {
     req.session.admin_enabled = false;
   }
   persistSessions();
+  addActivityLog(
+    req,
+    req.session.admin_enabled ? 'Admin Unlocked' : 'Admin Locked',
+    'security',
+    req.session.admin_enabled
+      ? 'Unlocked Administrator Functions (Write Mode enabled)'
+      : 'Locked Administrator Functions (Read-Only Mode active)',
+    'System',
+    'Admin Mode'
+  );
   return res.json({ ok: true, admin_enabled: Boolean(req.session.admin_enabled) });
 });
 
@@ -1331,6 +1473,7 @@ app.post('/api/auth/theme', requireAuth, (req, res) => {
   saveJson(USERS_FILE, users);
   req.session.theme = rawTheme;
   persistSessions();
+  addActivityLog(req, 'Theme Changed', 'change', `Changed UI color theme to '${rawTheme}'`, 'System', rawTheme);
   return res.json({ ok: true, theme: rawTheme });
 });
 
@@ -1409,6 +1552,7 @@ app.post('/api/smb/shares', requireAdmin, (req, res) => {
   shares.push(entry);
   saveJson(SHARES_FILE, shares);
   ensureShareFS(sid);
+  addActivityLog(req, 'Add Share', 'add', `Added SMB share '${entry.name}' (//${entry.host}/${entry.share})`, `SMB (${sid})`, entry.name);
   const { password, ...safeEntry } = entry;
   return res.status(201).json(safeEntry);
 });
@@ -1431,6 +1575,7 @@ app.post('/api/smb/shares/:share_id/rename', requireAdmin, (req, res) => {
   target.name = newName;
   target.custom_name = newName;
   saveJson(SHARES_FILE, shares);
+  addActivityLog(req, 'Rename Share', 'change', `Renamed SMB share '${share_id}' to '${newName}'`, `SMB (${share_id})`, newName);
   const { password, ...safeEntry } = target;
   return res.json(safeEntry);
 });
@@ -1441,6 +1586,7 @@ app.delete('/api/smb/shares/:share_id', requireAdmin, (req, res) => {
   saveJson(SHARES_FILE, shares);
   delete smbFSData[share_id];
   saveSmbFS();
+  addActivityLog(req, 'Remove Share', 'delete', `Removed SMB share '${share_id}'`, `SMB (${share_id})`, share_id);
   return res.json({ ok: true });
 });
 
@@ -1519,6 +1665,7 @@ app.post('/api/smb/upload/:share_id', requireAdmin, upload.single('file'), (req,
       mimeType: getMimeType(actualName, f.mimetype),
     };
     saveSmbFS();
+    addActivityLog(req, 'Upload', 'add', `Uploaded '${actualName}' (${formatLogBytes(f.size)}) to SMB share '${share_id}' (${fullPath})`, `SMB (${share_id})`, fullPath);
     return res.json({ ok: true });
   } catch (err) {
     return res.status(400).json({ error: err.message });
@@ -1554,6 +1701,7 @@ app.put('/api/smb/content/:share_id', requireAdmin, (req, res) => {
       mimeType: getMimeType(actualName, existing?.mimeType || 'text/plain'),
     };
     saveSmbFS();
+    addActivityLog(req, 'Edit File', 'change', `Saved edited content to '${fullPath}' (${formatLogBytes(buf.length)}) on SMB share '${share_id}'`, `SMB (${share_id})`, fullPath);
     return res.json({ ok: true, path: fullPath, size: buf.length });
   } catch (err) {
     return res.status(400).json({ error: err.message });
@@ -1643,6 +1791,7 @@ app.post('/api/smb/rename/:share_id', requireAdmin, (req, res) => {
   }
 
   saveSmbFS();
+  addActivityLog(req, 'Rename', 'change', `Renamed '${item.name}' to '${finalName}' on SMB share '${share_id}'`, `SMB (${share_id})`, newPath);
   return res.json({ ok: true, path: newPath, name: finalName });
 });
 
@@ -1708,6 +1857,7 @@ app.delete('/api/smb/delete/:share_id', requireAdmin, (req, res) => {
     }
   }
   saveSmbFS();
+  addActivityLog(req, 'Delete', 'delete', `Deleted ${b.is_dir ? 'folder' : 'file'} '${targetPath}' from SMB share '${share_id}'`, `SMB (${share_id})`, targetPath);
   return res.json({ ok: true });
 });
 
@@ -1721,6 +1871,7 @@ app.post('/api/smb/mkdir/:share_id', requireAdmin, (req, res) => {
   const entries = ensureShareFS(share_id);
   ensureSmbParentDirs(entries, rawPath + '/placeholder');
   saveSmbFS();
+  addActivityLog(req, 'New Folder', 'add', `Created folder '${rawPath}' on SMB share '${share_id}'`, `SMB (${share_id})`, rawPath);
   return res.json({ ok: true });
 });
 
@@ -1989,6 +2140,7 @@ app.post('/api/gdrive/accounts/:account_id/rename', requireAdmin, (req, res) => 
   target.name = newName;
   target.custom_name = newName;
   saveGDriveAccountsRaw(accounts);
+  addActivityLog(req, 'Rename Account', 'change', `Renamed Google Drive account '${account_id}' to '${newName}'`, `Google Drive (${account_id})`, newName);
   return res.json({
     id: target.id,
     name: target.name,
@@ -2001,6 +2153,7 @@ app.delete('/api/gdrive/accounts/:account_id', requireAdmin, (req, res) => {
   const { account_id } = req.params;
   const accounts = loadGDriveAccountsRaw().filter((a) => a.id !== account_id);
   saveGDriveAccountsRaw(accounts);
+  addActivityLog(req, 'Disconnect Drive', 'delete', `Disconnected Google Drive account '${account_id}'`, `Google Drive (${account_id})`, account_id);
   return res.json({ ok: true });
 });
 
@@ -2016,6 +2169,7 @@ app.post('/api/gdrive/config', requireAdmin, (req, res) => {
     redirect_uri: String(b.redirect_uri || '').trim() || 'http://localhost:3000/api/gdrive/callback',
   };
   saveJson(GDRIVE_CONFIG_FILE, cfg);
+  addActivityLog(req, 'OAuth Config', 'change', 'Updated Google Drive OAuth client configuration', 'Google Drive', 'OAuth Config');
   return res.json({ ok: true, configured: isGDriveConfigured() });
 });
 
@@ -2069,6 +2223,7 @@ app.get('/api/gdrive/callback', (req, res) => {
     ensureGDriveAccountSeeded(newId);
   }
   saveGDriveAccountsRaw(accounts);
+  addActivityLog(req, 'Connect Drive', 'add', `Connected Google Drive account${customName ? ` '${customName}'` : ''}`, 'Google Drive', customName || 'Google Drive');
   return res.redirect('/#gdrive-connected');
 });
 
@@ -2080,6 +2235,7 @@ app.delete('/api/gdrive/revoke', requireAdmin, (req, res) => {
   } else {
     saveGDriveAccountsRaw([]);
   }
+  addActivityLog(req, 'Disconnect Drive', 'delete', `Revoked Google Drive account '${accountId || 'all'}'`, 'Google Drive', accountId || 'all');
   return res.json({ ok: true });
 });
 
@@ -2175,6 +2331,7 @@ app.post('/api/gdrive/upload', requireAdmin, upload.single('file'), (req, res) =
     blobPath: f.path,
   };
   saveGDriveFS();
+  addActivityLog(req, 'Upload', 'add', `Uploaded '${actualName}' (${formatLogBytes(f.size)}) to Google Drive`, `Google Drive (${accId})`, actualName);
   return res.json({ ok: true });
 });
 
@@ -2198,6 +2355,7 @@ app.put('/api/gdrive/content/:file_id', requireAdmin, (req, res) => {
   item.size = buf.length;
   item.modified = new Date().toISOString();
   saveGDriveFS();
+  addActivityLog(req, 'Edit File', 'change', `Saved edited content to '${item.name}' (${formatLogBytes(buf.length)}) on Google Drive`, `Google Drive (${item.accountId || 'default'})`, item.name);
   return res.json({ ok: true, size: buf.length, file: item });
 });
 
@@ -2213,6 +2371,7 @@ app.post('/api/gdrive/rename/:file_id', requireAdmin, (req, res) => {
   if (!item) {
     return res.status(404).json({ error: 'File not found' });
   }
+  const oldName = item.name;
   const accId = item.accountId || 'default';
   const siblings = Object.values(gdriveFSData).filter(
     (f) => f.id !== file_id && (f.accountId || 'default') === accId && f.parent === item.parent
@@ -2232,6 +2391,7 @@ app.post('/api/gdrive/rename/:file_id', requireAdmin, (req, res) => {
   item.name = finalName;
   item.modified = new Date().toISOString();
   saveGDriveFS();
+  addActivityLog(req, 'Rename', 'change', `Renamed '${oldName}' to '${finalName}' on Google Drive`, `Google Drive (${accId})`, finalName);
   return res.json({ ok: true, id: item.id, name: finalName });
 });
 
@@ -2281,6 +2441,9 @@ app.post('/api/gdrive/zip', requireAuth, (req, res) => {
 
 app.delete('/api/gdrive/delete/:file_id', requireAdmin, (req, res) => {
   const { file_id } = req.params;
+  const targetItem = gdriveFSData[file_id];
+  const targetName = targetItem?.name || file_id;
+  const accId = targetItem?.accountId || 'default';
   function deleteRecursive(fid) {
     const item = gdriveFSData[fid];
     if (!item) return;
@@ -2293,6 +2456,7 @@ app.delete('/api/gdrive/delete/:file_id', requireAdmin, (req, res) => {
   }
   deleteRecursive(file_id);
   saveGDriveFS();
+  addActivityLog(req, 'Delete', 'delete', `Deleted '${targetName}' from Google Drive`, `Google Drive (${accId})`, targetName);
   return res.json({ ok: true });
 });
 
@@ -2313,6 +2477,7 @@ app.post('/api/gdrive/mkdir', requireAdmin, (req, res) => {
     parent,
   };
   saveGDriveFS();
+  addActivityLog(req, 'New Folder', 'add', `Created folder '${name}' on Google Drive`, `Google Drive (${accId})`, name);
   return res.json({ id });
 });
 
@@ -2551,6 +2716,7 @@ app.post('/api/onedrive/accounts/:account_id/rename', requireAdmin, (req, res) =
   target.name = newName;
   target.custom_name = newName;
   saveOneDriveAccountsRaw(accounts);
+  addActivityLog(req, 'Rename Account', 'change', `Renamed OneDrive account '${account_id}' to '${newName}'`, `OneDrive (${account_id})`, newName);
   return res.json({
     id: target.id,
     name: target.name,
@@ -2563,6 +2729,7 @@ app.delete('/api/onedrive/accounts/:account_id', requireAdmin, (req, res) => {
   const { account_id } = req.params;
   const accounts = loadOneDriveAccountsRaw().filter((a) => a.id !== account_id);
   saveOneDriveAccountsRaw(accounts);
+  addActivityLog(req, 'Disconnect Drive', 'delete', `Disconnected OneDrive account '${account_id}'`, `OneDrive (${account_id})`, account_id);
   return res.json({ ok: true });
 });
 
@@ -2579,6 +2746,7 @@ app.post('/api/onedrive/config', requireAdmin, (req, res) => {
     tenant_id: String(b.tenant_id || 'common').trim() || 'common',
   };
   saveJson(ONEDRIVE_CONFIG_FILE, cfg);
+  addActivityLog(req, 'OAuth Config', 'change', 'Updated Microsoft OneDrive OAuth client configuration', 'OneDrive', 'OAuth Config');
   return res.json({ ok: true, configured: isOneDriveConfigured() });
 });
 
@@ -2636,6 +2804,7 @@ app.get('/api/onedrive/callback', (req, res) => {
     ensureOneDriveAccountSeeded(newId);
   }
   saveOneDriveAccountsRaw(accounts);
+  addActivityLog(req, 'Connect Drive', 'add', `Connected Microsoft OneDrive account${customName ? ` '${customName}'` : ''}`, 'OneDrive', customName || 'OneDrive');
   return res.redirect('/#onedrive-connected');
 });
 
@@ -2647,6 +2816,7 @@ app.delete('/api/onedrive/revoke', requireAdmin, (req, res) => {
   } else {
     saveOneDriveAccountsRaw([]);
   }
+  addActivityLog(req, 'Disconnect Drive', 'delete', `Revoked OneDrive account '${accountId || 'all'}'`, 'OneDrive', accountId || 'all');
   return res.json({ ok: true });
 });
 
@@ -2722,6 +2892,7 @@ app.post('/api/onedrive/upload', requireAdmin, upload.single('file'), (req, res)
     blobPath: f.path,
   };
   saveOneDriveFS();
+  addActivityLog(req, 'Upload', 'add', `Uploaded '${actualName}' (${formatLogBytes(f.size)}) to OneDrive`, `OneDrive (${accId})`, actualName);
   return res.json({ ok: true });
 });
 
@@ -2745,6 +2916,7 @@ app.put('/api/onedrive/content/:file_id', requireAdmin, (req, res) => {
   item.size = buf.length;
   item.modified = new Date().toISOString();
   saveOneDriveFS();
+  addActivityLog(req, 'Edit File', 'change', `Saved edited content to '${item.name}' (${formatLogBytes(buf.length)}) on OneDrive`, `OneDrive (${item.accountId || 'default'})`, item.name);
   return res.json({ ok: true, size: buf.length, file: item });
 });
 
@@ -2760,6 +2932,7 @@ app.post('/api/onedrive/rename/:file_id', requireAdmin, (req, res) => {
   if (!item) {
     return res.status(404).json({ error: 'File not found' });
   }
+  const oldName = item.name;
   const accId = item.accountId || 'default';
   const siblings = Object.values(onedriveFSData).filter(
     (f) => f.id !== file_id && (f.accountId || 'default') === accId && f.parent === item.parent
@@ -2779,6 +2952,7 @@ app.post('/api/onedrive/rename/:file_id', requireAdmin, (req, res) => {
   item.name = finalName;
   item.modified = new Date().toISOString();
   saveOneDriveFS();
+  addActivityLog(req, 'Rename', 'change', `Renamed '${oldName}' to '${finalName}' on OneDrive`, `OneDrive (${accId})`, finalName);
   return res.json({ ok: true, id: item.id, name: finalName });
 });
 
@@ -2828,6 +3002,9 @@ app.post('/api/onedrive/zip', requireAuth, (req, res) => {
 
 app.delete('/api/onedrive/delete/:file_id', requireAdmin, (req, res) => {
   const { file_id } = req.params;
+  const targetItem = onedriveFSData[file_id];
+  const targetName = targetItem?.name || file_id;
+  const accId = targetItem?.accountId || 'default';
   function deleteRecursive(fid) {
     const item = onedriveFSData[fid];
     if (!item) return;
@@ -2840,6 +3017,7 @@ app.delete('/api/onedrive/delete/:file_id', requireAdmin, (req, res) => {
   }
   deleteRecursive(file_id);
   saveOneDriveFS();
+  addActivityLog(req, 'Delete', 'delete', `Deleted '${targetName}' from OneDrive`, `OneDrive (${accId})`, targetName);
   return res.json({ ok: true });
 });
 
@@ -2860,6 +3038,7 @@ app.post('/api/onedrive/mkdir', requireAdmin, (req, res) => {
     parent,
   };
   saveOneDriveFS();
+  addActivityLog(req, 'New Folder', 'add', `Created folder '${name}' on OneDrive`, `OneDrive (${accId})`, name);
   return res.json({ id });
 });
 
@@ -3080,6 +3259,7 @@ app.post('/api/filejump/accounts/:account_id/rename', requireAdmin, (req, res) =
   target.name = newName;
   target.custom_name = newName;
   saveFileJumpAccountsRaw(accounts);
+  addActivityLog(req, 'Rename Account', 'change', `Renamed FileJump account '${account_id}' to '${newName}'`, `FileJump (${account_id})`, newName);
   return res.json({
     id: target.id,
     name: target.name,
@@ -3092,6 +3272,7 @@ app.delete('/api/filejump/accounts/:account_id', requireAdmin, (req, res) => {
   const { account_id } = req.params;
   const accounts = loadFileJumpAccountsRaw().filter((a) => a.id !== account_id);
   saveFileJumpAccountsRaw(accounts);
+  addActivityLog(req, 'Disconnect Drive', 'delete', `Disconnected FileJump account '${account_id}'`, `FileJump (${account_id})`, account_id);
   return res.json({ ok: true });
 });
 
@@ -3149,6 +3330,7 @@ app.post('/api/filejump/connect', requireAdmin, (req, res) => {
     ensureFileJumpAccountSeeded(newId);
   }
   saveFileJumpAccountsRaw(accounts);
+  addActivityLog(req, 'Connect Drive', 'add', `Connected FileJump account '${target.name}' (${authType.toUpperCase()})`, `FileJump (${target.id})`, target.name);
   const allFormatted = listFileJumpAccounts();
   const createdFormatted = allFormatted.find((a) => a.id === target.id) || allFormatted[allFormatted.length - 1];
   return res.json({
@@ -3166,6 +3348,7 @@ app.delete('/api/filejump/revoke', requireAdmin, (req, res) => {
   } else {
     saveFileJumpAccountsRaw([]);
   }
+  addActivityLog(req, 'Disconnect Drive', 'delete', `Revoked FileJump account '${accountId || 'all'}'`, 'FileJump', accountId || 'all');
   return res.json({ ok: true });
 });
 
@@ -3241,6 +3424,7 @@ app.post('/api/filejump/upload', requireAdmin, upload.single('file'), (req, res)
     blobPath: f.path,
   };
   saveFileJumpFS();
+  addActivityLog(req, 'Upload', 'add', `Uploaded '${actualName}' (${formatLogBytes(f.size)}) to FileJump`, `FileJump (${accId})`, actualName);
   return res.json({ ok: true });
 });
 
@@ -3264,6 +3448,7 @@ app.put('/api/filejump/content/:file_id', requireAdmin, (req, res) => {
   item.size = buf.length;
   item.modified = new Date().toISOString();
   saveFileJumpFS();
+  addActivityLog(req, 'Edit File', 'change', `Saved edited content to '${item.name}' (${formatLogBytes(buf.length)}) on FileJump`, `FileJump (${item.accountId || 'default'})`, item.name);
   return res.json({ ok: true, size: buf.length, file: item });
 });
 
@@ -3279,6 +3464,7 @@ app.post('/api/filejump/rename/:file_id', requireAdmin, (req, res) => {
   if (!item) {
     return res.status(404).json({ error: 'File not found' });
   }
+  const oldName = item.name;
   const accId = item.accountId || 'default';
   const siblings = Object.values(filejumpFSData).filter(
     (f) => f.id !== file_id && (f.accountId || 'default') === accId && f.parent === item.parent
@@ -3298,6 +3484,7 @@ app.post('/api/filejump/rename/:file_id', requireAdmin, (req, res) => {
   item.name = finalName;
   item.modified = new Date().toISOString();
   saveFileJumpFS();
+  addActivityLog(req, 'Rename', 'change', `Renamed '${oldName}' to '${finalName}' on FileJump`, `FileJump (${accId})`, finalName);
   return res.json({ ok: true, id: item.id, name: finalName });
 });
 
@@ -3347,6 +3534,9 @@ app.post('/api/filejump/zip', requireAuth, (req, res) => {
 
 app.delete('/api/filejump/delete/:file_id', requireAdmin, (req, res) => {
   const { file_id } = req.params;
+  const targetItem = filejumpFSData[file_id];
+  const targetName = targetItem?.name || file_id;
+  const accId = targetItem?.accountId || 'default';
   function deleteRecursive(fid) {
     const item = filejumpFSData[fid];
     if (!item) return;
@@ -3359,6 +3549,7 @@ app.delete('/api/filejump/delete/:file_id', requireAdmin, (req, res) => {
   }
   deleteRecursive(file_id);
   saveFileJumpFS();
+  addActivityLog(req, 'Delete', 'delete', `Deleted '${targetName}' from FileJump`, `FileJump (${accId})`, targetName);
   return res.json({ ok: true });
 });
 
@@ -3379,6 +3570,7 @@ app.post('/api/filejump/mkdir', requireAdmin, (req, res) => {
     parent,
   };
   saveFileJumpFS();
+  addActivityLog(req, 'New Folder', 'add', `Created folder '${name}' on FileJump`, `FileJump (${accId})`, name);
   return res.json({ id });
 });
 
@@ -3756,6 +3948,21 @@ app.post('/api/transfers/upload/complete', requireAdmin, (req, res) => {
     try {
       if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
     } catch (_) {}
+    const driveLabelMap = {
+      smb: `SMB (${driveId})`,
+      gdrive: `Google Drive (${driveId})`,
+      onedrive: `OneDrive (${driveId})`,
+      filejump: `FileJump (${driveId})`,
+    };
+    const driveLabel = driveLabelMap[driveType] || driveType.toUpperCase();
+    addActivityLog(
+      req,
+      'Upload',
+      'add',
+      `Uploaded '${relClean || fileName}' (${formatLogBytes(finalSize)}) to ${driveLabel}`,
+      driveLabel,
+      relClean || fileName
+    );
     return res.json({ ok: true });
   } catch (err) {
     return res.status(500).json({ error: err.message });
@@ -4112,6 +4319,22 @@ app.post('/api/transfer', requireAdmin, (req, res) => {
     saveGDriveFS();
     saveOneDriveFS();
     saveFileJumpFS();
+    if (count > 0) {
+      const itemLabels = items
+        .slice(0, 3)
+        .map((it) => it.name || (it.path ? path.posix.basename(String(it.path)) : '') || it.id || 'item')
+        .filter(Boolean);
+      let summaryNames = itemLabels.join(', ');
+      if (items.length > 3) summaryNames += ` (+${items.length - 3} more)`;
+      addActivityLog(
+        req,
+        isMove ? 'Move' : 'Copy',
+        'move',
+        `${isMove ? 'Moved' : 'Copied'} ${count} item(s) [${summaryNames}] from ${String(srcType).toUpperCase()} (${srcDrive}) to ${String(destType).toUpperCase()} (${destDrive}:${destFolder})`,
+        `${String(srcType).toUpperCase()} → ${String(destType).toUpperCase()}`,
+        summaryNames
+      );
+    }
     return res.json({
       ok: true,
       copied: count,
@@ -4267,6 +4490,7 @@ app.post('/api/smb/proxy-shares/:account_id', requireAdmin, (req, res) => {
 
   const status = getSmbProxyStatus();
   const updatedShare = status.shares.find((s) => s.provider === targetProvider && s.account_id === target.id);
+  addActivityLog(req, 'SMB Proxy', 'change', `Updated SMB proxy share settings for '${target.name || account_id}'`, 'SMB Proxy', target.smb_share_name || account_id);
   return res.json({
     ok: true,
     share: updatedShare,
@@ -4286,6 +4510,7 @@ app.post('/api/smb/proxy-credentials', requireAdmin, (req, res) => {
     return res.status(400).json({ error: 'Password is required' });
   }
   saveJson(SMB_PROXY_FILE, { username, password });
+  addActivityLog(req, 'SMB Proxy', 'change', `Updated SMB proxy credentials for user '${username}'`, 'SMB Proxy', username);
   return res.json({
     ok: true,
     message: `Credentials saved. Reconnect as '${username}'.`,
@@ -4336,6 +4561,7 @@ app.post('/api/favorites', requireAuth, (req, res) => {
     favs.push(entry);
   }
   saveFavoritesList(favs);
+  addActivityLog(req, 'Favorite Added', 'add', `Pinned favorite folder '${entry.name}' (${entry.driveName})`, entry.driveName, entry.path);
   return res.json({ ok: true, favorites: favs });
 });
 
@@ -4345,8 +4571,11 @@ app.delete('/api/favorites', requireAuth, (req, res) => {
   if (!favId) {
     return res.status(400).json({ error: 'Favorite folder id is required' });
   }
-  const favs = loadFavoritesList().filter((item) => item && item.id !== favId);
+  const existing = loadFavoritesList();
+  const found = existing.find((item) => item && item.id === favId);
+  const favs = existing.filter((item) => item && item.id !== favId);
   saveFavoritesList(favs);
+  addActivityLog(req, 'Favorite Removed', 'delete', `Removed favorite folder '${found?.name || favId}'`, 'Favorites', found?.name || favId);
   return res.json({ ok: true, favorites: favs });
 });
 

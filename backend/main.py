@@ -1017,6 +1017,138 @@ def spa(path):
         return send_from_directory(app.static_folder, path)
     return send_from_directory(app.static_folder, "index.html")
 
+# ── Persistent Activity Logs (Capped at 500 entries) ─────────────────────────
+_LOGS_FILE = Path(os.environ.get("DATA_DIR", "/app/data")) / "activity_logs.json"
+_LOGS_LOCK = threading.Lock()
+_MAX_LOG_ENTRIES = 500
+
+
+def _format_log_bytes(num_bytes) -> str:
+    try:
+        n = int(num_bytes or 0)
+    except Exception:
+        return "0 B"
+    if n < 1024:
+        return f"{n} B"
+    for unit in ("KB", "MB", "GB", "TB"):
+        n /= 1024.0
+        if n < 1024.0 or unit == "TB":
+            return f"{n:.1f} {unit}"
+    return f"{n:.1f} TB"
+
+
+def _load_activity_logs_unlocked() -> list:
+    if not _LOGS_FILE.exists():
+        return []
+    try:
+        data = json.loads(_LOGS_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return data[:_MAX_LOG_ENTRIES]
+    except Exception:
+        pass
+    return []
+
+
+def _save_activity_logs_unlocked(logs: list):
+    try:
+        _LOGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        capped = list(logs)[:_MAX_LOG_ENTRIES]
+        _LOGS_FILE.write_text(json.dumps(capped, indent=2), encoding="utf-8")
+    except Exception as exc:
+        print(f"ACTIVITY LOG SAVE ERROR: {exc}", flush=True)
+
+
+def _current_request_username(explicit_user=None) -> str:
+    if explicit_user:
+        return str(explicit_user).strip()
+    try:
+        u_obj = getattr(request, "user", None)
+        if isinstance(u_obj, dict) and u_obj.get("username"):
+            return str(u_obj["username"])
+        t = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+        if not t:
+            t = request.args.get("token", "").strip() or request.cookies.get("sd_token", "")
+        if t:
+            sess = auth.get_session(t)
+            if sess and sess.get("username"):
+                return str(sess["username"])
+    except Exception:
+        pass
+    return "admin"
+
+
+def add_activity_log(action: str, category: str, details: str, drive: str = "System", target: str = "", user: str = None):
+    """
+    Records a timestamped activity log entry and caps total persisted entries at 500.
+    Categories: 'move', 'add', 'change', 'delete', 'security'
+    """
+    try:
+        now_ms = int(time.time() * 1000)
+        iso_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ms / 1000.0))
+        uname = _current_request_username(user)
+        entry = {
+            "id": f"log_{now_ms}_{secrets.token_hex(3)}",
+            "timestamp": iso_ts,
+            "epoch": now_ms,
+            "user": uname,
+            "category": str(category or "change").strip().lower(),
+            "action": str(action or "Event").strip(),
+            "drive": str(drive or "System").strip(),
+            "target": str(target or "").strip(),
+            "details": str(details or "").strip(),
+        }
+        with _LOGS_LOCK:
+            logs = _load_activity_logs_unlocked()
+            logs.insert(0, entry)
+            if len(logs) > _MAX_LOG_ENTRIES:
+                logs = logs[:_MAX_LOG_ENTRIES]
+            _save_activity_logs_unlocked(logs)
+    except Exception as exc:
+        print(f"ACTIVITY LOG ERROR: {exc}", flush=True)
+
+
+@app.get("/api/logs")
+@auth.require_auth
+def api_get_logs():
+    with _LOGS_LOCK:
+        logs = _load_activity_logs_unlocked()
+    return jsonify({"logs": logs[:_MAX_LOG_ENTRIES], "max_entries": _MAX_LOG_ENTRIES})
+
+
+@app.get("/api/logs/export.csv")
+@auth.require_auth
+def api_export_logs_csv():
+    import csv
+    with _LOGS_LOCK:
+        logs = _load_activity_logs_unlocked()[:_MAX_LOG_ENTRIES]
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Timestamp (UTC)", "Category", "Action", "User", "Drive / Source", "Target", "Details"])
+    for item in logs:
+        writer.writerow([
+            item.get("timestamp", ""),
+            item.get("category", ""),
+            item.get("action", ""),
+            item.get("user", ""),
+            item.get("drive", ""),
+            item.get("target", ""),
+            item.get("details", ""),
+        ])
+    csv_data = buf.getvalue()
+    resp = app.response_class(csv_data, status=200, mimetype="text/csv; charset=utf-8")
+    resp.headers["Content-Disposition"] = make_content_disposition("sagedrive_activity_logs.csv", True)
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@app.delete("/api/logs")
+@auth.require_admin
+def api_clear_logs():
+    with _LOGS_LOCK:
+        _save_activity_logs_unlocked([])
+    return jsonify({"ok": True, "logs": []})
+
+
 # ── Auth ──────────────────────────────────────────────────────────────────────
 @app.post("/api/auth/login")
 def api_login():
@@ -1026,9 +1158,18 @@ def api_login():
     token, err_msg, status_code, meta = auth.login_with_status(u, pw)
     if token:
         theme = auth.get_user_theme(u)
+        add_activity_log("Login", "security", f"User '{u}' signed in", drive="System", target=u, user=u)
         resp = jsonify({"token": token, "theme": theme, "admin_enabled": False})
         resp.set_cookie("sd_token", token, max_age=auth.SESSION_TTL, path="/", httponly=True, samesite="Lax")
         return resp
+    add_activity_log(
+        "Account Locked" if meta.get("locked") else "Failed Login",
+        "security",
+        f"Failed sign-in attempt for '{u or 'unknown'}': {err_msg or 'Invalid credentials'}",
+        drive="System",
+        target=u or "unknown",
+        user=u or "anonymous",
+    )
     return jsonify({
         "error": err_msg or "Invalid credentials",
         "locked": meta.get("locked", False),
@@ -1042,7 +1183,10 @@ def api_logout():
     t = request.headers.get("Authorization","").removeprefix("Bearer ").strip()
     if not t:
         t = request.args.get("token", "").strip() or request.cookies.get("sd_token", "")
+    s = auth.get_session(t)
+    uname = s.get("username", "admin") if s else "admin"
     auth.logout(t)
+    add_activity_log("Logout", "security", f"User '{uname}' signed out", drive="System", target=uname, user=uname)
     resp = jsonify({"ok": True})
     resp.delete_cookie("sd_token", path="/")
     return resp
@@ -1073,8 +1217,16 @@ def api_admin_mode():
     pin = str(b.get("pin", "")).strip()
     try:
         state = auth.set_admin_mode(t, enabled, pin=pin)
+        add_activity_log(
+            "Admin Unlocked" if state else "Admin Locked",
+            "security",
+            "Unlocked Administrator Functions (Write Mode enabled)" if state else "Locked Administrator Functions (Read-Only Mode active)",
+            drive="System",
+            target="Admin Mode",
+        )
         return jsonify({"ok": True, "admin_enabled": state})
     except ValueError as e:
+        add_activity_log("Admin PIN Failed", "security", f"Failed Administrator PIN attempt: {e}", drive="System", target="Admin Mode")
         return jsonify({"error": str(e)}), 403
     except PermissionError as e:
         return jsonify({"error": str(e)}), 401
@@ -1089,6 +1241,7 @@ def api_save_theme():
     b = request.get_json(force=True) or {}
     try:
         saved = auth.set_user_theme(s["username"], b.get("theme", "obsidian"))
+        add_activity_log("Theme Changed", "change", f"Changed UI color theme to '{saved}'", drive="System", target=saved, user=s["username"])
         return jsonify({"ok": True, "theme": saved})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -1111,6 +1264,13 @@ def smb_add_share():
             username=b.get("username",""), password=b.get("password",""),
             port=int(b.get("port", 445)),
             custom_name=b.get("custom_name", ""))
+        add_activity_log(
+            "Add Share",
+            "add",
+            f"Added SMB share '{entry.get('name')}' (//{entry.get('host')}/{entry.get('share')})",
+            drive=f"SMB ({entry.get('id')})",
+            target=entry.get("name", ""),
+        )
         return jsonify({k:v for k,v in entry.items() if k != "password"}), 201
     except (KeyError, ValueError) as e:
         return jsonify({"error": str(e)}), 400
@@ -1122,6 +1282,13 @@ def smb_rename_share(share_id):
     new_name = (b.get("name") or b.get("custom_name") or "").strip()
     try:
         updated = smb_manager.rename_share(share_id, new_name)
+        add_activity_log(
+            "Rename Share",
+            "change",
+            f"Renamed SMB share '{share_id}' to '{new_name}'",
+            drive=f"SMB ({share_id})",
+            target=new_name,
+        )
         return jsonify({k:v for k,v in updated.items() if k != "password"})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -1130,6 +1297,13 @@ def smb_rename_share(share_id):
 @auth.require_admin
 def smb_delete_share(share_id):
     smb_manager.remove_share(share_id)
+    add_activity_log(
+        "Remove Share",
+        "delete",
+        f"Removed SMB share '{share_id}'",
+        drive=f"SMB ({share_id})",
+        target=share_id,
+    )
     return jsonify({"ok": True})
 
 @app.get("/api/smb/browse/<share_id>")
@@ -1306,6 +1480,13 @@ def smb_upload(share_id):
         _SMB_SIZE_CACHE.pop(f"{share_id}:{target_path}", None)
         if saved_path:
             _SMB_SIZE_CACHE.pop(f"{share_id}:{saved_path}", None)
+            add_activity_log(
+                "Upload",
+                "add",
+                f"Uploaded '{saved_path.split('/')[-1]}' to SMB share '{share_id}' ({saved_path})",
+                drive=f"SMB ({share_id})",
+                target=saved_path,
+            )
         return jsonify({"ok": True, "path": saved_path})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -1325,6 +1506,13 @@ def smb_save_content(share_id):
         encoded = str(content).encode("utf-8")
         smb_manager.upload_file(share_id, target_path, io.BytesIO(encoded), conflict_action="replace")
         _SMB_SIZE_CACHE[f"{share_id}:{target_path}"] = (time.time(), len(encoded))
+        add_activity_log(
+            "Edit File",
+            "change",
+            f"Saved edited content to '{target_path}' ({_format_log_bytes(len(encoded))}) on SMB share '{share_id}'",
+            drive=f"SMB ({share_id})",
+            target=target_path,
+        )
         return jsonify({"ok": True, "path": target_path, "size": len(encoded)})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -1345,6 +1533,14 @@ def smb_rename(share_id):
         new_path = smb_manager.rename_path(share_id, norm_old, new_name, conflict_action=conflict_action)
         _SMB_SIZE_CACHE.pop(f"{share_id}:{norm_old}", None)
         _SMB_SIZE_CACHE.pop(f"{share_id}:{new_path}", None)
+        if new_path != norm_old:
+            add_activity_log(
+                "Rename",
+                "change",
+                f"Renamed '{norm_old.split('/')[-1]}' to '{new_path.split('/')[-1]}' on SMB share '{share_id}'",
+                drive=f"SMB ({share_id})",
+                target=new_path,
+            )
         return jsonify({"ok": True, "path": new_path})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -1383,8 +1579,16 @@ def smb_delete_file(share_id):
     b = request.get_json(force=True) or {}
     try:
         p = _sanitize_smb_path(b.get("path",""), allow_root=False)
-        smb_manager.delete_path(share_id, p, b.get("is_dir", False))
+        is_dir = bool(b.get("is_dir", False))
+        smb_manager.delete_path(share_id, p, is_dir)
         _SMB_SIZE_CACHE.pop(f"{share_id}:{p}", None)
+        add_activity_log(
+            "Delete",
+            "delete",
+            f"Deleted {'folder' if is_dir else 'file'} '{p}' from SMB share '{share_id}'",
+            drive=f"SMB ({share_id})",
+            target=p,
+        )
         return jsonify({"ok": True})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -1398,6 +1602,13 @@ def smb_mkdir(share_id):
     try:
         p = _sanitize_smb_path(b.get("path",""), allow_root=False)
         smb_manager.create_directory(share_id, p)
+        add_activity_log(
+            "New Folder",
+            "add",
+            f"Created folder '{p}' on SMB share '{share_id}'",
+            drive=f"SMB ({share_id})",
+            target=p,
+        )
         return jsonify({"ok": True})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -1427,6 +1638,13 @@ def gdrive_rename_account(account_id):
     new_name = (b.get("name") or b.get("custom_name") or "").strip()
     try:
         acc = gdrive_manager.rename_account(account_id, new_name)
+        add_activity_log(
+            "Rename Account",
+            "change",
+            f"Renamed Google Drive account '{account_id}' to '{new_name}'",
+            drive=f"Google Drive ({account_id})",
+            target=new_name,
+        )
         return jsonify(acc)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -1439,6 +1657,13 @@ def gdrive_delete_account(account_id):
         _reconcile_smb_proxy()
     except Exception:
         pass
+    add_activity_log(
+        "Disconnect Drive",
+        "delete",
+        f"Disconnected Google Drive account '{account_id}'",
+        drive=f"Google Drive ({account_id})",
+        target=account_id,
+    )
     return jsonify({"ok": True})
 
 @app.get("/api/gdrive/config")
@@ -1454,6 +1679,13 @@ def gdrive_save_config():
         b.get("client_id", ""),
         b.get("client_secret", ""),
         b.get("redirect_uri", "")
+    )
+    add_activity_log(
+        "OAuth Config",
+        "change",
+        "Updated Google Drive OAuth client configuration",
+        drive="Google Drive",
+        target="OAuth Config",
     )
     return jsonify({"ok": True, "configured": gdrive_manager.is_configured()})
 
@@ -1478,6 +1710,13 @@ def gdrive_callback():
             _reconcile_smb_proxy()
         except Exception:
             pass
+        add_activity_log(
+            "Connect Drive",
+            "add",
+            "Connected Google Drive account via OAuth",
+            drive="Google Drive",
+            target="OAuth Callback",
+        )
         return redirect("/#gdrive-connected")
     except Exception as e:
         return f"OAuth error: {e}", 500
@@ -1491,6 +1730,13 @@ def gdrive_revoke():
         _reconcile_smb_proxy()
     except Exception:
         pass
+    add_activity_log(
+        "Disconnect Drive",
+        "delete",
+        f"Revoked Google Drive account '{account_id or 'all'}'",
+        drive="Google Drive",
+        target=account_id or "all",
+    )
     return jsonify({"ok": True})
 
 @app.get("/api/gdrive/files")
@@ -1683,6 +1929,13 @@ def gdrive_upload():
             account_id=account_id,
             conflict_action=conflict_action,
         )
+        add_activity_log(
+            "Upload",
+            "add",
+            f"Uploaded '{rel_path or f.filename}' to Google Drive",
+            drive=f"Google Drive ({account_id or 'default'})",
+            target=rel_path or f.filename,
+        )
         return jsonify({"ok": True})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -1709,6 +1962,13 @@ def gdrive_save_content(file_id):
             mime_type=mime,
             account_id=account_id,
         )
+        add_activity_log(
+            "Edit File",
+            "change",
+            f"Saved edited content to '{meta.get('name', file_id)}' ({_format_log_bytes(len(encoded))}) on Google Drive",
+            drive=f"Google Drive ({account_id or 'default'})",
+            target=meta.get("name", file_id),
+        )
         return jsonify({"ok": True, "size": len(encoded), "file": updated})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1724,6 +1984,15 @@ def gdrive_rename(file_id):
         return jsonify({"error": "New name is required"}), 400
     try:
         res = gdrive_manager.rename_file(file_id, new_name, account_id=account_id, conflict_action=conflict_action)
+        if not (isinstance(res, dict) and res.get("skipped")):
+            final_name = res.get("name", new_name) if isinstance(res, dict) else new_name
+            add_activity_log(
+                "Rename",
+                "change",
+                f"Renamed item '{file_id}' to '{final_name}' on Google Drive",
+                drive=f"Google Drive ({account_id or 'default'})",
+                target=final_name,
+            )
         return jsonify({"ok": True, "file": res})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1758,6 +2027,13 @@ def gdrive_delete(file_id):
     account_id = request.args.get("account_id", "").strip() or None
     try:
         gdrive_manager.delete_file(file_id, account_id=account_id)
+        add_activity_log(
+            "Delete",
+            "delete",
+            f"Deleted item '{file_id}' from Google Drive",
+            drive=f"Google Drive ({account_id or 'default'})",
+            target=file_id,
+        )
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1768,7 +2044,15 @@ def gdrive_mkdir():
     b = request.get_json(force=True) or {}
     account_id = (request.args.get("account_id") or b.get("account_id") or "").strip() or None
     try:
-        fid = gdrive_manager.create_folder(b.get("parent","root"), b.get("name","New Folder"), account_id=account_id)
+        folder_name = b.get("name", "New Folder")
+        fid = gdrive_manager.create_folder(b.get("parent","root"), folder_name, account_id=account_id)
+        add_activity_log(
+            "New Folder",
+            "add",
+            f"Created folder '{folder_name}' on Google Drive",
+            drive=f"Google Drive ({account_id or 'default'})",
+            target=folder_name,
+        )
         return jsonify({"id": fid})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1796,6 +2080,13 @@ def onedrive_rename_account(account_id):
     new_name = (b.get("name") or b.get("custom_name") or "").strip()
     try:
         acc = onedrive_manager.rename_account(account_id, new_name)
+        add_activity_log(
+            "Rename Account",
+            "change",
+            f"Renamed OneDrive account '{account_id}' to '{new_name}'",
+            drive=f"OneDrive ({account_id})",
+            target=new_name,
+        )
         return jsonify(acc)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -1808,6 +2099,13 @@ def onedrive_delete_account(account_id):
         _reconcile_smb_proxy()
     except Exception:
         pass
+    add_activity_log(
+        "Disconnect Drive",
+        "delete",
+        f"Disconnected OneDrive account '{account_id}'",
+        drive=f"OneDrive ({account_id})",
+        target=account_id,
+    )
     return jsonify({"ok": True})
 
 @app.get("/api/onedrive/config")
@@ -1824,6 +2122,13 @@ def onedrive_save_config():
         b.get("client_secret", ""),
         b.get("redirect_uri", ""),
         b.get("tenant_id", "common"),
+    )
+    add_activity_log(
+        "OAuth Config",
+        "change",
+        "Updated Microsoft OneDrive OAuth client configuration",
+        drive="OneDrive",
+        target="OAuth Config",
     )
     return jsonify({"ok": True, "configured": onedrive_manager.is_configured()})
 
@@ -1848,6 +2153,13 @@ def onedrive_callback():
             _reconcile_smb_proxy()
         except Exception:
             pass
+        add_activity_log(
+            "Connect Drive",
+            "add",
+            "Connected Microsoft OneDrive account via OAuth",
+            drive="OneDrive",
+            target="OAuth Callback",
+        )
         return redirect("/#onedrive-connected")
     except Exception as e:
         return f"OneDrive OAuth error: {e}", 500
@@ -1861,6 +2173,13 @@ def onedrive_revoke():
         _reconcile_smb_proxy()
     except Exception:
         pass
+    add_activity_log(
+        "Disconnect Drive",
+        "delete",
+        f"Revoked OneDrive account '{account_id or 'all'}'",
+        drive="OneDrive",
+        target=account_id or "all",
+    )
     return jsonify({"ok": True})
 
 @app.get("/api/onedrive/files")
@@ -2043,6 +2362,13 @@ def onedrive_upload():
             account_id=account_id,
             conflict_action=conflict_action,
         )
+        add_activity_log(
+            "Upload",
+            "add",
+            f"Uploaded '{rel_path or f.filename}' to OneDrive",
+            drive=f"OneDrive ({account_id or 'default'})",
+            target=rel_path or f.filename,
+        )
         return jsonify({"ok": True})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -2069,6 +2395,13 @@ def onedrive_save_content(file_id):
             mime_type=mime,
             account_id=account_id,
         )
+        add_activity_log(
+            "Edit File",
+            "change",
+            f"Saved edited content to '{meta.get('name', file_id)}' ({_format_log_bytes(len(encoded))}) on OneDrive",
+            drive=f"OneDrive ({account_id or 'default'})",
+            target=meta.get("name", file_id),
+        )
         return jsonify({"ok": True, "size": len(encoded), "file": updated})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -2084,6 +2417,15 @@ def onedrive_rename(file_id):
         return jsonify({"error": "New name is required"}), 400
     try:
         res = onedrive_manager.rename_file(file_id, new_name, account_id=account_id, conflict_action=conflict_action)
+        if not (isinstance(res, dict) and res.get("skipped")):
+            final_name = res.get("name", new_name) if isinstance(res, dict) else new_name
+            add_activity_log(
+                "Rename",
+                "change",
+                f"Renamed item '{file_id}' to '{final_name}' on OneDrive",
+                drive=f"OneDrive ({account_id or 'default'})",
+                target=final_name,
+            )
         return jsonify({"ok": True, "file": res})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -2118,6 +2460,13 @@ def onedrive_delete(file_id):
     account_id = request.args.get("account_id", "").strip() or None
     try:
         onedrive_manager.delete_file(file_id, account_id=account_id)
+        add_activity_log(
+            "Delete",
+            "delete",
+            f"Deleted item '{file_id}' from OneDrive",
+            drive=f"OneDrive ({account_id or 'default'})",
+            target=file_id,
+        )
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -2128,7 +2477,15 @@ def onedrive_mkdir():
     b = request.get_json(force=True) or {}
     account_id = (request.args.get("account_id") or b.get("account_id") or "").strip() or None
     try:
-        fid = onedrive_manager.create_folder(b.get("parent", "root"), b.get("name", "New Folder"), account_id=account_id)
+        folder_name = b.get("name", "New Folder")
+        fid = onedrive_manager.create_folder(b.get("parent", "root"), folder_name, account_id=account_id)
+        add_activity_log(
+            "New Folder",
+            "add",
+            f"Created folder '{folder_name}' on OneDrive",
+            drive=f"OneDrive ({account_id or 'default'})",
+            target=folder_name,
+        )
         return jsonify({"id": fid})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -2157,6 +2514,13 @@ def filejump_rename_account(account_id):
         return jsonify({"error": "Custom name cannot be empty"}), 400
     try:
         updated = filejump_manager.rename_account(account_id, new_name)
+        add_activity_log(
+            "Rename Account",
+            "change",
+            f"Renamed FileJump account '{account_id}' to '{new_name}'",
+            drive=f"FileJump ({account_id})",
+            target=new_name,
+        )
         return jsonify(updated)
     except ValueError as e:
         return jsonify({"error": str(e)}), 404
@@ -2172,6 +2536,13 @@ def filejump_remove_account(account_id):
             _reconcile_smb_proxy()
         except Exception:
             pass
+        add_activity_log(
+            "Disconnect Drive",
+            "delete",
+            f"Disconnected FileJump account '{account_id}'",
+            drive=f"FileJump ({account_id})",
+            target=account_id,
+        )
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -2199,6 +2570,13 @@ def filejump_connect():
             _reconcile_smb_proxy()
         except Exception:
             pass
+        add_activity_log(
+            "Connect Drive",
+            "add",
+            f"Connected FileJump account '{acc.get('name', 'FileJump')}' ({auth_type.upper()})",
+            drive=f"FileJump ({acc.get('id', 'default')})",
+            target=acc.get("name", "FileJump"),
+        )
         return jsonify({"ok": True, "account": acc, "accounts": filejump_manager.list_accounts()})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -2214,6 +2592,13 @@ def filejump_revoke():
         _reconcile_smb_proxy()
     except Exception:
         pass
+    add_activity_log(
+        "Disconnect Drive",
+        "delete",
+        f"Revoked FileJump account '{account_id or 'all'}'",
+        drive="FileJump",
+        target=account_id or "all",
+    )
     return jsonify({"ok": True})
 
 @app.get("/api/filejump/files")
@@ -2396,6 +2781,13 @@ def filejump_upload():
             account_id=account_id,
             conflict_action=conflict_action,
         )
+        add_activity_log(
+            "Upload",
+            "add",
+            f"Uploaded '{rel_path or f.filename}' to FileJump",
+            drive=f"FileJump ({account_id or 'default'})",
+            target=rel_path or f.filename,
+        )
         return jsonify({"ok": True})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -2422,6 +2814,13 @@ def filejump_save_content(file_id):
             mime_type=mime,
             account_id=account_id,
         )
+        add_activity_log(
+            "Edit File",
+            "change",
+            f"Saved edited content to '{meta.get('name', file_id)}' ({_format_log_bytes(len(encoded))}) on FileJump",
+            drive=f"FileJump ({account_id or 'default'})",
+            target=meta.get("name", file_id),
+        )
         return jsonify({"ok": True, "size": len(encoded), "file": updated})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -2437,6 +2836,15 @@ def filejump_rename(file_id):
         return jsonify({"error": "New name is required"}), 400
     try:
         res = filejump_manager.rename_file(file_id, new_name, account_id=account_id, conflict_action=conflict_action)
+        if not (isinstance(res, dict) and res.get("skipped")):
+            final_name = res.get("name", new_name) if isinstance(res, dict) else new_name
+            add_activity_log(
+                "Rename",
+                "change",
+                f"Renamed item '{file_id}' to '{final_name}' on FileJump",
+                drive=f"FileJump ({account_id or 'default'})",
+                target=final_name,
+            )
         return jsonify({"ok": True, "file": res})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -2471,6 +2879,13 @@ def filejump_delete(file_id):
     account_id = request.args.get("account_id", "").strip() or None
     try:
         filejump_manager.delete_file(file_id, account_id=account_id)
+        add_activity_log(
+            "Delete",
+            "delete",
+            f"Deleted item '{file_id}' from FileJump",
+            drive=f"FileJump ({account_id or 'default'})",
+            target=file_id,
+        )
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -2481,7 +2896,15 @@ def filejump_mkdir():
     b = request.get_json(force=True) or {}
     account_id = (request.args.get("account_id") or b.get("account_id") or "").strip() or None
     try:
-        fid = filejump_manager.create_folder(b.get("parent", "root"), b.get("name", "New Folder"), account_id=account_id)
+        folder_name = b.get("name", "New Folder")
+        fid = filejump_manager.create_folder(b.get("parent", "root"), folder_name, account_id=account_id)
+        add_activity_log(
+            "New Folder",
+            "add",
+            f"Created folder '{folder_name}' on FileJump",
+            drive=f"FileJump ({account_id or 'default'})",
+            target=folder_name,
+        )
         return jsonify({"id": fid})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -3196,6 +3619,21 @@ def complete_resumable_upload():
         with _upload_sessions_lock:
             _UPLOAD_SESSIONS.pop(session_id, None)
 
+        disp_target = sess.get("destFull") or sess.get("resolvedName") or rel_path or file_name
+        drive_label = {
+            "smb": f"SMB ({drive_id})",
+            "gdrive": f"Google Drive ({drive_id})",
+            "onedrive": f"OneDrive ({drive_id})",
+            "filejump": f"FileJump ({drive_id})",
+        }.get(drive_type, drive_type.upper())
+        add_activity_log(
+            "Upload",
+            "add",
+            f"Uploaded '{disp_target}' ({_format_log_bytes(total_size)}) to {drive_label}",
+            drive=drive_label,
+            target=disp_target,
+        )
+
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -3432,6 +3870,24 @@ def transfer_items():
                     elif src_type == "filejump":
                         filejump_manager.delete_file(item["id"], account_id=src_drive)
             count += 1
+        if count > 0:
+            item_labels = []
+            for it in items[:3]:
+                lbl = it.get("name") or (str(it.get("path") or "").rstrip("/").split("/")[-1]) or str(it.get("id") or "item")
+                if lbl:
+                    item_labels.append(lbl)
+            summary_names = ", ".join(item_labels)
+            if len(items) > 3:
+                summary_names += f" (+{len(items) - 3} more)"
+            op_action = "Move" if is_move else "Copy"
+            op_verb = "Moved" if is_move else "Copied"
+            add_activity_log(
+                op_action,
+                "move",
+                f"{op_verb} {count} item(s) [{summary_names}] from {src_type.upper()} ({src_drive}) to {dest_type.upper()} ({dest_drive}:{dest_folder})",
+                drive=f"{src_type.upper()} → {dest_type.upper()}",
+                target=summary_names,
+            )
         return jsonify({
             "ok": True,
             "copied": count,
@@ -3886,6 +4342,13 @@ def update_smb_proxy_share(account_id):
                 smb_share_name=smb_share_name,
             )
         status = _reconcile_smb_proxy()
+        add_activity_log(
+            "SMB Proxy",
+            "change",
+            f"Updated SMB proxy share settings for account '{account_id}'",
+            drive="SMB Proxy",
+            target=str(account_id),
+        )
         return jsonify({
             "ok": True,
             "share": updated,
@@ -3929,6 +4392,13 @@ def set_smb_proxy_creds():
             text=True, capture_output=True
         )
         _reconcile_smb_proxy()
+        add_activity_log(
+            "SMB Proxy",
+            "change",
+            f"Updated SMB proxy user credentials for '{username}'",
+            drive="SMB Proxy",
+            target=username,
+        )
         return jsonify({"ok": True, "message": f"Credentials saved. Reconnect as '{username}'."})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -3978,7 +4448,7 @@ def save_favorite_folder():
         "name": str(body.get("name") or "Folder").strip() or "Folder",
         "driveType": str(body.get("driveType") or "smb").strip(),
         "driveId": str(body.get("driveId") or "default").strip(),
-        "driveName": str(body.get("driveName") or "Drive").strip(),
+        "driveName": str(body.get("driveName") or "Drive").trim() if hasattr(str, "trim") else str(body.get("driveName") or "Drive").strip(),
         "path": str(body.get("path") or "/").strip(),
         "folderId": str(body.get("folderId") or "root").strip(),
         "pathStack": body.get("pathStack") if isinstance(body.get("pathStack"), list) else [],
@@ -3991,7 +4461,14 @@ def save_favorite_folder():
         else:
             favs.append(entry)
         _save_favorites_list(favs)
-        return jsonify({"ok": True, "favorites": favs})
+    add_activity_log(
+        "Favorite Added",
+        "add",
+        f"Pinned favorite folder '{entry['name']}' ({entry['driveName']})",
+        drive=entry["driveName"],
+        target=entry["path"],
+    )
+    return jsonify({"ok": True, "favorites": favs})
 
 
 @app.delete("/api/favorites")
@@ -4001,10 +4478,23 @@ def delete_favorite_folder():
     fav_id = (request.args.get("id") or body.get("id") or "").strip()
     if not fav_id:
         return jsonify({"error": "Favorite folder id is required"}), 400
+    removed_name = fav_id
     with _favorites_lock:
-        favs = [item for item in _load_favorites_list() if item.get("id") != fav_id]
+        existing = _load_favorites_list()
+        for item in existing:
+            if item.get("id") == fav_id:
+                removed_name = item.get("name") or fav_id
+                break
+        favs = [item for item in existing if item.get("id") != fav_id]
         _save_favorites_list(favs)
-        return jsonify({"ok": True, "favorites": favs})
+    add_activity_log(
+        "Favorite Removed",
+        "delete",
+        f"Removed favorite folder '{removed_name}'",
+        drive="Favorites",
+        target=removed_name,
+    )
+    return jsonify({"ok": True, "favorites": favs})
 
 
 # Trigger initial multi-drive SMB proxy reconciliation in background on startup

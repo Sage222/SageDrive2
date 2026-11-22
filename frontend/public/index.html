@@ -6206,6 +6206,185 @@ async function doMkdir(type) {
   } catch(e) { toast('Failed: '+e.message, 'error'); }
 }
 
+let _activityLogs = [];
+let _activityLogsMaxEntries = 500;
+let _logCategoryFilter = 'all';
+let _logSearchQuery = '';
+
+async function refreshActivityLogs() {
+  try {
+    const res = await apiJSON('/api/logs');
+    _activityLogs = Array.isArray(res.logs) ? res.logs : [];
+    _activityLogsMaxEntries = Number(res.max_entries) || 500;
+  } catch (_) {
+    _activityLogs = [];
+  }
+}
+
+function formatLogTimestamp(isoStr, epochMs) {
+  try {
+    const d = epochMs ? new Date(Number(epochMs)) : new Date(isoStr);
+    if (isNaN(d.getTime())) return isoStr || '—';
+    return d.toLocaleString(undefined, {
+      year: 'numeric',
+      month: 'short',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    });
+  } catch (_) {
+    return isoStr || '—';
+  }
+}
+
+function getLogCategoryMeta(cat) {
+  const c = String(cat || 'info').toLowerCase();
+  switch (c) {
+    case 'move':
+      return { label: 'Move / Copy', badgeClass: 'badge-primary', icon: 'arrow-right-left', color: '#38bdf8' };
+    case 'add':
+      return { label: 'Add / Create', badgeClass: 'badge-success', icon: 'plus-circle', color: '#22c55e' };
+    case 'change':
+      return { label: 'Change / Edit', badgeClass: 'badge-primary', icon: 'edit-3', color: '#f59e0b' };
+    case 'delete':
+      return { label: 'Delete / Remove', badgeClass: 'badge-danger', icon: 'trash-2', color: '#ef4444' };
+    case 'security':
+      return { label: 'Security / Auth', badgeClass: 'badge-primary', icon: 'shield-alert', color: '#a855f7' };
+    default:
+      return { label: 'System', badgeClass: 'badge-primary', icon: 'activity', color: 'var(--color-text-muted)' };
+  }
+}
+
+function getFilteredActivityLogs() {
+  const q = (_logSearchQuery || '').trim().toLowerCase();
+  return _activityLogs.filter(entry => {
+    const cat = String(entry.category || 'info').toLowerCase();
+    if (_logCategoryFilter !== 'all' && cat !== _logCategoryFilter) return false;
+    if (!q) return true;
+    const hay = [
+      entry.timestamp,
+      entry.category,
+      entry.action,
+      entry.user,
+      entry.drive,
+      entry.target,
+      entry.details,
+    ].map(v => String(v || '').toLowerCase()).join(' ');
+    return hay.includes(q);
+  });
+}
+
+function buildActivityLogRowsHtml(entries) {
+  if (!entries.length) {
+    return `
+      <tr>
+        <td colspan="6" style="text-align:center;padding:var(--space-6);color:var(--color-text-muted);font-size:var(--text-xs)">
+          No activity log entries match the current filter.
+        </td>
+      </tr>
+    `;
+  }
+  return entries.map(entry => {
+    const meta = getLogCategoryMeta(entry.category);
+    const tsFormatted = formatLogTimestamp(entry.timestamp, entry.epoch);
+    return `
+      <tr style="border-bottom:1px solid var(--color-divider)">
+        <td style="padding:10px 12px;white-space:nowrap;font-family:var(--font-mono);font-size:11px;color:var(--color-text-muted)" title="${escHtml(entry.timestamp || '')}">
+          ${escHtml(tsFormatted)}
+        </td>
+        <td style="padding:10px 12px;white-space:nowrap">
+          <span class="badge" style="background:color-mix(in oklab, ${meta.color} 15%, var(--color-surface-offset));color:${meta.color};border:1px solid color-mix(in oklab, ${meta.color} 32%, transparent);font-size:10px;display:inline-flex;align-items:center;gap:4px">
+            <svg data-lucide="${meta.icon}" width="11" height="11"></svg>
+            ${escHtml(meta.label)}
+          </span>
+        </td>
+        <td style="padding:10px 12px;white-space:nowrap;font-weight:600;font-size:var(--text-xs);color:var(--color-text)">
+          ${escHtml(entry.action || 'Event')}
+        </td>
+        <td style="padding:10px 12px;white-space:nowrap;font-size:var(--text-xs);color:var(--color-text-muted)">
+          <span style="font-family:var(--font-mono);font-size:11px;color:var(--color-text)">${escHtml(entry.drive || 'System')}</span>
+          ${entry.user ? `<div style="font-size:10px;color:var(--color-text-faint)">by ${escHtml(entry.user)}</div>` : ''}
+        </td>
+        <td style="padding:10px 12px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-mono);font-size:11px;color:var(--color-text)" title="${escHtml(entry.target || '')}">
+          ${escHtml(entry.target || '—')}
+        </td>
+        <td style="padding:10px 12px;font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.4;min-width:220px">
+          ${escHtml(entry.details || '')}
+        </td>
+      </tr>
+    `;
+  }).join('');
+}
+
+function setLogCategoryFilter(cat) {
+  _logCategoryFilter = cat;
+  renderSettings();
+}
+
+function onLogSearchInput(val) {
+  _logSearchQuery = val || '';
+  const tbody = document.getElementById('activity-logs-tbody');
+  const countEl = document.getElementById('activity-logs-count');
+  const filtered = getFilteredActivityLogs();
+  if (tbody) {
+    tbody.innerHTML = buildActivityLogRowsHtml(filtered);
+    lucide.createIcons();
+  }
+  if (countEl) {
+    countEl.textContent = `Showing ${filtered.length} of ${_activityLogs.length} entries (capped at ${_activityLogsMaxEntries})`;
+  }
+}
+
+async function handleRefreshActivityLogs() {
+  await refreshActivityLogs();
+  renderSettings();
+  toast('Activity logs refreshed', 'info');
+}
+
+function exportActivityLogsCsv() {
+  const a = document.createElement('a');
+  a.href = '/api/logs/export.csv';
+  a.download = `sagedrive_activity_logs_${new Date().toISOString().slice(0,10)}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  toast('Exporting activity logs to CSV…', 'success');
+}
+
+function showClearActivityLogsModal() {
+  if (!requireAdminAction('Clear Activity Logs')) return;
+  showModal(`
+    <div class="modal-header">
+      <span class="modal-title">Clear Activity Logs</span>
+      <button class="btn-icon" onclick="closeModal()"><svg data-lucide="x" width="16" height="16"></svg></button>
+    </div>
+    <div class="modal-body">
+      <p style="font-size:var(--text-sm);color:var(--color-text-muted);line-height:1.5">
+        Are you sure you want to clear all recorded activity logs? A fresh log entry recording the reset will be created.
+      </p>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-danger" onclick="doClearActivityLogs()">
+        <svg data-lucide="trash-2" width="13" height="13"></svg> Clear Logs
+      </button>
+    </div>`);
+}
+
+async function doClearActivityLogs() {
+  closeModal();
+  try {
+    await apiJSON('/api/logs', { method: 'DELETE' });
+    await refreshActivityLogs();
+    renderSettings();
+    toast('Activity logs cleared', 'info');
+  } catch (e) {
+    toast('Failed to clear logs: ' + e.message, 'error');
+  }
+}
+
 function setSettingsTab(tab) {
   _settingsTab = tab;
   renderSettings();
@@ -6229,9 +6408,10 @@ async function renderSettings() {
   await refreshGDStatus();
   await refreshODStatus();
   await refreshFJStatus();
+  await refreshActivityLogs();
   try { smbProxyCreds = await apiJSON('/api/smb/proxy-credentials'); } catch(_) {}
 
-  const validTabs = ['gdrive', 'onedrive', 'filejump', 'smb', 'oauth', 'od_oauth', 'proxy', 'themes', 'system'];
+  const validTabs = ['gdrive', 'onedrive', 'filejump', 'smb', 'oauth', 'od_oauth', 'proxy', 'themes', 'system', 'logs'];
   if (!validTabs.includes(_settingsTab)) {
     _settingsTab = 'gdrive';
   }
@@ -6245,6 +6425,7 @@ async function renderSettings() {
   const showProxy     = _settingsTab === 'proxy';
   const showThemes    = _settingsTab === 'themes';
   const showSystem    = _settingsTab === 'system';
+  const showLogs      = _settingsTab === 'logs';
   const oauthOpen    = true;
   const defaultRedir   = _gdConfig.redirect_uri || `${location.origin}/api/gdrive/callback`;
   const defaultOdRedir = _odConfig.redirect_uri || `${location.origin}/api/onedrive/callback`;
@@ -6363,6 +6544,9 @@ async function renderSettings() {
         </button>
         <button class="settings-tab ${_settingsTab==='system'?'active':''}" onclick="setSettingsTab('system')">
           <svg data-lucide="shield-check"></svg> Security &amp; About
+        </button>
+        <button class="settings-tab ${_settingsTab==='logs'?'active':''}" onclick="setSettingsTab('logs')">
+          <svg data-lucide="scroll-text"></svg> Logs (${_activityLogs.length})
         </button>
       </div>
     </div>
@@ -6997,6 +7181,96 @@ async function renderSettings() {
       </div>
     </div>
     ` : ''}
+
+    ${showLogs ? (() => {
+      const filteredLogs = getFilteredActivityLogs();
+      const counts = {
+        all: _activityLogs.length,
+        move: _activityLogs.filter(e => e.category === 'move').length,
+        add: _activityLogs.filter(e => e.category === 'add').length,
+        change: _activityLogs.filter(e => e.category === 'change').length,
+        delete: _activityLogs.filter(e => e.category === 'delete').length,
+        security: _activityLogs.filter(e => e.category === 'security').length,
+      };
+      return `
+      <!-- Activity Logs Card -->
+      <div class="card">
+        <div class="card-header" style="flex-wrap:wrap;gap:var(--space-2)">
+          <div style="display:flex;align-items:center;gap:var(--space-2)">
+            <svg data-lucide="scroll-text" width="16" height="16" style="color:var(--color-primary)"></svg>
+            <span class="card-title">Activity Logs</span>
+            <span class="badge badge-primary">${_activityLogs.length} / ${_activityLogsMaxEntries} max</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap">
+            <button class="btn btn-secondary btn-sm" onclick="handleRefreshActivityLogs()" title="Refresh activity logs">
+              <svg data-lucide="refresh-cw" width="13" height="13"></svg> Refresh
+            </button>
+            <button class="btn btn-primary btn-sm" onclick="exportActivityLogsCsv()" title="Export activity logs to CSV">
+              <svg data-lucide="download" width="13" height="13"></svg> Export CSV
+            </button>
+            ${_adminMode ? `
+              <button class="btn btn-danger btn-sm" onclick="showClearActivityLogsModal()" title="Clear activity logs">
+                <svg data-lucide="trash-2" width="13" height="13"></svg> Clear Logs
+              </button>
+            ` : ''}
+          </div>
+        </div>
+        <div class="card-body">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:var(--space-3);flex-wrap:wrap;margin-bottom:var(--space-3)">
+            <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+              <button class="btn ${_logCategoryFilter==='all'?'btn-primary':'btn-secondary'} btn-sm" onclick="setLogCategoryFilter('all')">
+                All Events (${counts.all})
+              </button>
+              <button class="btn ${_logCategoryFilter==='move'?'btn-primary':'btn-secondary'} btn-sm" onclick="setLogCategoryFilter('move')">
+                Moves &amp; Copies (${counts.move})
+              </button>
+              <button class="btn ${_logCategoryFilter==='add'?'btn-primary':'btn-secondary'} btn-sm" onclick="setLogCategoryFilter('add')">
+                Adds &amp; Uploads (${counts.add})
+              </button>
+              <button class="btn ${_logCategoryFilter==='change'?'btn-primary':'btn-secondary'} btn-sm" onclick="setLogCategoryFilter('change')">
+                Changes &amp; Edits (${counts.change})
+              </button>
+              <button class="btn ${_logCategoryFilter==='delete'?'btn-primary':'btn-secondary'} btn-sm" onclick="setLogCategoryFilter('delete')">
+                Deletes (${counts.delete})
+              </button>
+              <button class="btn ${_logCategoryFilter==='security'?'btn-primary':'btn-secondary'} btn-sm" onclick="setLogCategoryFilter('security')">
+                Security &amp; Auth (${counts.security})
+              </button>
+            </div>
+            <div style="position:relative;min-width:220px;flex:1;max-width:320px">
+              <input type="text" class="form-input" placeholder="Search logs by file, action, drive, user…"
+                     value="${escHtml(_logSearchQuery)}"
+                     oninput="onLogSearchInput(this.value)"
+                     style="width:100%;padding-left:var(--space-3);font-size:var(--text-xs)" />
+            </div>
+          </div>
+
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:var(--space-2);font-size:11px;color:var(--color-text-muted)">
+            <span id="activity-logs-count">Showing ${filteredLogs.length} of ${_activityLogs.length} entries (capped at ${_activityLogsMaxEntries})</span>
+            <span>Newest entries first · Rolling 500-entry retention</span>
+          </div>
+
+          <div style="border:1px solid var(--color-border);overflow-x:auto;max-height:540px;overflow-y:auto;background:var(--color-surface)">
+            <table style="width:100%;border-collapse:collapse;text-align:left">
+              <thead style="position:sticky;top:0;background:var(--color-surface-offset);border-bottom:1px solid var(--color-border);z-index:1">
+                <tr>
+                  <th style="padding:9px 12px;font-size:11px;font-weight:600;color:var(--color-text-muted);text-transform:uppercase;letter-spacing:.04em;white-space:nowrap">Timestamp</th>
+                  <th style="padding:9px 12px;font-size:11px;font-weight:600;color:var(--color-text-muted);text-transform:uppercase;letter-spacing:.04em;white-space:nowrap">Category</th>
+                  <th style="padding:9px 12px;font-size:11px;font-weight:600;color:var(--color-text-muted);text-transform:uppercase;letter-spacing:.04em;white-space:nowrap">Action</th>
+                  <th style="padding:9px 12px;font-size:11px;font-weight:600;color:var(--color-text-muted);text-transform:uppercase;letter-spacing:.04em;white-space:nowrap">Drive / User</th>
+                  <th style="padding:9px 12px;font-size:11px;font-weight:600;color:var(--color-text-muted);text-transform:uppercase;letter-spacing:.04em;white-space:nowrap">Target</th>
+                  <th style="padding:9px 12px;font-size:11px;font-weight:600;color:var(--color-text-muted);text-transform:uppercase;letter-spacing:.04em">Details</th>
+                </tr>
+              </thead>
+              <tbody id="activity-logs-tbody">
+                ${buildActivityLogRowsHtml(filteredLogs)}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      `;
+    })() : ''}
 
   </div>`;
   lucide.createIcons();

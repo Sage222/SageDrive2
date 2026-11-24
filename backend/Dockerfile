@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf
 
 WORKDIR /app
+ENV DATA_DIR=/app/data
 COPY backend/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 

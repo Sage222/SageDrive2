@@ -1476,7 +1476,8 @@ def smb_upload(share_id):
         norm_dest = _sanitize_smb_path(dest, allow_root=True)
         sub_path = (rel_path or f.filename or "").lstrip("/")
         target_path = _sanitize_smb_path(norm_dest.rstrip("/") + "/" + sub_path, allow_root=False)
-        saved_path = smb_manager.upload_file(share_id, target_path, f.stream, conflict_action=conflict_action)
+        with _SINGLE_FILE_UPLOAD_LOCK:
+            saved_path = smb_manager.upload_file(share_id, target_path, f.stream, conflict_action=conflict_action)
         _SMB_SIZE_CACHE.pop(f"{share_id}:{target_path}", None)
         if saved_path:
             _SMB_SIZE_CACHE.pop(f"{share_id}:{saved_path}", None)
@@ -1920,15 +1921,16 @@ def gdrive_upload():
     if not f:
         return jsonify({"error": "No file provided"}), 400
     try:
-        gdrive_manager.upload_file(
-            folder_id,
-            f.filename,
-            f.stream,
-            f.content_type or "application/octet-stream",
-            relative_path=rel_path or None,
-            account_id=account_id,
-            conflict_action=conflict_action,
-        )
+        with _SINGLE_FILE_UPLOAD_LOCK:
+            gdrive_manager.upload_file(
+                folder_id,
+                f.filename,
+                f.stream,
+                f.content_type or "application/octet-stream",
+                relative_path=rel_path or None,
+                account_id=account_id,
+                conflict_action=conflict_action,
+            )
         add_activity_log(
             "Upload",
             "add",
@@ -2353,15 +2355,16 @@ def onedrive_upload():
     if not f:
         return jsonify({"error": "No file provided"}), 400
     try:
-        onedrive_manager.upload_file(
-            folder_id,
-            f.filename,
-            f.stream,
-            f.content_type or "application/octet-stream",
-            relative_path=rel_path or None,
-            account_id=account_id,
-            conflict_action=conflict_action,
-        )
+        with _SINGLE_FILE_UPLOAD_LOCK:
+            onedrive_manager.upload_file(
+                folder_id,
+                f.filename,
+                f.stream,
+                f.content_type or "application/octet-stream",
+                relative_path=rel_path or None,
+                account_id=account_id,
+                conflict_action=conflict_action,
+            )
         add_activity_log(
             "Upload",
             "add",
@@ -2772,15 +2775,16 @@ def filejump_upload():
     if not f:
         return jsonify({"error": "No file provided"}), 400
     try:
-        filejump_manager.upload_file(
-            folder_id,
-            f.filename,
-            f.stream,
-            f.content_type or "application/octet-stream",
-            relative_path=rel_path or None,
-            account_id=account_id,
-            conflict_action=conflict_action,
-        )
+        with _SINGLE_FILE_UPLOAD_LOCK:
+            filejump_manager.upload_file(
+                folder_id,
+                f.filename,
+                f.stream,
+                f.content_type or "application/octet-stream",
+                relative_path=rel_path or None,
+                account_id=account_id,
+                conflict_action=conflict_action,
+            )
         add_activity_log(
             "Upload",
             "add",
@@ -2919,6 +2923,7 @@ except Exception:
 
 _UPLOAD_SESSIONS = {}
 _upload_sessions_lock = threading.Lock()
+_SINGLE_FILE_UPLOAD_LOCK = threading.Lock()
 
 
 class _UploadAbortedError(Exception):
@@ -3463,7 +3468,7 @@ def chunk_resumable_upload():
             return jsonify({"error": "Upload session not found"}), 404
 
         chunk_bytes = request.get_data(cache=False)
-        with sess["lock"]:
+        with _SINGLE_FILE_UPLOAD_LOCK, sess["lock"]:
             drive_type = sess["driveType"]
             drive_id = sess["driveId"]
             total_size = sess["totalSize"]

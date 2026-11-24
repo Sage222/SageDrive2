@@ -65,6 +65,13 @@ if od_accounts_file.exists():
         pass
 
 fj_accounts = []
+legacy_fj_file = Path('/data/filejump_accounts.json')
+if not fj_accounts_file.exists() and legacy_fj_file.exists():
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        fj_accounts_file.write_text(legacy_fj_file.read_text())
+    except Exception:
+        pass
 if fj_accounts_file.exists():
     try:
         loaded_fj = json.loads(fj_accounts_file.read_text())
@@ -273,6 +280,7 @@ for idx, acc in enumerate(accounts):
         "rclone", "mount", f"gdrive_{rc_id}:", mpath,
         "--config", "/root/.config/rclone/rclone.conf",
         "--allow-other",
+        "--transfers", "1",
         "--buffer-size", "16M",
         "--vfs-read-chunk-size", "32M",
         "--vfs-cache-mode", "off",
@@ -291,6 +299,7 @@ for idx, acc in enumerate(od_accounts):
         "rclone", "mount", f"onedrive_{rc_id}:", mpath,
         "--config", "/root/.config/rclone/rclone.conf",
         "--allow-other",
+        "--transfers", "1",
         "--buffer-size", "16M",
         "--vfs-read-chunk-size", "32M",
         "--vfs-cache-mode", "off",
@@ -310,6 +319,7 @@ for idx, acc in enumerate(fj_accounts):
         "rclone", "mount", f"filejump_{rc_id}:", mpath,
         "--config", "/root/.config/rclone/rclone.conf",
         "--allow-other",
+        "--transfers", "1",
         "--buffer-size", "16M",
         "--vfs-read-chunk-size", "32M",
         "--vfs-cache-mode", "off",

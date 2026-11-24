@@ -6,6 +6,7 @@ import posixpath
 import re
 import secrets
 import tempfile
+import threading
 import urllib.parse
 import xml.etree.ElementTree as ET
 import zipfile
@@ -15,8 +16,10 @@ from urllib.parse import quote, unquote, urlparse
 
 import requests
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 ACCOUNTS_FILE = DATA_DIR / "filejump_accounts.json"
+_LEGACY_ACCOUNTS_FILE = Path("/data/filejump_accounts.json")
+_accounts_lock = threading.Lock()
 
 DEFAULT_REST_BASE = os.getenv("FILEJUMP_API_URL", "https://filejump.com/api").rstrip("/")
 DEFAULT_UPLOAD_URL = os.getenv("FILEJUMP_UPLOAD_URL", "https://uploads.filejump.com/api/upload").rstrip("/")
@@ -121,23 +124,45 @@ def _ensure_smb_proxy_fields(accounts):
     return changed
 
 
-def _load_accounts_raw():
-    if ACCOUNTS_FILE.exists():
+def _save_accounts_unlocked(accounts):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _ensure_smb_proxy_fields(accounts)
+    payload = json.dumps(accounts, indent=2)
+    tmp_file = ACCOUNTS_FILE.with_suffix(".json.tmp")
+    with open(tmp_file, "w", encoding="utf-8") as f:
+        f.write(payload)
+        f.flush()
         try:
-            data = json.loads(ACCOUNTS_FILE.read_text())
-            if isinstance(data, list):
-                if _ensure_smb_proxy_fields(data):
-                    _save_accounts_raw(data)
-                return data
+            os.fsync(f.fileno())
         except Exception:
             pass
-    return []
+    os.replace(tmp_file, ACCOUNTS_FILE)
+
+
+def _load_accounts_raw():
+    with _accounts_lock:
+        if not ACCOUNTS_FILE.exists() and _LEGACY_ACCOUNTS_FILE.exists():
+            try:
+                legacy_data = json.loads(_LEGACY_ACCOUNTS_FILE.read_text(encoding="utf-8"))
+                if isinstance(legacy_data, list) and legacy_data:
+                    _save_accounts_unlocked(legacy_data)
+            except Exception:
+                pass
+        if ACCOUNTS_FILE.exists():
+            try:
+                data = json.loads(ACCOUNTS_FILE.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    if _ensure_smb_proxy_fields(data):
+                        _save_accounts_unlocked(data)
+                    return data
+            except Exception:
+                pass
+        return []
 
 
 def _save_accounts_raw(accounts):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    _ensure_smb_proxy_fields(accounts)
-    ACCOUNTS_FILE.write_text(json.dumps(accounts, indent=2))
+    with _accounts_lock:
+        _save_accounts_unlocked(accounts)
 
 
 def list_accounts():

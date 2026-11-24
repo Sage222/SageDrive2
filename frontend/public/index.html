@@ -528,6 +528,71 @@
                    font-size:var(--text-xs);line-height:1.45;display:flex;align-items:flex-start;gap:var(--space-2)}
     .lockout-alert svg{width:16px;height:16px;flex-shrink:0;margin-top:1px}
 
+    /* ── Directory Top Selection Bar & Music Queue Interface ── */
+    .dir-select-bar{
+      display:flex;align-items:center;justify-content:space-between;gap:var(--space-3);
+      padding:8px var(--space-4);margin-bottom:var(--space-3);
+      background:var(--color-surface);border:1px solid var(--color-border);
+      border-radius:var(--radius-lg);flex-wrap:wrap
+    }
+    .dir-select-left{display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap}
+    .dir-select-right{display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap;font-size:var(--text-xs);color:var(--color-text-muted)}
+    .dir-select-label{
+      display:inline-flex;align-items:center;gap:var(--space-2);cursor:pointer;
+      font-size:var(--text-xs);font-weight:600;color:var(--color-text);user-select:none;
+      padding:4px 8px;border-radius:var(--radius-md);transition:background var(--transition-interactive)
+    }
+    .dir-select-label:hover{background:var(--color-surface-offset)}
+    .music-queue-panel{
+      display:flex;flex-direction:column;border:1px solid var(--color-border);
+      border-radius:var(--radius-lg);background:var(--color-surface);overflow:hidden
+    }
+    .music-queue-header{
+      display:flex;align-items:center;justify-content:space-between;gap:var(--space-2);
+      padding:8px 12px;background:var(--color-surface-2);border-bottom:1px solid var(--color-divider);
+      flex-wrap:wrap
+    }
+    .music-queue-title{
+      display:flex;align-items:center;gap:6px;font-size:var(--text-xs);
+      font-weight:700;color:var(--color-text);letter-spacing:.01em
+    }
+    .music-queue-actions{display:flex;align-items:center;gap:4px;flex-wrap:wrap}
+    .music-queue-list{
+      display:flex;flex-direction:column;max-height:230px;overflow-y:auto;
+      divide-y:1px solid var(--color-divider)
+    }
+    .music-queue-item{
+      display:flex;align-items:center;gap:var(--space-2);padding:8px 12px;
+      border-bottom:1px solid var(--color-divider);cursor:pointer;
+      transition:background var(--transition-interactive);font-size:var(--text-xs)
+    }
+    .music-queue-item:last-child{border-bottom:none}
+    .music-queue-item:hover{background:var(--color-surface-offset)}
+    .music-queue-item.active{
+      background:color-mix(in oklab, var(--color-primary) 15%, var(--color-surface-offset));
+      border-left:3px solid var(--color-primary);padding-left:9px
+    }
+    .music-queue-idx{
+      width:24px;flex-shrink:0;text-align:center;font-family:var(--font-mono);
+      font-size:11px;color:var(--color-text-muted);font-weight:600
+    }
+    .music-queue-item.active .music-queue-idx{color:var(--color-primary);font-weight:700}
+    .music-queue-info{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
+    .music-queue-name{
+      font-weight:500;color:var(--color-text);overflow:hidden;
+      text-overflow:ellipsis;white-space:nowrap
+    }
+    .music-queue-item.active .music-queue-name{font-weight:700;color:var(--color-primary)}
+    .music-queue-sub{
+      font-size:10px;color:var(--color-text-muted);font-family:var(--font-mono);
+      display:flex;align-items:center;gap:6px
+    }
+    .music-queue-row-btns{
+      display:flex;align-items:center;gap:2px;flex-shrink:0;opacity:.75;
+      transition:opacity var(--transition-interactive)
+    }
+    .music-queue-item:hover .music-queue-row-btns{opacity:1}
+
     .spinner{width:20px;height:20px;border:2px solid var(--color-border);
              border-top-color:var(--color-primary);border-radius:50%;
              animation:spin .7s linear infinite}
@@ -799,6 +864,7 @@ let _mediaIndex = -1;
 let _playbackRate = 1;
 let _videoZoom = 1;
 let _autoPlayNext = true;
+let _mediaRepeatMode = 'all'; // 'all' | 'one' | 'off'
 let _favoriteFolders = [];
 const FAVORITES_STORAGE_KEY = 'sd_favorite_folders_v1';
 const VIDEO_RESUME_STORAGE_KEY = 'sd_video_resume_v1';
@@ -1803,15 +1869,37 @@ function itemKey(f, type) {
   return type === 'smb' ? (f.path || f.name) : f.id;
 }
 
+function getAudioFilesInList(list) {
+  return (list || []).filter(f => f && f.type !== 'folder' && isAudioFile(f));
+}
+
+function getSelectedAudioFiles() {
+  const selectedSet = new Set(_selectedItems.keys());
+  const type = _activeDrive?.type || 'smb';
+  // Preserve current directory sort order for selected audio files
+  const orderedFromDir = (_currentFiles || []).filter(
+    f => f && f.type !== 'folder' && isAudioFile(f) && selectedSet.has(itemKey(f, type))
+  );
+  if (orderedFromDir.length > 0) return orderedFromDir;
+  return Array.from(_selectedItems.values()).filter(f => f && f.type !== 'folder' && isAudioFile(f));
+}
+
 function clearSelection() {
   _selectedItems.clear();
   updateBatchBar();
+  if (_activeDrive && _view === 'files') {
+    setTopbarActions(fileToolbar(_activeDrive.type));
+  }
   document.querySelectorAll('.file-item-list.selected, .file-item-grid.selected').forEach(el => {
     el.classList.remove('selected');
   });
-  document.querySelectorAll('.list-select-cb, .grid-select-cb').forEach(cb => {
+  document.querySelectorAll('.list-select-cb, .grid-select-cb, #dir-top-select-all-cb').forEach(cb => {
     cb.checked = false;
   });
+  const topBtnLbl = document.getElementById('dir-top-select-all-label');
+  if (topBtnLbl) {
+    topBtnLbl.textContent = `Select All (${_currentFiles.length})`;
+  }
 }
 
 function toggleSelectItem(fJson, type, ev) {
@@ -1823,18 +1911,46 @@ function toggleSelectItem(fJson, type, ev) {
   } else {
     _selectedItems.set(key, f);
   }
+  if (_activeDrive && _view === 'files') {
+    setTopbarActions(fileToolbar(type));
+  }
   if (_currentFiles.length) {
     renderFileView(_currentFiles, type, true);
   }
 }
 
-function selectAllItems(type) {
-  if (_selectedItems.size === _currentFiles.length && _currentFiles.length > 0) {
+function selectAllItems(type, forceState = null) {
+  const allSelected = _selectedItems.size === _currentFiles.length && _currentFiles.length > 0;
+  const shouldSelect = typeof forceState === 'boolean' ? forceState : !allSelected;
+  if (!shouldSelect) {
     _selectedItems.clear();
   } else {
     for (const f of _currentFiles) {
       _selectedItems.set(itemKey(f, type), f);
     }
+  }
+  if (_activeDrive && _view === 'files') {
+    setTopbarActions(fileToolbar(type));
+  }
+  renderFileView(_currentFiles, type, true);
+}
+
+function selectAllAudioItems(type) {
+  const audioFiles = getAudioFilesInList(_currentFiles);
+  if (!audioFiles.length) {
+    toast('No audio files in this folder', 'info');
+    return;
+  }
+  const allAudioSelected = audioFiles.every(f => _selectedItems.has(itemKey(f, type))) && _selectedItems.size === audioFiles.length;
+  _selectedItems.clear();
+  if (!allAudioSelected) {
+    for (const f of audioFiles) {
+      _selectedItems.set(itemKey(f, type), f);
+    }
+    toast(`Selected ${audioFiles.length} music file${audioFiles.length > 1 ? 's' : ''}`, 'success');
+  }
+  if (_activeDrive && _view === 'files') {
+    setTopbarActions(fileToolbar(type));
   }
   renderFileView(_currentFiles, type, true);
 }
@@ -1849,17 +1965,33 @@ function updateBatchBar() {
   }
   const type = _activeDrive.type;
   const allSelected = count === _currentFiles.length && _currentFiles.length > 0;
+  const selectedAudio = getSelectedAudioFiles();
+  const folderAudio = getAudioFilesInList(_currentFiles);
   bar.innerHTML = `
     <div class="batch-bar">
       <div class="batch-bar-left">
-        <span class="batch-count">${count} selected</span>
+        <span class="batch-count">${count} selected${selectedAudio.length > 0 ? ` (${selectedAudio.length} audio)` : ''}</span>
         <button class="btn btn-ghost btn-sm" onclick="selectAllItems('${type}')">
           <svg data-lucide="${allSelected ? 'check-square' : 'square'}" width="14" height="14"></svg>
-          ${allSelected ? 'Deselect All' : 'Select All'}
+          ${allSelected ? 'Deselect All' : `Select All (${_currentFiles.length})`}
         </button>
+        ${folderAudio.length > 0 && folderAudio.length !== _currentFiles.length ? `
+          <button class="btn btn-ghost btn-sm" onclick="selectAllAudioItems('${type}')" title="Select only audio/music files in this folder">
+            <svg data-lucide="music" width="14" height="14"></svg>
+            Select Music (${folderAudio.length})
+          </button>
+        ` : ''}
       </div>
       <div class="batch-bar-actions">
-        <button class="btn btn-primary btn-sm" onclick="queueSelectedDownloads('${type}')">
+        ${selectedAudio.length > 0 ? `
+          <button class="btn btn-primary btn-sm" onclick="playSelectedAudio('${type}')" title="Play selected music files one after another in the Music Queue">
+            <svg data-lucide="play" width="14" height="14"></svg> Play Music (${selectedAudio.length})
+          </button>
+          <button class="btn btn-secondary btn-sm" onclick="addSelectedToMusicQueue('${type}')" title="Append selected music files to the playback queue">
+            <svg data-lucide="list-music" width="14" height="14"></svg> Queue Music
+          </button>
+        ` : ''}
+        <button class="btn ${selectedAudio.length > 0 ? 'btn-secondary' : 'btn-primary'} btn-sm" onclick="queueSelectedDownloads('${type}')">
           <svg data-lucide="download" width="14" height="14"></svg> Queue Downloads
         </button>
         <button class="btn btn-secondary btn-sm" onclick="downloadSelectedZip('${type}')">
@@ -1937,6 +2069,50 @@ function toggleFileSort(field = null) {
   }
 }
 
+function renderDirectorySelectBar(files, type) {
+  const totalCount = files.length;
+  const allSelected = _selectedItems.size === totalCount && totalCount > 0;
+  const folderCount = files.filter(f => f.type === 'folder').length;
+  const fileCount = totalCount - folderCount;
+  const audioFiles = getAudioFilesInList(files);
+  const selectedAudio = getSelectedAudioFiles();
+  const allAudioSelected = audioFiles.length > 0 && audioFiles.every(f => _selectedItems.has(itemKey(f, type)));
+
+  const summaryParts = [];
+  if (folderCount > 0) summaryParts.push(`${folderCount} folder${folderCount !== 1 ? 's' : ''}`);
+  if (fileCount > 0) summaryParts.push(`${fileCount} file${fileCount !== 1 ? 's' : ''}`);
+  if (audioFiles.length > 0) summaryParts.push(`${audioFiles.length} music track${audioFiles.length !== 1 ? 's' : ''}`);
+
+  return `
+    <div class="dir-select-bar" oncontextmenu="openDirectoryContextMenu(event,'${type}')">
+      <div class="dir-select-left">
+        <label class="dir-select-label" title="${allSelected ? 'Deselect all items in this folder' : 'Select all items in this folder (Ctrl+A)'}">
+          <input type="checkbox" id="dir-top-select-all-cb" class="list-select-cb" ${allSelected ? 'checked' : ''}
+                 onclick="selectAllItems('${type}')" />
+          <span id="dir-top-select-all-label">${allSelected ? 'Deselect All' : `Select All (${totalCount})`}</span>
+        </label>
+        ${audioFiles.length > 0 ? `
+          <button class="btn ${allAudioSelected && _selectedItems.size === audioFiles.length ? 'btn-primary' : 'btn-secondary'} btn-sm"
+                  onclick="selectAllAudioItems('${type}')"
+                  title="Select all music/audio files (.mp3, .wav, .opus, .flac, etc.) in this directory">
+            <svg data-lucide="check-square" width="13" height="13"></svg>
+            ${allAudioSelected && _selectedItems.size === audioFiles.length ? 'Deselect Music' : `Select Music (${audioFiles.length})`}
+          </button>
+          <button class="btn btn-primary btn-sm"
+                  onclick="${selectedAudio.length > 0 ? `playSelectedAudio('${type}')` : `playAllAudioInFolder('${type}')`}"
+                  title="${selectedAudio.length > 0 ? `Play ${selectedAudio.length} selected music track(s) in queue` : `Play all ${audioFiles.length} music track(s) in this folder one after another`}">
+            <svg data-lucide="list-music" width="14" height="14"></svg>
+            ${selectedAudio.length > 0 ? `Play Selected Music (${selectedAudio.length})` : `Play All Music (${audioFiles.length})`}
+          </button>
+        ` : ''}
+      </div>
+      <div class="dir-select-right">
+        <span>${summaryParts.join(' · ')}</span>
+      </div>
+    </div>
+  `;
+}
+
 function renderFileListHeader(type) {
   const allSelected = _selectedItems.size === _currentFiles.length && _currentFiles.length > 0;
   const sortArrow = (col) => _sortBy === col
@@ -1982,8 +2158,11 @@ function renderFileView(files, type, keepSelection = false) {
   }
   if (!files.length) {
     _currentFiles = [];
+    if (_activeDrive && _view === 'files') {
+      setTopbarActions(fileToolbar(type));
+    }
     document.getElementById('content-area').innerHTML = `
-      <div class="empty-state">
+      <div class="empty-state" oncontextmenu="openDirectoryContextMenu(event,'${type}')">
         <svg data-lucide="folder-open" width="48" height="48"></svg>
         <h3>Empty folder</h3>
         <p>${_adminMode ? 'Upload files or folders, or create a new folder to get started.' : 'This folder is empty. (Enable Administrator Functions in Settings to upload or create folders.)'}</p>
@@ -1993,23 +2172,29 @@ function renderFileView(files, type, keepSelection = false) {
 
   sortFilesList(files);
   _currentFiles = files;
+  if (_activeDrive && _view === 'files') {
+    setTopbarActions(fileToolbar(type));
+  }
 
   const ca = document.getElementById('content-area');
+  const topSelectBarHtml = renderDirectorySelectBar(files, type);
   const listHtml = _viewMode === 'grid'
-    ? `<div class="file-grid">${files.map(f=>fileCardGrid(f,type)).join('')}</div>`
-    : `<div class="card">${renderFileListHeader(type)}<div class="file-list">${files.map(f=>fileCardList(f,type)).join('')}</div></div>`;
+    ? `<div class="file-grid" oncontextmenu="openDirectoryContextMenu(event,'${type}')">${files.map(f=>fileCardGrid(f,type)).join('')}</div>`
+    : `<div class="card" oncontextmenu="openDirectoryContextMenu(event,'${type}')">${renderFileListHeader(type)}<div class="file-list">${files.map(f=>fileCardList(f,type)).join('')}</div></div>`;
 
-  ca.innerHTML = `<div id="batch-bar-container"></div>${listHtml}`;
+  ca.innerHTML = `<div id="batch-bar-container"></div>${topSelectBarHtml}${listHtml}`;
   updateBatchBar();
   lucide.createIcons();
 }
 
 function fileIcon(f) {
   if (f.type==='folder') return 'folder';
+  if (isAudioFile(f)) return 'music';
+  if (isVideoFile(f)) return 'video';
+  if (isImageFile(f)) return 'image';
   const ext = f.name.split('.').pop().toLowerCase();
   const map = {
-    pdf:'file-text',mp3:'music',mp4:'video',mov:'video',avi:'video',
-    jpg:'image',jpeg:'image',png:'image',gif:'image',webp:'image',svg:'image',
+    pdf:'file-text',
     zip:'archive',tar:'archive',gz:'archive','7z':'archive',rar:'archive',
     doc:'file-text',docx:'file-text',xls:'file-spreadsheet',xlsx:'file-spreadsheet',
     ppt:'presentation',pptx:'presentation',txt:'file-text',md:'file-text',
@@ -2020,11 +2205,11 @@ function fileIcon(f) {
 
 function fileColorClass(f) {
   if (f.type==='folder') return 'color:var(--color-gold,#d19900)';
+  if (isImageFile(f)) return 'color:var(--color-blue)';
+  if (isAudioFile(f)) return 'color:var(--color-purple)';
+  if (isVideoFile(f)) return 'color:var(--color-error)';
   const ext = f.name.split('.').pop().toLowerCase();
-  if (['jpg','jpeg','png','gif','webp','svg'].includes(ext)) return 'color:var(--color-blue)';
-  if (['mp3','wav','flac'].includes(ext)) return 'color:var(--color-purple)';
-  if (['mp4','mov','avi','mkv'].includes(ext)) return 'color:var(--color-error)';
-  if (['zip','tar','gz','rar'].includes(ext)) return 'color:var(--color-warning)';
+  if (['zip','tar','gz','rar','7z'].includes(ext)) return 'color:var(--color-warning)';
   if (['pdf'].includes(ext)) return 'color:var(--color-notification,#a13544)';
   return 'color:var(--color-text-muted)';
 }
@@ -2666,10 +2851,22 @@ document.addEventListener('fullscreenchange', _onFullscreenChange);
 document.addEventListener('webkitfullscreenchange', _onFullscreenChange);
 
 document.addEventListener('keydown', (e) => {
-  if (!_activeMediaState) return;
   const tag = (e.target && e.target.tagName) ? e.target.tagName.toLowerCase() : '';
-  if (tag === 'input' && e.target.type !== 'range') return;
-  if (tag === 'textarea' || tag === 'select' || e.target?.isContentEditable) return;
+  const inEditable = (tag === 'input' && e.target.type !== 'range' && e.target.type !== 'checkbox') ||
+    tag === 'textarea' || tag === 'select' || e.target?.isContentEditable;
+
+  // Ctrl+A / Cmd+A to Select All in file directory view when no modal/input is open
+  if ((e.ctrlKey || e.metaKey) && (e.key === 'a' || e.key === 'A') && !inEditable) {
+    const modalOpen = Boolean(document.getElementById('modal-backdrop'));
+    if (!modalOpen && _view === 'files' && _activeDrive && _currentFiles.length > 0) {
+      e.preventDefault();
+      selectAllItems(_activeDrive.type, true);
+      return;
+    }
+  }
+
+  if (!_activeMediaState) return;
+  if (inEditable) return;
 
   if (e.key === 'ArrowLeft') {
     e.preventDefault();
@@ -2683,6 +2880,12 @@ document.addEventListener('keydown', (e) => {
   } else if (e.key === 'l' || e.key === 'L') {
     e.preventDefault();
     skipMediaBy(15);
+  } else if (e.key === 'n' || e.key === 'N') {
+    e.preventDefault();
+    nextMediaTrack(_activeMediaState.type);
+  } else if (e.key === 'p' || e.key === 'P') {
+    e.preventDefault();
+    prevMediaTrack(_activeMediaState.type);
   } else if ((e.key === ' ' || e.key === 'k' || e.key === 'K') && tag !== 'button') {
     e.preventDefault();
     toggleMediaPlayPause();
@@ -2699,10 +2902,240 @@ function toggleAutoNext(cb) {
   _autoPlayNext = cb.checked;
 }
 
+function playSelectedAudio(type, startWithFile = null) {
+  const selectedAudio = getSelectedAudioFiles();
+  if (!selectedAudio.length) {
+    toast('No music/audio files selected', 'info');
+    return;
+  }
+  _autoPlayNext = true;
+  let startIdx = 0;
+  if (startWithFile) {
+    const found = selectedAudio.findIndex(item => itemKey(item, type) === itemKey(startWithFile, type));
+    if (found >= 0) startIdx = found;
+  }
+  _mediaPlaylist = selectedAudio.slice();
+  _mediaIndex = startIdx;
+  openMedia(encodeFileArg(_mediaPlaylist[startIdx]), type, { keepPlaylist: true });
+}
+
+function playAllAudioInFolder(type, startWithFile = null) {
+  const audioFiles = getAudioFilesInList(_currentFiles);
+  if (!audioFiles.length) {
+    toast('No music/audio files in this folder', 'info');
+    return;
+  }
+  _autoPlayNext = true;
+  let startIdx = 0;
+  if (startWithFile) {
+    const found = audioFiles.findIndex(item => itemKey(item, type) === itemKey(startWithFile, type));
+    if (found >= 0) startIdx = found;
+  }
+  _mediaPlaylist = audioFiles.slice();
+  _mediaIndex = startIdx;
+  openMedia(encodeFileArg(_mediaPlaylist[startIdx]), type, { keepPlaylist: true });
+}
+
+function addTrackToMusicQueue(fJson, type) {
+  const f = parseFileArg(fJson);
+  if (!f || f.type === 'folder' || !isAudioFile(f)) return;
+  const existingAudioQueue = _mediaPlaylist.filter(item => isAudioFile(item));
+  const alreadyExists = existingAudioQueue.some(item => itemKey(item, type) === itemKey(f, type));
+  if (!alreadyExists) {
+    existingAudioQueue.push(f);
+  }
+  _mediaPlaylist = existingAudioQueue;
+  if (_activeMediaState && !_activeMediaState.isVid) {
+    refreshMediaQueueDOM(type);
+    toast(`Added "${f.name}" to music queue (${_mediaPlaylist.length} tracks)`, 'success');
+  } else {
+    _mediaIndex = _mediaPlaylist.findIndex(item => itemKey(item, type) === itemKey(f, type));
+    if (_mediaIndex < 0) _mediaIndex = 0;
+    _autoPlayNext = true;
+    openMedia(encodeFileArg(_mediaPlaylist[_mediaIndex]), type, { keepPlaylist: true });
+  }
+}
+
+function addSelectedToMusicQueue(type) {
+  const selectedAudio = getSelectedAudioFiles();
+  if (!selectedAudio.length) {
+    toast('No audio files selected', 'info');
+    return;
+  }
+  const existingAudioQueue = _mediaPlaylist.filter(item => isAudioFile(item));
+  let added = 0;
+  for (const track of selectedAudio) {
+    if (!existingAudioQueue.some(item => itemKey(item, type) === itemKey(track, type))) {
+      existingAudioQueue.push(track);
+      added++;
+    }
+  }
+  _mediaPlaylist = existingAudioQueue;
+  if (_activeMediaState && !_activeMediaState.isVid) {
+    refreshMediaQueueDOM(type);
+    toast(`Added ${added} track${added !== 1 ? 's' : ''} to music queue (${_mediaPlaylist.length} total)`, 'success');
+  } else {
+    _mediaIndex = 0;
+    _autoPlayNext = true;
+    openMedia(encodeFileArg(_mediaPlaylist[0]), type, { keepPlaylist: true });
+  }
+}
+
+function moveMediaQueueTrack(idx, delta, type, ev) {
+  if (ev) ev.stopPropagation();
+  const targetIdx = idx + delta;
+  if (idx < 0 || idx >= _mediaPlaylist.length || targetIdx < 0 || targetIdx >= _mediaPlaylist.length) return;
+  const currentKey = _mediaPlaylist[_mediaIndex] ? itemKey(_mediaPlaylist[_mediaIndex], type) : null;
+  const temp = _mediaPlaylist[idx];
+  _mediaPlaylist[idx] = _mediaPlaylist[targetIdx];
+  _mediaPlaylist[targetIdx] = temp;
+  if (currentKey) {
+    _mediaIndex = _mediaPlaylist.findIndex(item => itemKey(item, type) === currentKey);
+  }
+  refreshMediaQueueDOM(type);
+}
+
+function removeMediaQueueTrack(idx, type, ev) {
+  if (ev) ev.stopPropagation();
+  if (idx < 0 || idx >= _mediaPlaylist.length) return;
+  if (_mediaPlaylist.length <= 1) {
+    closeModal();
+    return;
+  }
+  const removingCurrent = (idx === _mediaIndex);
+  _mediaPlaylist.splice(idx, 1);
+  if (removingCurrent) {
+    if (_mediaIndex >= _mediaPlaylist.length) _mediaIndex = 0;
+    openMedia(encodeFileArg(_mediaPlaylist[_mediaIndex]), type, { keepPlaylist: true });
+    return;
+  }
+  if (idx < _mediaIndex) {
+    _mediaIndex = Math.max(0, _mediaIndex - 1);
+  }
+  refreshMediaQueueDOM(type);
+}
+
+function shuffleMediaQueue(type, ev) {
+  if (ev) ev.stopPropagation();
+  if (_mediaPlaylist.length <= 1) return;
+  const curTrack = _mediaPlaylist[_mediaIndex];
+  const others = _mediaPlaylist.filter((_, i) => i !== _mediaIndex);
+  for (let i = others.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = others[i];
+    others[i] = others[j];
+    others[j] = tmp;
+  }
+  _mediaPlaylist = curTrack ? [curTrack, ...others] : others;
+  _mediaIndex = 0;
+  refreshMediaQueueDOM(type);
+  toast(`Shuffled ${others.length} upcoming track${others.length !== 1 ? 's' : ''}`, 'info');
+}
+
+function cycleMediaRepeatMode(type, ev) {
+  if (ev) ev.stopPropagation();
+  const order = ['all', 'one', 'off'];
+  const next = order[(order.indexOf(_mediaRepeatMode) + 1) % order.length];
+  _mediaRepeatMode = next;
+  refreshMediaQueueDOM(type);
+}
+
+function buildMediaQueuePanelHtml(type) {
+  const totalBytes = _mediaPlaylist.reduce((acc, item) => acc + (Number(item.size) || 0), 0);
+  const repeatLabel = _mediaRepeatMode === 'all'
+    ? 'Loop Queue'
+    : (_mediaRepeatMode === 'one' ? 'Repeat 1' : 'Repeat Off');
+  const repeatIcon = _mediaRepeatMode === 'one' ? 'repeat-1' : 'repeat';
+  const repeatActive = _mediaRepeatMode !== 'off';
+
+  const rowsHtml = _mediaPlaylist.map((item, idx) => {
+    const isCurrent = idx === _mediaIndex;
+    const ext = (_fileExt(item) || 'audio').toUpperCase();
+    return `
+      <div class="music-queue-item ${isCurrent ? 'active' : ''}"
+           id="music-queue-row-${idx}"
+           onclick="playMediaAtIndex(${idx}, '${type}')"
+           title="Click to play ${escAttr(item.name)}">
+        <div class="music-queue-idx">
+          ${isCurrent
+            ? '<svg data-lucide="volume-2" width="14" height="14"></svg>'
+            : String(idx + 1).padStart(2, '0')}
+        </div>
+        <div class="music-queue-info">
+          <div class="music-queue-name">${escHtml(item.name)}</div>
+          <div class="music-queue-sub">
+            <span>${escHtml(ext)}</span>
+            <span>•</span>
+            <span>${fmtSize(item.size)}</span>
+            ${isCurrent ? '<span style="color:var(--color-primary);font-weight:700">• Now Playing</span>' : ''}
+          </div>
+        </div>
+        <div class="music-queue-row-btns" onclick="event.stopPropagation()">
+          <button type="button" class="btn btn-ghost btn-icon btn-sm"
+                  onclick="moveMediaQueueTrack(${idx}, -1, '${type}', event)"
+                  ${idx === 0 ? 'disabled style="opacity:.25;cursor:default"' : ''}
+                  title="Move up in queue">
+            <svg data-lucide="chevron-up" width="13" height="13"></svg>
+          </button>
+          <button type="button" class="btn btn-ghost btn-icon btn-sm"
+                  onclick="moveMediaQueueTrack(${idx}, 1, '${type}', event)"
+                  ${idx === _mediaPlaylist.length - 1 ? 'disabled style="opacity:.25;cursor:default"' : ''}
+                  title="Move down in queue">
+            <svg data-lucide="chevron-down" width="13" height="13"></svg>
+          </button>
+          ${_mediaPlaylist.length > 1 ? `
+          <button type="button" class="btn btn-ghost btn-icon btn-sm"
+                  onclick="removeMediaQueueTrack(${idx}, '${type}', event)"
+                  title="Remove from queue">
+            <svg data-lucide="x" width="13" height="13"></svg>
+          </button>
+          ` : ''}
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  return `
+    <div class="music-queue-panel">
+      <div class="music-queue-header">
+        <div class="music-queue-title">
+          <svg data-lucide="list-music" width="15" height="15" style="color:var(--color-primary)"></svg>
+          <span>Music Playback Queue (${_mediaPlaylist.length} track${_mediaPlaylist.length !== 1 ? 's' : ''})</span>
+          <span style="font-weight:400;color:var(--color-text-muted);font-family:var(--font-mono)">· ${fmtSize(totalBytes)}</span>
+        </div>
+        <div class="music-queue-actions">
+          ${_mediaPlaylist.length > 1 ? `
+            <button type="button" class="btn btn-secondary btn-sm" onclick="shuffleMediaQueue('${type}', event)" style="padding:3px 8px;font-size:11px" title="Shuffle upcoming tracks">
+              <svg data-lucide="shuffle" width="12" height="12"></svg> Shuffle
+            </button>
+          ` : ''}
+          <button type="button" class="btn ${repeatActive ? 'btn-primary' : 'btn-secondary'} btn-sm" onclick="cycleMediaRepeatMode('${type}', event)" style="padding:3px 8px;font-size:11px" title="Toggle repeat mode (Loop Queue / Repeat 1 / Off)">
+            <svg data-lucide="${repeatIcon}" width="12" height="12"></svg> ${repeatLabel}
+          </button>
+        </div>
+      </div>
+      <div class="music-queue-list" id="music-queue-list-scroll">
+        ${rowsHtml}
+      </div>
+    </div>
+  `;
+}
+
+function refreshMediaQueueDOM(type) {
+  const root = document.getElementById('media-queue-panel-root');
+  if (root) {
+    root.innerHTML = buildMediaQueuePanelHtml(type);
+  }
+  document.querySelectorAll('.media-track-badge').forEach(el => {
+    el.textContent = `${_mediaIndex + 1} / ${_mediaPlaylist.length}`;
+  });
+  lucide.createIcons();
+}
+
 function playMediaAtIndex(idx, type) {
   if (idx < 0 || idx >= _mediaPlaylist.length) return;
   _mediaIndex = idx;
-  openMedia(encodeFileArg(_mediaPlaylist[idx]), type);
+  openMedia(encodeFileArg(_mediaPlaylist[idx]), type, { keepPlaylist: true });
 }
 
 function prevMediaTrack(type) {
@@ -2804,10 +3237,28 @@ function forceMediaCompatMode() {
   }
 }
 
-function openMedia(fJson, type) {
+function openMedia(fJson, type, opts = {}) {
   cleanupActiveMedia();
   var f   = parseFileArg(fJson);
-  _mediaPlaylist = _currentFiles.filter(item => item.type !== 'folder' && (isVideoFile(item) || isAudioFile(item)));
+  var isVid = isVideoFile(f);
+
+  if (opts && Array.isArray(opts.customPlaylist) && opts.customPlaylist.length > 0) {
+    _mediaPlaylist = opts.customPlaylist.slice();
+  } else if (!(opts && opts.keepPlaylist && _mediaPlaylist.length > 0)) {
+    if (!isVid) {
+      // If multiple audio files are currently selected and this file is one of them, queue the selected audio files
+      const selectedAudio = getSelectedAudioFiles();
+      const inSelected = selectedAudio.some(item => itemKey(item, type) === itemKey(f, type));
+      if (selectedAudio.length > 1 && inSelected) {
+        _mediaPlaylist = selectedAudio.slice();
+      } else {
+        _mediaPlaylist = getAudioFilesInList(_currentFiles);
+      }
+    } else {
+      _mediaPlaylist = (_currentFiles || []).filter(item => item.type !== 'folder' && isVideoFile(item));
+    }
+  }
+
   _mediaIndex = _mediaPlaylist.findIndex(item => itemKey(item, type) === itemKey(f, type));
   if (_mediaIndex === -1) {
     _mediaPlaylist = [f];
@@ -2815,7 +3266,6 @@ function openMedia(fJson, type) {
   }
 
   var src = mediaApiUrl(f, type);
-  var isVid = isVideoFile(f);
   var extBadge = (_fileExt(f) || (isVid ? 'video' : 'audio')).toUpperCase();
   var rates = [1, 1.1, 1.25, 1.5, 2];
   if (_playbackRate < 1 || !rates.some(r => Math.abs(r - _playbackRate) < 0.001)) {
@@ -2919,14 +3369,14 @@ function openMedia(fJson, type) {
         +   '</div>'
         +   '<div style="overflow:hidden;flex:1">'
         +     '<div style="font-weight:600;font-size:var(--text-sm);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escHtml(f.name) + '</div>'
-        +     '<div id="audio-stream-subtitle" style="font-size:var(--text-xs);color:var(--color-text-muted);font-family:var(--font-mono);margin-top:2px">' + escHtml(extBadge) + ' Audio Stream • ' + fmtSize(f.size) + '</div>'
+        +     '<div id="audio-stream-subtitle" style="font-size:var(--text-xs);color:var(--color-text-muted);font-family:var(--font-mono);margin-top:2px">' + escHtml(extBadge) + ' Audio Stream • ' + fmtSize(f.size) + ' • Track ' + (_mediaIndex + 1) + ' of ' + _mediaPlaylist.length + '</div>'
         +   '</div>'
         + '</div>'
         + '<audio id="active-media-player" controls autoplay preload="auto" '
         +   'style="width:100%;display:block">'
         +   'Your browser cannot play this audio.</audio>'
       + '</div>';
-  var styleW = isVid ? 'max-width:900px' : 'max-width:560px';
+  var styleW = isVid ? 'max-width:900px' : 'max-width:640px';
   var fjEsc  = encodeFileArg(f);
 
   var audioTimelineHtml = !isVid
@@ -2946,15 +3396,15 @@ function openMedia(fJson, type) {
   var controlsBarHtml = (!isVid || _mediaPlaylist.length > 1)
     ? '<div class="media-controls-bar">'
       + '<div class="media-nav-group">'
-      +   '<button class="btn btn-secondary btn-sm" onclick="prevMediaTrack(\'' + type + '\')" ' + (_mediaPlaylist.length <= 1 ? 'disabled style="opacity:.45;cursor:not-allowed"' : '') + ' title="Previous track">'
+      +   '<button class="btn btn-secondary btn-sm" onclick="prevMediaTrack(\'' + type + '\')" ' + (_mediaPlaylist.length <= 1 ? 'disabled style="opacity:.45;cursor:not-allowed"' : '') + ' title="Previous track (P)">'
       +     '<svg data-lucide="skip-back" width="14" height="14"></svg> Prev'
       +   '</button>'
       +   '<span class="media-track-badge">' + (_mediaIndex + 1) + ' / ' + _mediaPlaylist.length + '</span>'
-      +   '<button class="btn btn-secondary btn-sm" onclick="nextMediaTrack(\'' + type + '\')" ' + (_mediaPlaylist.length <= 1 ? 'disabled style="opacity:.45;cursor:not-allowed"' : '') + ' title="Next track">'
+      +   '<button class="btn btn-secondary btn-sm" onclick="nextMediaTrack(\'' + type + '\')" ' + (_mediaPlaylist.length <= 1 ? 'disabled style="opacity:.45;cursor:not-allowed"' : '') + ' title="Next track (N)">'
       +     'Next <svg data-lucide="skip-forward" width="14" height="14"></svg>'
       +   '</button>'
       +   (_mediaPlaylist.length > 1
-            ? '<label style="display:inline-flex;align-items:center;gap:4px;font-size:var(--text-xs);color:var(--color-text-muted);margin-left:var(--space-1);cursor:pointer">'
+            ? '<label style="display:inline-flex;align-items:center;gap:4px;font-size:var(--text-xs);color:var(--color-text-muted);margin-left:var(--space-1);cursor:pointer" title="Automatically play the next track when current track ends">'
               + '<input type="checkbox" ' + (_autoPlayNext ? 'checked' : '') + ' onchange="toggleAutoNext(this)" style="accent-color:var(--color-primary)"/> Auto-next</label>'
             : '')
       + '</div>'
@@ -2966,6 +3416,10 @@ function openMedia(fJson, type) {
             + '</div>'
           : '<div style="font-size:11px;color:var(--color-text-faint);font-family:var(--font-mono)">Double-tap left/right: ±15s</div>')
       + '</div>'
+    : '';
+
+  var queuePanelHtml = !isVid
+    ? '<div id="media-queue-panel-root">' + buildMediaQueuePanelHtml(type) + '</div>'
     : '';
 
   showModal(
@@ -2985,6 +3439,7 @@ function openMedia(fJson, type) {
     + mediaEl
     + audioTimelineHtml
     + controlsBarHtml
+    + queuePanelHtml
     + '<div style="display:flex;justify-content:space-between;align-items:center;gap:var(--space-2);flex-wrap:wrap">'
     +   '<div style="display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap">'
     +     '<span style="font-size:var(--text-xs);color:var(--color-text-muted);font-family:var(--font-mono)">' + fmtSize(f.size) + '</span>'
@@ -3010,6 +3465,13 @@ function openMedia(fJson, type) {
       const modalCard = mb.querySelector('.modal');
       if (modalCard) modalCard.classList.add('video-modal');
     }
+  } else {
+    setTimeout(() => {
+      const activeRow = document.getElementById('music-queue-row-' + _mediaIndex);
+      if (activeRow && typeof activeRow.scrollIntoView === 'function') {
+        activeRow.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      }
+    }, 30);
   }
   lucide.createIcons();
 
@@ -3518,8 +3980,20 @@ function openMedia(fJson, type) {
     if (isVid) {
       clearVideoProgress(state.f, state.type);
     }
+    if (_mediaRepeatMode === 'one' && player) {
+      seekTo(0);
+      player.play().catch(() => {});
+      return;
+    }
     if (_autoPlayNext && _mediaPlaylist.length > 1) {
-      nextMediaTrack(type);
+      if (_mediaIndex + 1 < _mediaPlaylist.length) {
+        playMediaAtIndex(_mediaIndex + 1, type);
+      } else if (_mediaRepeatMode === 'all') {
+        playMediaAtIndex(0, type);
+      }
+    } else if (_autoPlayNext && _mediaPlaylist.length === 1 && _mediaRepeatMode === 'all') {
+      seekTo(0);
+      player.play().catch(() => {});
     }
   };
 
@@ -4228,6 +4702,7 @@ function queueSelectedDownloads(type) {
 const _transferQueue = [];
 let _transferDrawerOpen = false;
 let _transferWorkerRunning = false;
+const MAX_CONCURRENT_UPLOADS = 1; // Strictly 1 file upload at a time across all platforms
 const UPLOAD_CHUNK_SIZE = 2560 * 1024; // 2.5 MiB (exact multiple of 256 KiB & 320 KiB for direct upstream streaming)
 
 function toggleTransferDrawer(forceState = null) {
@@ -4274,6 +4749,7 @@ function renderTransferQueueUI() {
       <div class="transfer-queue-title">
         <svg data-lucide="arrow-up-down" width="15" height="15" style="color:var(--color-primary)"></svg>
         <span>Transfer Queue (${_transferQueue.length})</span>
+        <span class="badge badge-primary" style="font-size:10px;padding:1px 6px" title="All uploads run sequentially 1 file at a time across all platforms">1 file at a time</span>
       </div>
       <div style="display:flex;align-items:center;gap:4px">
         ${hasPausable ? `
@@ -4632,11 +5108,12 @@ async function enqueueUploadEntries(entries, driveType) {
     return { queuedCount: 0, skippedCount: resolved.skippedCount, cancelled: false };
   }
 
+  const newJobs = [];
   for (const item of resolved.items) {
     const file = item.file;
     const relativePath = item.relativePath || file.webkitRelativePath || file.name;
     const jobId = 'tq_ul_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
-    _transferQueue.unshift({
+    newJobs.push({
       id: jobId,
       direction: 'upload',
       name: relativePath || file.name,
@@ -4656,6 +5133,16 @@ async function enqueueUploadEntries(entries, driveType) {
       errorMsg: '',
     });
   }
+  // Insert in strict FIFO order after any currently active/queued jobs so uploads run 1 by 1 in order
+  let insertIdx = 0;
+  while (
+    insertIdx < _transferQueue.length &&
+    (_transferQueue[insertIdx].status === 'active' || _transferQueue[insertIdx].status === 'queued')
+  ) {
+    insertIdx++;
+  }
+  _transferQueue.splice(insertIdx, 0, ...newJobs);
+
   _transferDrawerOpen = true;
   renderTransferQueueUI();
   processTransferQueue();
@@ -4667,7 +5154,12 @@ async function processTransferQueue() {
   _transferWorkerRunning = true;
   try {
     while (true) {
-      const nextJob = _transferQueue.find(j => j.status === 'queued');
+      const activeUploadsCount = _transferQueue.filter(j => j.direction === 'upload' && j.status === 'active').length;
+      const nextJob = _transferQueue.find(j => {
+        if (j.status !== 'queued') return false;
+        if (j.direction === 'upload' && activeUploadsCount >= MAX_CONCURRENT_UPLOADS) return false;
+        return true;
+      });
       if (!nextJob) break;
       if (nextJob.direction === 'upload') {
         await runResumableUploadJob(nextJob);
@@ -4678,10 +5170,22 @@ async function processTransferQueue() {
   } finally {
     _transferWorkerRunning = false;
     renderTransferQueueUI();
+    // Re-check if new queued items arrived while the worker was winding down
+    const hasPendingUpload = _transferQueue.some(j => j.direction === 'upload' && j.status === 'queued') &&
+      _transferQueue.filter(j => j.direction === 'upload' && j.status === 'active').length < MAX_CONCURRENT_UPLOADS;
+    const hasPendingDownload = _transferQueue.some(j => j.direction === 'download' && j.status === 'queued') &&
+      !_transferQueue.some(j => j.direction === 'download' && j.status === 'active');
+    if (hasPendingUpload || hasPendingDownload) {
+      processTransferQueue();
+    }
   }
 }
 
 async function runResumableUploadJob(job) {
+  // Enforce strictly 1 active upload at a time across all platforms
+  if (_transferQueue.some(j => j.id !== job.id && j.direction === 'upload' && j.status === 'active')) {
+    return;
+  }
   job.status = 'active';
   job.errorMsg = '';
   renderTransferQueueUI();
@@ -4690,8 +5194,11 @@ async function runResumableUploadJob(job) {
     const resolvedDriveType = job.driveType || _activeDrive?.type || '';
     job.driveType = resolvedDriveType;
     if (!job.uploadId) {
+      const initCtrl = new AbortController();
+      job.abortCtrl = initCtrl;
       const initRes = await apiJSON('/api/transfers/upload/init', {
         method: 'POST',
+        signal: initCtrl.signal,
         json: {
           driveType: resolvedDriveType,
           drive_type: resolvedDriveType,
@@ -4710,6 +5217,7 @@ async function runResumableUploadJob(job) {
           conflict_action: job.conflictAction || 'replace',
         }
       });
+      if (job.status !== 'active') return;
       if (initRes.skipped) {
         job.status = 'completed';
         job.transferredBytes = job.totalBytes;
@@ -4724,7 +5232,13 @@ async function runResumableUploadJob(job) {
       job.uploadId = initRes.upload_id || initRes.sessionId;
       job.transferredBytes = Number(initRes.offset) || 0;
     } else {
-      const stRes = await apiJSON(`/api/transfers/upload/status?upload_id=${encodeURIComponent(job.uploadId)}&session_id=${encodeURIComponent(job.uploadId)}`).catch(() => null);
+      const stCtrl = new AbortController();
+      job.abortCtrl = stCtrl;
+      const stRes = await apiJSON(
+        `/api/transfers/upload/status?upload_id=${encodeURIComponent(job.uploadId)}&session_id=${encodeURIComponent(job.uploadId)}`,
+        { signal: stCtrl.signal }
+      ).catch(() => null);
+      if (job.status !== 'active') return;
       if (stRes && typeof stRes.offset === 'number') {
         job.transferredBytes = stRes.offset;
       } else {
@@ -4773,8 +5287,11 @@ async function runResumableUploadJob(job) {
     }
 
     if (job.status !== 'active') return;
+    const compCtrl = new AbortController();
+    job.abortCtrl = compCtrl;
     await apiJSON('/api/transfers/upload/complete', {
       method: 'POST',
+      signal: compCtrl.signal,
       json: {
         upload_id: job.uploadId,
         sessionId: job.uploadId,
@@ -5178,16 +5695,105 @@ window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') closeContextMenu();
 });
 
+function positionAndShowContextMenu(menu, e) {
+  menu.style.display = 'flex';
+  lucide.createIcons();
+  const rect = menu.getBoundingClientRect();
+  const x = Math.min(e.clientX, window.innerWidth - rect.width - 12);
+  const y = Math.min(e.clientY, window.innerHeight - rect.height - 12);
+  menu.style.left = Math.max(8, x) + 'px';
+  menu.style.top = Math.max(8, y) + 'px';
+}
+
+function openDirectoryContextMenu(e, type) {
+  // Only handle right-clicks on directory background/headers (item cards stopPropagation)
+  if (e.target && e.target.closest('.file-item-list, .file-item-grid')) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const menu = document.getElementById('context-menu');
+  if (!menu) return;
+
+  const totalCount = _currentFiles.length;
+  const allSelected = _selectedItems.size === totalCount && totalCount > 0;
+  const folderAudio = getAudioFilesInList(_currentFiles);
+  const selectedAudio = getSelectedAudioFiles();
+  const allAudioSelected = folderAudio.length > 0 && folderAudio.every(f => _selectedItems.has(itemKey(f, type))) && _selectedItems.size === folderAudio.length;
+
+  let html = '';
+  if (totalCount > 0) {
+    html += `<button class="ctx-item" onclick="closeContextMenu();selectAllItems('${type}')">
+      <svg data-lucide="${allSelected ? 'check-square' : 'square'}"></svg>
+      ${allSelected ? 'Deselect All' : `Select All (${totalCount})`}
+    </button>`;
+  }
+
+  if (folderAudio.length > 0) {
+    html += `<button class="ctx-item" onclick="closeContextMenu();selectAllAudioItems('${type}')">
+      <svg data-lucide="music"></svg>
+      ${allAudioSelected ? 'Deselect All Music' : `Select All Music (${folderAudio.length})`}
+    </button>`;
+  }
+
+  if (selectedAudio.length > 0) {
+    html += `<button class="ctx-item" onclick="closeContextMenu();playSelectedAudio('${type}')">
+      <svg data-lucide="play"></svg>
+      Play Selected Music (${selectedAudio.length})
+    </button>`;
+    html += `<button class="ctx-item" onclick="closeContextMenu();addSelectedToMusicQueue('${type}')">
+      <svg data-lucide="list-music"></svg>
+      Add Selected Music to Queue (${selectedAudio.length})
+    </button>`;
+  } else if (folderAudio.length > 0) {
+    html += `<button class="ctx-item" onclick="closeContextMenu();playAllAudioInFolder('${type}')">
+      <svg data-lucide="list-music"></svg>
+      Play All Music in Folder (${folderAudio.length})
+    </button>`;
+  }
+
+  if (_selectedItems.size > 0) {
+    html += `<button class="ctx-item" onclick="closeContextMenu();clearSelection()">
+      <svg data-lucide="x"></svg>
+      Clear Selection (${_selectedItems.size})
+    </button>`;
+  }
+
+  if (_adminMode) {
+    if (html) html += `<div class="ctx-divider"></div>`;
+    html += `<button class="ctx-item" onclick="closeContextMenu();showUploadModal('${type}')">
+      <svg data-lucide="upload"></svg> Upload Files…
+    </button>`;
+    html += `<button class="ctx-item" onclick="closeContextMenu();showMkdirModal('${type}')">
+      <svg data-lucide="folder-plus"></svg> New Folder…
+    </button>`;
+  }
+
+  if (html) html += `<div class="ctx-divider"></div>`;
+  html += `<button class="ctx-item" onclick="closeContextMenu();reloadActiveDriveFiles()">
+    <svg data-lucide="refresh-cw"></svg> Refresh Folder
+  </button>`;
+
+  menu.innerHTML = html;
+  positionAndShowContextMenu(menu, e);
+}
+
 function openContextMenu(e, fJson, type) {
   e.preventDefault();
   e.stopPropagation();
   const f = parseFileArg(fJson);
   const key = itemKey(f, type);
   const isSel = _selectedItems.has(key);
-  const isMedia = f.type !== 'folder' && (isVideoFile(f) || isAudioFile(f));
+  const isAudio = f.type !== 'folder' && isAudioFile(f);
+  const isVid = f.type !== 'folder' && isVideoFile(f);
+  const isMedia = isAudio || isVid;
   const isImg = f.type !== 'folder' && isImageFile(f);
   const isTxt = f.type !== 'folder' && isTextFile(f);
   const menu = document.getElementById('context-menu');
+
+  const totalCount = _currentFiles.length;
+  const allSelected = _selectedItems.size === totalCount && totalCount > 0;
+  const folderAudio = getAudioFilesInList(_currentFiles);
+  const selectedAudio = getSelectedAudioFiles();
+  const allAudioSelected = folderAudio.length > 0 && folderAudio.every(item => _selectedItems.has(itemKey(item, type))) && _selectedItems.size === folderAudio.length;
 
   let html = '';
   if (f.type === 'folder') {
@@ -5198,9 +5804,21 @@ function openContextMenu(e, fJson, type) {
     html += `<button class="ctx-item" onclick="closeContextMenu();toggleFavoriteFolderItem('${fJson}','${type}',event)">
       <svg data-lucide="${isFav ? 'star-off' : 'star'}"></svg> ${isFav ? 'Remove from Favorites' : 'Add to Favorites'}
     </button>`;
-  } else if (isMedia) {
+  } else if (isAudio) {
     html += `<button class="ctx-item" onclick="closeContextMenu();openMedia('${fJson}','${type}')">
-      <svg data-lucide="play"></svg> ${isAudioFile(f) ? 'Stream Audio' : 'Stream Video'}
+      <svg data-lucide="play"></svg> ${selectedAudio.length > 1 && isSel ? `Play Selected Music (${selectedAudio.length})` : 'Play Audio &amp; Queue'}
+    </button>`;
+    html += `<button class="ctx-item" onclick="closeContextMenu();addTrackToMusicQueue('${fJson}','${type}')">
+      <svg data-lucide="list-music"></svg> Add to Music Queue
+    </button>`;
+    if (selectedAudio.length > 1 && !isSel) {
+      html += `<button class="ctx-item" onclick="closeContextMenu();playSelectedAudio('${type}')">
+        <svg data-lucide="list-music"></svg> Play Selected Music (${selectedAudio.length})
+      </button>`;
+    }
+  } else if (isVid) {
+    html += `<button class="ctx-item" onclick="closeContextMenu();openMedia('${fJson}','${type}')">
+      <svg data-lucide="play"></svg> Stream Video
     </button>`;
   } else if (isImg) {
     html += `<button class="ctx-item" onclick="closeContextMenu();openImageViewer('${fJson}','${type}')">
@@ -5209,6 +5827,12 @@ function openContextMenu(e, fJson, type) {
   } else {
     html += `<button class="ctx-item" onclick="closeContextMenu();openBrowserPreview('${fJson}','${type}', false)">
       <svg data-lucide="eye"></svg> Open in Browser
+    </button>`;
+  }
+
+  if (!isAudio && selectedAudio.length > 0) {
+    html += `<button class="ctx-item" onclick="closeContextMenu();playSelectedAudio('${type}')">
+      <svg data-lucide="list-music"></svg> Play Selected Music (${selectedAudio.length})
     </button>`;
   }
 
@@ -5237,10 +5861,25 @@ function openContextMenu(e, fJson, type) {
     </button>`;
   }
 
+  html += `<div class="ctx-divider"></div>`;
   html += `<button class="ctx-item" onclick="closeContextMenu();toggleSelectItem('${fJson}','${type}')">
     <svg data-lucide="${isSel ? 'check-square' : 'square'}"></svg>
     ${isSel ? 'Deselect' : 'Select'}
   </button>`;
+
+  if (totalCount > 0) {
+    html += `<button class="ctx-item" onclick="closeContextMenu();selectAllItems('${type}')">
+      <svg data-lucide="${allSelected ? 'check-square' : 'square'}"></svg>
+      ${allSelected ? 'Deselect All' : `Select All (${totalCount})`}
+    </button>`;
+  }
+
+  if (folderAudio.length > 0 && folderAudio.length !== totalCount) {
+    html += `<button class="ctx-item" onclick="closeContextMenu();selectAllAudioItems('${type}')">
+      <svg data-lucide="music"></svg>
+      ${allAudioSelected ? 'Deselect All Music' : `Select All Music (${folderAudio.length})`}
+    </button>`;
+  }
 
   if (_adminMode) {
     html += `<div class="ctx-divider"></div>`;
@@ -5250,14 +5889,7 @@ function openContextMenu(e, fJson, type) {
   }
 
   menu.innerHTML = html;
-  menu.style.display = 'flex';
-  lucide.createIcons();
-
-  const rect = menu.getBoundingClientRect();
-  const x = Math.min(e.clientX, window.innerWidth - rect.width - 12);
-  const y = Math.min(e.clientY, window.innerHeight - rect.height - 12);
-  menu.style.left = Math.max(8, x) + 'px';
-  menu.style.top = Math.max(8, y) + 'px';
+  positionAndShowContextMenu(menu, e);
 }
 
 // ── In-Place Rename Modal ─────────────────────────────────────────────────────
@@ -6016,7 +6648,20 @@ function fileToolbar(type) {
   const dirIcon = _sortDir === 'asc' ? 'arrow-up-narrow-wide' : 'arrow-down-wide-narrow';
   const dirTitle = _sortDir === 'asc' ? 'Sort ascending (click to sort descending)' : 'Sort descending (click to sort ascending)';
   const curFavorited = isCurrentFolderFavorited();
+  const totalCount = _currentFiles.length;
+  const allSelected = _selectedItems.size === totalCount && totalCount > 0;
+  const selectedAudio = getSelectedAudioFiles();
   return `
+    ${totalCount > 0 ? `
+    <button class="btn ${allSelected ? 'btn-primary' : 'btn-secondary'} btn-sm" onclick="selectAllItems('${type}')" title="${allSelected ? 'Deselect all items in this folder' : 'Select all items in this folder (Ctrl+A)'}">
+      <svg data-lucide="${allSelected ? 'check-square' : 'square'}" width="14" height="14"></svg> <span class="btn-label">${allSelected ? 'Deselect All' : 'Select All'}</span>
+    </button>
+    ` : ''}
+    ${selectedAudio.length > 0 ? `
+    <button class="btn btn-primary btn-sm" onclick="playSelectedAudio('${type}')" title="Play ${selectedAudio.length} selected music file(s) one after another">
+      <svg data-lucide="list-music" width="14" height="14"></svg> <span class="btn-label">Play Music (${selectedAudio.length})</span>
+    </button>
+    ` : ''}
     <button class="btn ${curFavorited ? 'btn-primary' : 'btn-secondary'} btn-sm" onclick="toggleFavoriteCurrentFolder()" title="${curFavorited ? 'Remove current folder from Favorites' : 'Add current folder to Favorites'}">
       <svg data-lucide="star" width="14" height="14"></svg> <span class="btn-label">${curFavorited ? 'Favorited' : 'Favorite'}</span>
     </button>
@@ -6068,7 +6713,8 @@ function showUploadModal(type) {
     <div class="modal-body">
       <div class="dropzone" id="dropzone" ondragover="dzOver(event)" ondragleave="dzLeave(event)" ondrop="dzDrop(event,'${type}')">
         <svg data-lucide="upload-cloud" width="32" height="32" style="margin:0 auto var(--space-3);color:var(--color-text-faint)"></svg>
-        <p style="margin-bottom:var(--space-3)">Drag &amp; drop files or entire folders here</p>
+        <p style="margin-bottom:var(--space-1)">Drag &amp; drop files or entire folders here</p>
+        <p style="margin-bottom:var(--space-3);font-size:var(--text-xs);color:var(--color-text-muted)">Files are uploaded sequentially (1 file at a time)</p>
         <div style="display:flex;justify-content:center;gap:var(--space-2);flex-wrap:wrap">
           <button class="btn btn-secondary btn-sm" onclick="document.getElementById('file-input').click()">
             <svg data-lucide="file-plus" width="14" height="14"></svg> Choose Files

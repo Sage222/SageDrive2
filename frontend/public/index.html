@@ -1967,15 +1967,21 @@ function updateBatchBar() {
   const allSelected = count === _currentFiles.length && _currentFiles.length > 0;
   const selectedAudio = getSelectedAudioFiles();
   const folderAudio = getAudioFilesInList(_currentFiles);
+  const isMixedFolder = folderAudio.length > 0 && folderAudio.length < _currentFiles.length;
+  const onlyAudioSelected = selectedAudio.length === folderAudio.length && count === folderAudio.length;
+  const hasActiveAudioPlayer = Boolean(_activeMediaState && !_activeMediaState.isVid);
+
   bar.innerHTML = `
     <div class="batch-bar">
       <div class="batch-bar-left">
-        <span class="batch-count">${count} selected${selectedAudio.length > 0 ? ` (${selectedAudio.length} audio)` : ''}</span>
-        <button class="btn btn-ghost btn-sm" onclick="selectAllItems('${type}')">
-          <svg data-lucide="${allSelected ? 'check-square' : 'square'}" width="14" height="14"></svg>
-          ${allSelected ? 'Deselect All' : `Select All (${_currentFiles.length})`}
-        </button>
-        ${folderAudio.length > 0 && folderAudio.length !== _currentFiles.length ? `
+        <span class="batch-count">${count} selected${selectedAudio.length > 0 && isMixedFolder ? ` (${selectedAudio.length} audio)` : ''}</span>
+        ${!allSelected ? `
+          <button class="btn btn-ghost btn-sm" onclick="selectAllItems('${type}')">
+            <svg data-lucide="check-square" width="14" height="14"></svg>
+            Select All (${_currentFiles.length})
+          </button>
+        ` : ''}
+        ${isMixedFolder && !onlyAudioSelected ? `
           <button class="btn btn-ghost btn-sm" onclick="selectAllAudioItems('${type}')" title="Select only audio/music files in this folder">
             <svg data-lucide="music" width="14" height="14"></svg>
             Select Music (${folderAudio.length})
@@ -1987,9 +1993,11 @@ function updateBatchBar() {
           <button class="btn btn-primary btn-sm" onclick="playSelectedAudio('${type}')" title="Play selected music files one after another in the Music Queue">
             <svg data-lucide="play" width="14" height="14"></svg> Play Music (${selectedAudio.length})
           </button>
-          <button class="btn btn-secondary btn-sm" onclick="addSelectedToMusicQueue('${type}')" title="Append selected music files to the playback queue">
-            <svg data-lucide="list-music" width="14" height="14"></svg> Queue Music
-          </button>
+          ${hasActiveAudioPlayer ? `
+            <button class="btn btn-secondary btn-sm" onclick="addSelectedToMusicQueue('${type}')" title="Append selected music files to the active playback queue">
+              <svg data-lucide="list-music" width="14" height="14"></svg> Add to Queue
+            </button>
+          ` : ''}
         ` : ''}
         <button class="btn ${selectedAudio.length > 0 ? 'btn-secondary' : 'btn-primary'} btn-sm" onclick="queueSelectedDownloads('${type}')">
           <svg data-lucide="download" width="14" height="14"></svg> Queue Downloads
@@ -2069,50 +2077,6 @@ function toggleFileSort(field = null) {
   }
 }
 
-function renderDirectorySelectBar(files, type) {
-  const totalCount = files.length;
-  const allSelected = _selectedItems.size === totalCount && totalCount > 0;
-  const folderCount = files.filter(f => f.type === 'folder').length;
-  const fileCount = totalCount - folderCount;
-  const audioFiles = getAudioFilesInList(files);
-  const selectedAudio = getSelectedAudioFiles();
-  const allAudioSelected = audioFiles.length > 0 && audioFiles.every(f => _selectedItems.has(itemKey(f, type)));
-
-  const summaryParts = [];
-  if (folderCount > 0) summaryParts.push(`${folderCount} folder${folderCount !== 1 ? 's' : ''}`);
-  if (fileCount > 0) summaryParts.push(`${fileCount} file${fileCount !== 1 ? 's' : ''}`);
-  if (audioFiles.length > 0) summaryParts.push(`${audioFiles.length} music track${audioFiles.length !== 1 ? 's' : ''}`);
-
-  return `
-    <div class="dir-select-bar" oncontextmenu="openDirectoryContextMenu(event,'${type}')">
-      <div class="dir-select-left">
-        <label class="dir-select-label" title="${allSelected ? 'Deselect all items in this folder' : 'Select all items in this folder (Ctrl+A)'}">
-          <input type="checkbox" id="dir-top-select-all-cb" class="list-select-cb" ${allSelected ? 'checked' : ''}
-                 onclick="selectAllItems('${type}')" />
-          <span id="dir-top-select-all-label">${allSelected ? 'Deselect All' : `Select All (${totalCount})`}</span>
-        </label>
-        ${audioFiles.length > 0 ? `
-          <button class="btn ${allAudioSelected && _selectedItems.size === audioFiles.length ? 'btn-primary' : 'btn-secondary'} btn-sm"
-                  onclick="selectAllAudioItems('${type}')"
-                  title="Select all music/audio files (.mp3, .wav, .opus, .flac, etc.) in this directory">
-            <svg data-lucide="check-square" width="13" height="13"></svg>
-            ${allAudioSelected && _selectedItems.size === audioFiles.length ? 'Deselect Music' : `Select Music (${audioFiles.length})`}
-          </button>
-          <button class="btn btn-primary btn-sm"
-                  onclick="${selectedAudio.length > 0 ? `playSelectedAudio('${type}')` : `playAllAudioInFolder('${type}')`}"
-                  title="${selectedAudio.length > 0 ? `Play ${selectedAudio.length} selected music track(s) in queue` : `Play all ${audioFiles.length} music track(s) in this folder one after another`}">
-            <svg data-lucide="list-music" width="14" height="14"></svg>
-            ${selectedAudio.length > 0 ? `Play Selected Music (${selectedAudio.length})` : `Play All Music (${audioFiles.length})`}
-          </button>
-        ` : ''}
-      </div>
-      <div class="dir-select-right">
-        <span>${summaryParts.join(' · ')}</span>
-      </div>
-    </div>
-  `;
-}
-
 function renderFileListHeader(type) {
   const allSelected = _selectedItems.size === _currentFiles.length && _currentFiles.length > 0;
   const sortArrow = (col) => _sortBy === col
@@ -2177,12 +2141,11 @@ function renderFileView(files, type, keepSelection = false) {
   }
 
   const ca = document.getElementById('content-area');
-  const topSelectBarHtml = renderDirectorySelectBar(files, type);
   const listHtml = _viewMode === 'grid'
     ? `<div class="file-grid" oncontextmenu="openDirectoryContextMenu(event,'${type}')">${files.map(f=>fileCardGrid(f,type)).join('')}</div>`
     : `<div class="card" oncontextmenu="openDirectoryContextMenu(event,'${type}')">${renderFileListHeader(type)}<div class="file-list">${files.map(f=>fileCardList(f,type)).join('')}</div></div>`;
 
-  ca.innerHTML = `<div id="batch-bar-container"></div>${topSelectBarHtml}${listHtml}`;
+  ca.innerHTML = `<div id="batch-bar-container"></div>${listHtml}`;
   updateBatchBar();
   lucide.createIcons();
 }
@@ -6650,16 +6613,10 @@ function fileToolbar(type) {
   const curFavorited = isCurrentFolderFavorited();
   const totalCount = _currentFiles.length;
   const allSelected = _selectedItems.size === totalCount && totalCount > 0;
-  const selectedAudio = getSelectedAudioFiles();
   return `
     ${totalCount > 0 ? `
     <button class="btn ${allSelected ? 'btn-primary' : 'btn-secondary'} btn-sm" onclick="selectAllItems('${type}')" title="${allSelected ? 'Deselect all items in this folder' : 'Select all items in this folder (Ctrl+A)'}">
       <svg data-lucide="${allSelected ? 'check-square' : 'square'}" width="14" height="14"></svg> <span class="btn-label">${allSelected ? 'Deselect All' : 'Select All'}</span>
-    </button>
-    ` : ''}
-    ${selectedAudio.length > 0 ? `
-    <button class="btn btn-primary btn-sm" onclick="playSelectedAudio('${type}')" title="Play ${selectedAudio.length} selected music file(s) one after another">
-      <svg data-lucide="list-music" width="14" height="14"></svg> <span class="btn-label">Play Music (${selectedAudio.length})</span>
     </button>
     ` : ''}
     <button class="btn ${curFavorited ? 'btn-primary' : 'btn-secondary'} btn-sm" onclick="toggleFavoriteCurrentFolder()" title="${curFavorited ? 'Remove current folder from Favorites' : 'Add current folder to Favorites'}">

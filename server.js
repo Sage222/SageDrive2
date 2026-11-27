@@ -4718,6 +4718,38 @@ function parseTorrentBuffer(rawBuf) {
       });
       offset += size;
     });
+  } else if (info['file tree'] && typeof info['file tree'] === 'object') {
+    const rootDir = sanitizeTorrentRelPath(name);
+    const v2Entries = [];
+    const walkV2 = (node, prefix) => {
+      for (const [k, v] of Object.entries(node)) {
+        if (!v || typeof v !== 'object' || Buffer.isBuffer(v)) continue;
+        if (k === '' && v.length !== undefined) {
+          v2Entries.push([prefix.slice(), Math.max(0, Number(v.length || 0) || 0)]);
+        } else {
+          walkV2(v, [...prefix, String(k)]);
+        }
+      }
+    };
+    walkV2(info['file tree'], []);
+    let offset = 0;
+    v2Entries.forEach(([parts, size], idx) => {
+      const relSub = parts.length ? sanitizeTorrentRelPath(parts.join('/')) : rootDir;
+      const relPath = v2Entries.length > 1 ? sanitizeTorrentRelPath(`${rootDir}/${relSub}`) : relSub;
+      files.push({
+        index: idx,
+        name: path.posix.basename(relPath),
+        relative_path: relPath,
+        size,
+        offset,
+        selected: true,
+        uploaded_bytes: 0,
+        status: 'queued',
+        error: '',
+        cloud_file_id: '',
+      });
+      offset += size;
+    });
   } else {
     const size = Math.max(0, Number(info.length || 0) || 0);
     const relPath = sanitizeTorrentRelPath(name);
@@ -4917,8 +4949,40 @@ function writePreviewTorrentFileToCloud(job, fileRec) {
   const dest = job.destination || {};
   const provider = dest.provider;
   const accountId = dest.account_id || 'default';
-  const baseFolderId = dest.folder_id || 'root';
+  const baseFolderId = dest.folder_id || (provider === 'smb' ? '/' : 'root');
   const conflictAction = dest.conflict_action || 'keep_both';
+  if (provider === 'smb') {
+    const baseDir = String(dest.folder_path || baseFolderId || '/').replace(/\/+$/, '') || '';
+    const rel = sanitizeTorrentRelPath(fileRec.relative_path || fileRec.name);
+    const fullPath = `${baseDir}/${rel}`.replace(/\/+/g, '/');
+    const entries = smbFSData[accountId] || (smbFSData[accountId] = []);
+    const parts = fullPath.split('/').filter(Boolean);
+    let built = '';
+    for (let i = 0; i < parts.length - 1; i++) {
+      built += '/' + parts[i];
+      if (!entries.some((e) => e.path === built)) {
+        entries.push({
+          name: parts[i],
+          type: 'folder',
+          size: 0,
+          modified: Math.floor(Date.now() / 1000),
+          path: built,
+        });
+      }
+    }
+    const finalName = parts[parts.length - 1] || fileRec.name || 'torrent_file.bin';
+    if (!entries.some((e) => e.path === fullPath)) {
+      entries.push({
+        name: finalName,
+        type: 'file',
+        size: Number(fileRec.size) || 0,
+        modified: Math.floor(Date.now() / 1000),
+        path: fullPath,
+      });
+    }
+    saveSmbFS();
+    return fullPath;
+  }
   const fsMap = provider === 'filejump' ? filejumpFSData : gdriveFSData;
   const saveFn = provider === 'filejump' ? saveFileJumpFS : saveGDriveFS;
   const folderMime = provider === 'filejump' ? 'application/vnd.filejump.folder' : 'application/vnd.google-apps.folder';
@@ -5062,10 +5126,12 @@ setInterval(() => {
   const nextFile = (active.files || []).find((f) => f.selected !== false && f.status !== 'completed' && f.status !== 'skipped');
   if (!nextFile) {
     active.status = 'completed';
+    active.active_file = '';
     active.completed_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     active.updated_at = active.completed_at;
     active.stats.download_rate = 0;
     active.stats.upload_rate = 0;
+    active.stats.peer_upload_rate = 0;
     active.stats.window_bytes = 0;
     active.stats.eta_seconds = 0;
     recomputeTorrentTotals(active);
@@ -5082,12 +5148,14 @@ setInterval(() => {
   }
 
   nextFile.status = 'streaming';
+  active.active_file = nextFile.name || '';
   const step = Math.max(4 * 1024 * 1024, Math.ceil((Number(nextFile.size) || 1024 * 1024) / 6));
   const remaining = Math.max(0, (Number(nextFile.size) || 0) - (Number(nextFile.uploaded_bytes) || 0));
   const delta = Math.min(remaining, step);
   nextFile.uploaded_bytes = (Number(nextFile.uploaded_bytes) || 0) + delta;
   active.stats.download_rate = Math.round(step * 1.08);
   active.stats.upload_rate = step;
+  active.stats.peer_upload_rate = Math.min(256 * 1024, Math.round(step * 0.04));
   active.stats.peers = 18;
   active.stats.seeds = 11;
   active.stats.window_cap_bytes = winCap;
@@ -5167,8 +5235,8 @@ app.post('/api/torrents', requireAdmin, torrentUpload.single('file'), (req, res)
     if (typeof selectedIndices === 'string') selectedIndices = JSON.parse(selectedIndices);
 
     const provider = String(destination.provider || '').trim().toLowerCase();
-    if (!['gdrive', 'filejump'].includes(provider)) {
-      return res.status(400).json({ error: "Destination provider must be 'gdrive' or 'filejump'" });
+    if (!['gdrive', 'filejump', 'smb'].includes(provider)) {
+      return res.status(400).json({ error: "Destination provider must be 'gdrive', 'filejump', or 'smb'" });
     }
     const parsed = req.file && req.file.buffer
       ? parseTorrentBuffer(req.file.buffer)
@@ -5187,7 +5255,8 @@ app.post('/api/torrents', requireAdmin, torrentUpload.single('file'), (req, res)
     const conflictAction = ['keep_both', 'skip', 'replace'].includes(String(destination.conflict_action || '').toLowerCase())
       ? String(destination.conflict_action).toLowerCase()
       : torrentSettings.default_conflict_action;
-    const accountName = String(destination.account_name || (provider === 'gdrive' ? 'Google Drive' : 'FileJump')).trim();
+    const defaultAccLabel = provider === 'gdrive' ? 'Google Drive' : (provider === 'filejump' ? 'FileJump' : 'Local SMB NAS');
+    const accountName = String(destination.account_name || defaultAccLabel).trim();
     const folderPath = String(destination.folder_path || '/').trim() || '/';
     const job = {
       id: `tor_${Math.floor(Date.now() / 1000)}_${crypto.randomBytes(4).toString('hex')}`,
@@ -5199,18 +5268,20 @@ app.post('/api/torrents', requireAdmin, torrentUpload.single('file'), (req, res)
         provider,
         account_id: String(destination.account_id || 'default').trim() || 'default',
         account_name: accountName,
-        folder_id: String(destination.folder_id || 'root').trim() || 'root',
+        folder_id: String(destination.folder_id || (provider === 'smb' ? '/' : 'root')).trim() || (provider === 'smb' ? '/' : 'root'),
         folder_path: folderPath,
         conflict_action: conflictAction,
       },
       status: 'queued',
       metadata_ready: Boolean(parsed.metadata_ready),
       error_message: '',
+      active_file: '',
       stats: {
         total_bytes: files.filter((f) => f.selected !== false).reduce((a, f) => a + (Number(f.size) || 0), 0),
         uploaded_bytes: 0,
         download_rate: 0,
         upload_rate: 0,
+        peer_upload_rate: 0,
         peers: 0,
         seeds: 0,
         window_bytes: 0,

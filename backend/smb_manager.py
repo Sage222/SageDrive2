@@ -449,6 +449,22 @@ def upload_chunk(share_id, dest_path, chunk_bytes, offset=0, truncate=False):
         c.close()
 
 
+def prepare_upload_target(share_id, dest_path, conflict_action="keep_both"):
+    """Ensure parent directories exist on SMB share and resolve filename conflicts. Returns (resolved_path, should_skip)."""
+    norm_path = sanitize_smb_path(dest_path, allow_root=False)
+    cfg = _cfg(share_id)
+    c = _conn(cfg)
+    try:
+        parent = "/".join(norm_path.split("/")[:-1])
+        if parent and parent != "/":
+            _ensure_dirs_on_conn(c, cfg["share"], parent)
+        return _resolve_conflict_path_on_conn(
+            c, cfg["share"], norm_path, conflict_action=conflict_action
+        )
+    finally:
+        c.close()
+
+
 def _delete_recursive_on_conn(c, share_name, path, is_dir=False):
     if not is_dir:
         c.deleteFiles(share_name, path)

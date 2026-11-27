@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import filejump_manager
 import gdrive_manager
+import smb_manager
 
 lt = None
 LIBTORRENT_AVAILABLE = False
@@ -217,6 +218,39 @@ def parse_torrent_bytes(raw_bytes: bytes):
                 "cloud_file_id": "",
             })
             offset += size
+    elif b"file tree" in info and isinstance(info[b"file tree"], dict):
+        # BitTorrent v2 (BEP 52) file tree support
+        root_dir = _sanitize_rel_path(name)
+        v2_entries = []
+
+        def _walk_v2(node, prefix):
+            for k, v in node.items():
+                if not isinstance(v, dict):
+                    continue
+                if k == b"" and b"length" in v:
+                    v2_entries.append((list(prefix), max(0, int(v.get(b"length") or 0))))
+                else:
+                    seg = k.decode("utf-8", errors="replace") if isinstance(k, bytes) else str(k)
+                    _walk_v2(v, prefix + [seg])
+
+        _walk_v2(info[b"file tree"], [])
+        offset = 0
+        for idx, (parts, size) in enumerate(v2_entries):
+            rel_sub = _sanitize_rel_path("/".join(parts)) if parts else root_dir
+            rel_path = _sanitize_rel_path(f"{root_dir}/{rel_sub}") if len(v2_entries) > 1 else rel_sub
+            files.append({
+                "index": idx,
+                "name": posixpath.basename(rel_path),
+                "relative_path": rel_path,
+                "size": size,
+                "offset": offset,
+                "selected": True,
+                "uploaded_bytes": 0,
+                "status": "queued",
+                "error": "",
+                "cloud_file_id": "",
+            })
+            offset += size
     else:
         size = max(0, int(info.get(b"length") or 0))
         rel_path = _sanitize_rel_path(name)
@@ -306,7 +340,7 @@ class _TorrentSequentialReader:
     """
     Non-seekable streaming reader for FileJump (_MultipartStreamReader / WebDAV PUT)
     that pulls verified sequential bytes directly from libtorrent's bounded sliding
-    window and immediately punches holes on already-read blocks so disk usage stays near zero.
+    window and releases completed prior pieces via Linux fallocate hole-punching.
     """
 
     def __init__(self, streamer, file_idx: int, file_size: int, file_offset: int, backing_path: Path):
@@ -319,6 +353,9 @@ class _TorrentSequentialReader:
         self._punched_up_to = 0
         self._fd = None
         self._closed = False
+
+    def __len__(self):
+        return self._file_size
 
     def _ensure_fd(self):
         if self._fd is None:
@@ -334,23 +371,23 @@ class _TorrentSequentialReader:
         if want <= 0:
             return b""
 
-        # Ensure the piece(s) covering [pos, pos + want) are verified in the sliding window
         abs_start = self._file_offset + self._pos
         ready_len = self._streamer.wait_for_range(abs_start, want, self._file_idx, self._pos)
         if ready_len <= 0:
             return b""
 
-        fd = self._ensure_fd()
-        chunk = os.pread(fd, ready_len, self._pos)
-        if not chunk:
-            raise RuntimeError("Unexpected EOF reading sparse torrent piece")
+        chunk, self._fd = self._streamer.read_flushed_bytes(
+            self._backing_path, self._pos, ready_len, fd=self._fd
+        )
         self._pos += len(chunk)
 
-        # Punch hole in aligned 4 KiB blocks as soon as bytes are handed off
-        punch_end = (self._pos // 4096) * 4096
-        if punch_end > self._punched_up_to:
-            _punch_hole_fd(fd, self._punched_up_to, punch_end - self._punched_up_to)
-            self._punched_up_to = punch_end
+        # Only punch holes strictly on completed prior pieces (aligned to 4 KiB)
+        # so we never zero bytes inside a piece libtorrent may still be verifying or seeding
+        pl = self._streamer.piece_length
+        safe_boundary = ((max(0, self._pos - pl)) // 4096) * 4096
+        if safe_boundary > self._punched_up_to and self._fd is not None:
+            _punch_hole_fd(self._fd, self._punched_up_to, safe_boundary - self._punched_up_to)
+            self._punched_up_to = safe_boundary
 
         self._streamer.on_bytes_streamed(self._file_idx, self._pos, len(chunk))
         return chunk
@@ -380,16 +417,21 @@ class _ActiveJobStreamer:
         self.tinfo = tinfo
         self.save_dir = save_dir
         self.piece_length = max(16384, int(tinfo.piece_length()))
-        self.num_pieces = int(tinfo.num_pieces())
+        self.num_pieces = max(1, int(tinfo.num_pieces()))
         self.window_bytes = max(8 * 1024 * 1024, int(window_bytes))
-        self.window_pieces = max(2, min(64, int(self.window_bytes // self.piece_length) + 1))
+        self.window_pieces = max(4, min(64, int(self.window_bytes // self.piece_length) + 2))
         self._active_window_start = -1
         self._active_window_end = -1
         self._last_stat_ts = 0.0
+        self._last_reannounce_ts = time.time()
         self._up_bytes_window = 0
         self._up_rate_ts = time.time()
         self._up_rate = 0
         self._stop_event = threading.Event()
+        try:
+            self.handle.set_sequential_download(True)
+        except Exception:
+            pass
 
     def request_stop(self):
         self._stop_event.set()
@@ -401,20 +443,57 @@ class _ActiveJobStreamer:
         if not job or job.get("status") in ("paused", "cancelled"):
             raise InterruptedError("Torrent transfer paused or cancelled")
 
-    def set_window(self, start_piece: int, file_last_piece: int):
+    def file_piece_bounds(self, file_idx: int):
+        finfo = self.tinfo.files()
+        f_off = int(finfo.file_offset(file_idx))
+        f_sz = int(finfo.file_size(file_idx))
+        if f_sz <= 0:
+            p = max(0, min(self.num_pieces - 1, f_off // self.piece_length))
+            return p, p
+        first_p = max(0, min(self.num_pieces - 1, f_off // self.piece_length))
+        last_p = max(first_p, min(self.num_pieces - 1, (f_off + f_sz - 1) // self.piece_length))
+        return first_p, last_p
+
+    def set_window(self, start_piece: int, file_last_piece: int, force: bool = False):
+        """
+        Keep a strictly bounded sliding window of active pieces while NEVER
+        passing an all-zero priority list (which would cause libtorrent to mark
+        the torrent finished and disconnect all seeders!).
+        """
         start_piece = max(0, min(start_piece, self.num_pieces - 1))
-        end_piece = min(file_last_piece, self.num_pieces - 1, start_piece + self.window_pieces - 1)
-        if start_piece == self._active_window_start and end_piece == self._active_window_end:
+        file_last_piece = max(start_piece, min(file_last_piece, self.num_pieces - 1))
+
+        # Expand end_piece up to window_pieces un-downloaded pieces (bounded to 2x window_pieces max)
+        end_piece = min(file_last_piece, start_piece + self.window_pieces - 1)
+        missing_in_win = 0
+        p_scan = start_piece
+        max_scan = min(file_last_piece, start_piece + self.window_pieces * 2 - 1)
+        while p_scan <= max_scan and missing_in_win < self.window_pieces:
+            if not self.handle.have_piece(p_scan):
+                missing_in_win += 1
+            end_piece = max(end_piece, p_scan)
+            p_scan += 1
+
+        if not force and start_piece == self._active_window_start and end_piece == self._active_window_end:
             return
+
         priorities = [0] * self.num_pieces
         for p in range(start_piece, end_piece + 1):
-            if not self.handle.have_piece(p):
-                dist = p - start_piece
-                priorities[p] = 7 if dist == 0 else (6 if dist <= 2 else 4)
+            dist = p - start_piece
+            priorities[p] = 7 if dist == 0 else (6 if dist <= 3 else 4)
+
+        # If every piece in this window is already downloaded, keep the next piece after end_piece
+        # at low priority (1) so libtorrent stays in downloading state and keeps seeders connected
+        if missing_in_win == 0 and end_piece + 1 < self.num_pieces:
+            priorities[end_piece + 1] = 1
+
         self.handle.prioritize_pieces(priorities)
         for p in range(start_piece, end_piece + 1):
             if not self.handle.have_piece(p):
-                self.handle.set_piece_deadline(p, (p - start_piece) * 250)
+                try:
+                    self.handle.set_piece_deadline(p, (p - start_piece) * 250)
+                except Exception:
+                    pass
         self._active_window_start = start_piece
         self._active_window_end = end_piece
 
@@ -434,10 +513,19 @@ class _ActiveJobStreamer:
         try:
             st = self.handle.status()
             dl_rate = int(getattr(st, "download_rate", 0) or 0)
+            peer_ul_rate = int(getattr(st, "upload_rate", 0) or 0)
             peers = int(getattr(st, "num_peers", 0) or 0)
             seeds = int(getattr(st, "num_seeds", 0) or 0)
+            # If stuck with 0 peers for 20s, trigger tracker/DHT reannounce
+            if peers == 0 and (now - self._last_reannounce_ts) > 20.0:
+                self._last_reannounce_ts = now
+                try:
+                    self.handle.force_reannounce()
+                    self.handle.force_dht_announce()
+                except Exception:
+                    pass
         except Exception:
-            dl_rate, peers, seeds = 0, 0, 0
+            dl_rate, peer_ul_rate, peers, seeds = 0, 0, 0, 0
 
         dt = max(0.25, now - self._up_rate_ts)
         if dt >= 1.0:
@@ -449,12 +537,55 @@ class _ActiveJobStreamer:
         self.manager._update_live_stats(
             self.job_id,
             download_rate=dl_rate,
+            peer_upload_rate=peer_ul_rate,
             upload_rate=self._up_rate,
             peers=peers,
             seeds=seeds,
             window_bytes=win_used,
             window_cap_bytes=self.window_bytes,
         )
+
+    def read_flushed_bytes(self, backing_path: Path, file_pos: int, length: int, fd=None):
+        """
+        Safely open and pread verified piece bytes from libtorrent's sparse file.
+        Handles async disk-cache flush latency in libtorrent 1.2 & 2.0 cleanly.
+        """
+        deadline = time.time() + 20.0
+        flushed_once = False
+        while True:
+            self._check_abort()
+            try:
+                if fd is None:
+                    if not backing_path.exists():
+                        if not flushed_once:
+                            flushed_once = True
+                            try:
+                                self.handle.flush_cache()
+                            except Exception:
+                                pass
+                        if time.time() > deadline:
+                            raise FileNotFoundError(f"Torrent backing file not flushed to scratch: {backing_path.name}")
+                        time.sleep(0.08)
+                        continue
+                    fd = os.open(str(backing_path), os.O_RDWR)
+                chunk = os.pread(fd, length, file_pos)
+                if chunk and len(chunk) == length:
+                    return chunk, fd
+                if chunk and len(chunk) > 0:
+                    return chunk, fd
+                if not flushed_once:
+                    flushed_once = True
+                    try:
+                        self.handle.flush_cache()
+                    except Exception:
+                        pass
+                if time.time() > deadline:
+                    raise RuntimeError(f"Timed out waiting for sparse torrent bytes at offset {file_pos} ({backing_path.name})")
+                time.sleep(0.08)
+            except FileNotFoundError:
+                if time.time() > deadline:
+                    raise
+                time.sleep(0.08)
 
     def wait_for_range(self, abs_start: int, want: int, file_idx: int, file_pos: int) -> int:
         piece_idx = abs_start // self.piece_length
@@ -474,7 +605,7 @@ class _ActiveJobStreamer:
         return readable_in_piece
 
     def wait_initial_buffer(self, file_idx: int, target_bytes: int = 2 * 1024 * 1024):
-        """Wait until the first piece(s) of a file are ready before opening a FileJump HTTP upload."""
+        """Wait until the first piece(s) of a file are verified before opening an HTTP upload stream."""
         finfo = self.tinfo.files()
         f_off = finfo.file_offset(file_idx)
         f_sz = finfo.file_size(file_idx)
@@ -483,12 +614,13 @@ class _ActiveJobStreamer:
         first_p = f_off // self.piece_length
         last_p = (f_off + f_sz - 1) // self.piece_length
         need_end_p = min(last_p, (f_off + min(f_sz, target_bytes) - 1) // self.piece_length)
-        self.set_window(first_p, last_p)
+        self.set_window(first_p, last_p, force=True)
         for p in range(first_p, need_end_p + 1):
             while not self.handle.have_piece(p):
                 self._check_abort()
                 self.refresh_stats(first_p, last_p)
                 time.sleep(0.15)
+        self.refresh_stats(first_p, last_p, force=True)
 
     def on_bytes_streamed(self, file_idx: int, uploaded_bytes: int, delta: int):
         self._up_bytes_window += max(0, int(delta))
@@ -1042,12 +1174,16 @@ class TorrentManager:
         created_by: str = "admin",
     ):
         provider = str((destination or {}).get("provider") or "").strip().lower()
-        if provider not in ("gdrive", "filejump"):
-            raise ValueError("Destination provider must be 'gdrive' or 'filejump'")
+        if provider not in ("gdrive", "filejump", "smb"):
+            raise ValueError("Destination provider must be 'gdrive', 'filejump', or 'smb'")
         account_id = str((destination or {}).get("account_id") or "default").strip() or "default"
-        folder_id = str((destination or {}).get("folder_id") or "root").strip() or "root"
+        folder_id = str((destination or {}).get("folder_id") or ("/" if provider == "smb" else "root")).strip() or ("/" if provider == "smb" else "root")
         folder_path = str((destination or {}).get("folder_path") or "/").strip() or "/"
-        account_name = str((destination or {}).get("account_name") or ("Google Drive" if provider == "gdrive" else "FileJump")).strip()
+        default_acc_name = (
+            "Google Drive" if provider == "gdrive"
+            else ("FileJump" if provider == "filejump" else "Local SMB NAS")
+        )
+        account_name = str((destination or {}).get("account_name") or default_acc_name).strip()
         conflict_action = str((destination or {}).get("conflict_action") or self._settings["default_conflict_action"]).strip().lower()
         if conflict_action not in ("keep_both", "skip", "replace"):
             conflict_action = "keep_both"
@@ -1056,6 +1192,10 @@ class TorrentManager:
             raise ValueError("Selected Google Drive account is not connected")
         if provider == "filejump" and not filejump_manager.is_authenticated(account_id=account_id):
             raise ValueError("Selected FileJump account is not connected")
+        if provider == "smb":
+            shares = smb_manager.list_shares()
+            if not any(s.get("id") == account_id for s in shares):
+                raise ValueError("Selected Local SMB share was not found")
 
         parsed = self.inspect_source(magnet_uri=magnet_uri, torrent_bytes=torrent_bytes)
         job_id = f"tor_{int(time.time())}_{secrets.token_hex(4)}"
@@ -1094,11 +1234,13 @@ class TorrentManager:
             "status": "queued",
             "metadata_ready": bool(parsed.get("metadata_ready")),
             "error_message": "",
+            "active_file": "",
             "stats": {
                 "total_bytes": sum(f["size"] for f in files if f.get("selected", True)),
                 "uploaded_bytes": 0,
                 "download_rate": 0,
                 "upload_rate": 0,
+                "peer_upload_rate": 0,
                 "peers": 0,
                 "seeds": 0,
                 "window_bytes": 0,
@@ -1177,7 +1319,7 @@ class TorrentManager:
                 if f.get("selected", True) and f.get("status") != "completed":
                     f["status"] = "queued"
                     f["error"] = ""
-                    if job["destination"]["provider"] == "filejump":
+                    if job["destination"]["provider"] in ("filejump", "smb"):
                         f["uploaded_bytes"] = 0
             self._recompute_job_totals(job)
             job["updated_at"] = _now_iso()
@@ -1297,12 +1439,10 @@ class TorrentManager:
                 time.sleep(0.4)
 
             tinfo = handle.torrent_file()
-            num_pieces = int(tinfo.num_pieces())
-            # Zero-disk discipline: disable ALL pieces immediately, only enable sliding window per active file!
-            handle.prioritize_pieces([0] * num_pieces)
 
             # Populate files list from resolved magnet metadata if not yet populated
             fstorage = tinfo.files()
+            first_selected_idx = None
             with self._lock:
                 job = self._get_job_ref(job_id)
                 if not job:
@@ -1329,6 +1469,10 @@ class TorrentManager:
                     job["files"] = resolved_files
                     job["name"] = tinfo.name() or job["name"]
                     job["metadata_ready"] = True
+                for f in job["files"]:
+                    if f.get("selected", True) and f.get("status") not in ("completed", "skipped"):
+                        first_selected_idx = int(f["index"])
+                        break
                 job["status"] = "streaming"
                 self._recompute_job_totals(job)
                 self._save_jobs_unlocked()
@@ -1338,6 +1482,11 @@ class TorrentManager:
             with self._lock:
                 self._active_job_id = job_id
                 self._active_streamer = streamer
+
+            # Immediately activate the first file's sliding window so seeders stay connected!
+            if first_selected_idx is not None:
+                fp_start, fp_end = streamer.file_piece_bounds(first_selected_idx)
+                streamer.set_window(fp_start, fp_end, force=True)
 
             # Stream selected files strictly 1 file at a time
             while True:
@@ -1351,6 +1500,7 @@ class TorrentManager:
                             next_file = dict(f)
                             f["status"] = "streaming"
                             f["error"] = ""
+                            job["active_file"] = f.get("name") or ""
                             break
                     self._save_jobs_unlocked()
                 if not next_file:
@@ -1363,10 +1513,12 @@ class TorrentManager:
                 job = self._get_job_ref(job_id)
                 if job and job["status"] not in ("paused", "cancelled"):
                     job["status"] = "completed"
+                    job["active_file"] = ""
                     job["completed_at"] = _now_iso()
                     job["updated_at"] = job["completed_at"]
                     job["stats"]["download_rate"] = 0
                     job["stats"]["upload_rate"] = 0
+                    job["stats"]["peer_upload_rate"] = 0
                     job["stats"]["window_bytes"] = 0
                     job["stats"]["eta_seconds"] = 0
                     self._recompute_job_totals(job)
@@ -1448,7 +1600,12 @@ class TorrentManager:
         rel_path = file_rec["relative_path"]
         filename = file_rec["name"]
         mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        backing_path = save_dir / fstorage.file_path(fidx)
+        raw_fp = str(fstorage.file_path(fidx)).replace("\\", "/").lstrip("/")
+        backing_path = save_dir / raw_fp
+
+        # Immediately keep this file's sliding window prioritized before any destination API calls
+        fp_start, fp_end = streamer.file_piece_bounds(fidx)
+        streamer.set_window(fp_start, fp_end, force=True)
 
         cloud_file_id = ""
         if provider == "gdrive":
@@ -1461,10 +1618,16 @@ class TorrentManager:
                 job_id, streamer, fidx, file_size, file_offset, backing_path,
                 folder_id, filename, rel_path, mime_type, account_id, conflict_action,
             )
+        elif provider == "smb":
+            folder_path = dest.get("folder_path") or folder_id or "/"
+            cloud_file_id = self._stream_file_to_smb(
+                job_id, streamer, fidx, file_size, file_offset, backing_path,
+                folder_path, rel_path, account_id, conflict_action,
+            )
         else:
             raise ValueError(f"Unsupported provider: {provider}")
 
-        # Immediately release all pieces for this completed file and unlink sparse backing file
+        # Immediately unlink sparse backing file so container scratch stays near zero
         try:
             backing_path.unlink(missing_ok=True)
         except Exception:
@@ -1545,11 +1708,7 @@ class TorrentManager:
                 while len(buf) < target_chunk:
                     want = target_chunk - len(buf)
                     ready_len = streamer.wait_for_range(file_offset + cur_read_pos, want, fidx, cur_read_pos)
-                    if fd is None:
-                        fd = os.open(str(backing_path), os.O_RDWR)
-                    data = os.pread(fd, ready_len, cur_read_pos)
-                    if not data:
-                        raise RuntimeError("Unexpected EOF reading sparse torrent piece")
+                    data, fd = streamer.read_flushed_bytes(backing_path, cur_read_pos, ready_len, fd=fd)
                     buf.extend(data)
                     cur_read_pos += len(data)
 
@@ -1558,12 +1717,12 @@ class TorrentManager:
                 )
                 streamer.on_bytes_streamed(fidx, offset, len(buf))
 
-                # Immediately punch hole on confirmed uploaded range to free physical blocks!
+                # Safely punch holes strictly on completed prior pieces
                 if fd is not None:
-                    punch_end = (offset // 4096) * 4096
-                    if punch_end > punched_up_to:
-                        _punch_hole_fd(fd, punched_up_to, punch_end - punched_up_to)
-                        punched_up_to = punch_end
+                    safe_end = ((max(0, offset - streamer.piece_length)) // 4096) * 4096
+                    if safe_end > punched_up_to:
+                        _punch_hole_fd(fd, punched_up_to, safe_end - punched_up_to)
+                        punched_up_to = safe_end
         finally:
             if fd is not None:
                 try:
@@ -1585,8 +1744,12 @@ class TorrentManager:
                 total_size=0, conflict_action=conflict_action,
             )
 
-        # Pre-buffer first 2 MiB of verified pieces before opening the FileJump HTTP upload stream
-        streamer.wait_initial_buffer(fidx, target_bytes=min(file_size, 2 * 1024 * 1024))
+        # Pre-buffer up to half the sliding window (or full file if smaller than window)
+        # so FileJump's HTTP upload connection never times out waiting on slow initial peers
+        prebuf = min(file_size, max(4 * 1024 * 1024, streamer.window_bytes // 2))
+        if file_size <= streamer.window_bytes:
+            prebuf = file_size
+        streamer.wait_initial_buffer(fidx, target_bytes=prebuf)
         reader = _TorrentSequentialReader(streamer, fidx, file_size, file_offset, backing_path)
         try:
             return filejump_manager.upload_file(
@@ -1601,6 +1764,61 @@ class TorrentManager:
             )
         finally:
             reader.close()
+
+    def _stream_file_to_smb(
+        self, job_id, streamer, fidx, file_size, file_offset, backing_path,
+        base_folder_path, rel_path, share_id, conflict_action,
+    ):
+        base_norm = smb_manager.sanitize_smb_path(base_folder_path or "/", allow_root=True)
+        rel_clean = _sanitize_rel_path(rel_path)
+        raw_dest = (f"/{rel_clean}" if base_norm == "/" else f"{base_norm.rstrip('/')}/{rel_clean}")
+        resolved_path, should_skip = smb_manager.prepare_upload_target(
+            share_id, raw_dest, conflict_action=conflict_action
+        )
+        if should_skip:
+            return resolved_path
+
+        if file_size == 0:
+            smb_manager.upload_chunk(share_id, resolved_path, b"", offset=0, truncate=True)
+            return resolved_path
+
+        chunk_unit = 4 * 1024 * 1024  # 4 MiB sequential SMB writes
+        offset = 0
+        fd = None
+        punched_up_to = 0
+        try:
+            while offset < file_size:
+                streamer._check_abort()
+                buf = bytearray()
+                target_chunk = min(chunk_unit, file_size - offset)
+                cur_read_pos = offset
+                while len(buf) < target_chunk:
+                    want = target_chunk - len(buf)
+                    ready_len = streamer.wait_for_range(file_offset + cur_read_pos, want, fidx, cur_read_pos)
+                    data, fd = streamer.read_flushed_bytes(backing_path, cur_read_pos, ready_len, fd=fd)
+                    buf.extend(data)
+                    cur_read_pos += len(data)
+
+                smb_manager.upload_chunk(
+                    share_id, resolved_path, bytes(buf), offset=offset, truncate=(offset == 0)
+                )
+                offset += len(buf)
+                streamer.on_bytes_streamed(fidx, offset, len(buf))
+
+                if fd is not None:
+                    safe_end = ((max(0, offset - streamer.piece_length)) // 4096) * 4096
+                    if safe_end > punched_up_to:
+                        _punch_hole_fd(fd, punched_up_to, safe_end - punched_up_to)
+                        punched_up_to = safe_end
+        finally:
+            if fd is not None:
+                try:
+                    if file_size > punched_up_to:
+                        _punch_hole_fd(fd, punched_up_to, file_size - punched_up_to)
+                    os.close(fd)
+                except Exception:
+                    pass
+        return resolved_path
 
 
 _manager_instance = None

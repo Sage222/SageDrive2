@@ -725,7 +725,7 @@
     .torrent-list-panel{background:var(--color-surface);border:1px solid var(--color-border);border-radius:var(--radius-lg);overflow:hidden}
     .torrent-row{border-bottom:1px solid var(--color-divider);transition:background var(--transition-interactive)}
     .torrent-row:last-child{border-bottom:none}
-    .torrent-row-main{display:grid;grid-template-columns:minmax(220px,2.2fr) minmax(180px,1.5fr) minmax(150px,1.1fr) auto;align-items:center;gap:var(--space-4);padding:var(--space-3) var(--space-4)}
+    .torrent-row-main{display:grid;grid-template-columns:minmax(220px,2.1fr) minmax(185px,1.5fr) minmax(195px,1.35fr) auto;align-items:center;gap:var(--space-4);padding:var(--space-3) var(--space-4)}
     .torrent-row-main:hover{background:var(--color-surface-2)}
     .torrent-title{font-size:var(--text-sm);font-weight:600;color:var(--color-text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .torrent-meta-inline{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12px;color:var(--color-text-muted);margin-top:3px}
@@ -819,11 +819,6 @@
       </div>
       <div id="sidebar-favorites"></div>
       <div class="sidebar-section" style="margin-top:var(--space-4)">App</div>
-      <div class="sidebar-item" data-view="torrents" onclick="setView('torrents')">
-        <svg data-lucide="magnet"></svg>
-        <span class="sidebar-item-label">Torrents</span>
-        <span id="sidebar-torrents-count" style="font-size:11px;font-family:var(--font-mono);font-variant-numeric:tabular-nums;color:var(--color-primary);display:none"></span>
-      </div>
       <div class="sidebar-item" data-view="settings" onclick="setView('settings')">
         <svg data-lucide="settings"></svg>
         <span class="sidebar-item-label">Settings</span>
@@ -1281,6 +1276,8 @@ function refreshCurrentViewAfterAdminToggle() {
   renderSidebar();
   if (_view === 'settings') {
     renderSettings();
+  } else if (_view === 'torrents') {
+    renderTorrentsView(true);
   } else if (_view === 'files' && _activeDrive) {
     setTopbarActions(fileToolbar(_activeDrive.type));
     renderFileView(_currentFiles, _activeDrive.type, true);
@@ -1706,6 +1703,16 @@ function renderSidebar() {
       No drives — add one in Settings
     </div>`;
   }
+
+  const activeTorCount = _torrentJobs.filter(j => ['streaming', 'fetching_metadata', 'queued'].includes(j.status)).length;
+  html += `<div class="sidebar-item ${_view === 'torrents' ? 'active' : ''}"
+                data-view="torrents"
+                onclick="setView('torrents')"
+                title="View active torrent downloads, speeds, peers, and ETA">
+    <svg data-lucide="magnet"></svg>
+    <span class="sidebar-item-label">Torrents</span>
+    <span id="sidebar-torrents-count" style="margin-left:auto;font-size:11px;font-family:var(--font-mono);font-variant-numeric:tabular-nums;color:var(--color-primary);display:${activeTorCount > 0 ? 'inline' : 'none'}">${activeTorCount > 0 ? activeTorCount : ''}</span>
+  </div>`;
 
   el.innerHTML = html;
 
@@ -7082,6 +7089,7 @@ async function renderSettings() {
   await refreshActivityLogs();
   await refreshTorrents(true);
   try { smbProxyCreds = await apiJSON('/api/smb/proxy-credentials'); } catch(_) {}
+  if (_view !== 'settings') return;
 
   const validTabs = ['gdrive', 'onedrive', 'filejump', 'smb', 'oauth', 'od_oauth', 'proxy', 'torrents', 'themes', 'system', 'logs'];
   if (!validTabs.includes(_settingsTab)) {
@@ -7976,9 +7984,6 @@ async function renderSettings() {
       <div style="display:flex;align-items:center;gap:var(--space-3);flex-wrap:wrap">
         <button class="btn btn-primary btn-sm" onclick="saveTorrentSettings()" ${_adminMode ? '' : 'disabled'}>
           <svg data-lucide="save" width="14" height="14"></svg> Save All Torrent Settings
-        </button>
-        <button class="btn btn-secondary btn-sm" onclick="setView('torrents')">
-          <svg data-lucide="magnet" width="14" height="14"></svg> Open Torrents Workspace
         </button>
         ${!_adminMode ? `<span style="font-size:var(--text-xs);color:var(--color-text-muted)">Unlock Administrator Functions above to modify engine settings.</span>` : ''}
       </div>
@@ -8958,9 +8963,18 @@ function toggleTorrentExpand(jobId) {
   renderTorrentsView(true);
 }
 
-function getTorrentStatusInfo(status) {
+function getTorrentProviderLabel(provider) {
+  if (provider === 'filejump') return 'FileJump';
+  if (provider === 'smb') return 'Local SMB NAS';
+  return 'Google Drive';
+}
+
+function getTorrentStatusInfo(status, provider = '') {
   switch (status) {
-    case 'streaming': return { label: 'Streaming to Cloud', cls: 'torrent-status-streaming', icon: 'radio' };
+    case 'streaming': {
+      const target = provider ? getTorrentProviderLabel(provider) : 'Storage';
+      return { label: `Streaming to ${target}`, cls: 'torrent-status-streaming', icon: 'radio' };
+    }
     case 'fetching_metadata': return { label: 'Fetching Metadata', cls: 'torrent-status-streaming', icon: 'loader' };
     case 'queued': return { label: 'Queued', cls: 'torrent-status-queued', icon: 'clock' };
     case 'paused': return { label: 'Paused', cls: 'torrent-status-paused', icon: 'pause-circle' };
@@ -9000,6 +9014,15 @@ async function openTorrentDestination(jobId) {
     document.querySelectorAll('.sidebar-item[data-view]').forEach(el => el.classList.remove('active'));
     renderSidebar();
     await loadFileJumpFiles();
+  } else if (dest.provider === 'smb') {
+    const share = _shares.find(s => s.id === dest.account_id) || _shares[0];
+    if (!share) { toast('SMB NAS share is not configured', 'error'); return; }
+    _view = 'files';
+    _activeDrive = { type: 'smb', id: share.id, name: share.name };
+    _path = dest.folder_path || '/';
+    document.querySelectorAll('.sidebar-item[data-view]').forEach(el => el.classList.remove('active'));
+    renderSidebar();
+    await loadSMBFiles();
   }
 }
 
@@ -9213,7 +9236,12 @@ function renderTorrentsView(isSilentRefresh = false) {
     return true;
   });
 
-  const activeWindowBytes = _torrentJobs.reduce((acc, j) => acc + (['streaming', 'fetching_metadata'].includes(j.status) ? Number(j.stats?.window_bytes || 0) : 0), 0);
+  const activeJobs = _torrentJobs.filter(j => ['streaming', 'fetching_metadata'].includes(j.status));
+  const activeWindowBytes = activeJobs.reduce((acc, j) => acc + Number(j.stats?.window_bytes || 0), 0);
+  const totalDownRate = activeJobs.reduce((acc, j) => acc + Number(j.stats?.download_rate || 0), 0);
+  const totalPeerUpRate = activeJobs.reduce((acc, j) => acc + Number(j.stats?.peer_upload_rate || 0), 0);
+  const totalTargetRate = activeJobs.reduce((acc, j) => acc + Number(j.stats?.upload_rate || 0), 0);
+  const totalPeers = activeJobs.reduce((acc, j) => acc + Number(j.stats?.peers || 0), 0);
   const windowCapMb = Number(_torrentSettings.window_mb || 24);
   const engineWarn = _torrentSettings && _torrentSettings.engine_available === false
     ? `<div style="padding:var(--space-3) var(--space-4);border:1px solid var(--color-warning);border-radius:var(--radius-md);background:color-mix(in oklab,var(--color-warning) 10%,transparent);font-size:var(--text-xs);color:var(--color-text);display:flex;align-items:center;justify-content:space-between;gap:var(--space-3);flex-wrap:wrap">
@@ -9231,7 +9259,9 @@ function renderTorrentsView(isSilentRefresh = false) {
   const rowsHtml = filtered.length
     ? `<div class="torrent-list-panel">
         ${filtered.map(job => {
-          const st = getTorrentStatusInfo(job.status);
+          const dest = job.destination || {};
+          const providerLabel = getTorrentProviderLabel(dest.provider);
+          const st = getTorrentStatusInfo(job.status, dest.provider);
           const stats = job.stats || {};
           const total = Number(stats.total_bytes || 0);
           const uploaded = Number(stats.uploaded_bytes || 0);
@@ -9239,13 +9269,23 @@ function renderTorrentsView(isSilentRefresh = false) {
           const winBytes = Number(stats.window_bytes || 0);
           const winCap = Number(stats.window_cap_bytes || (windowCapMb * 1024 * 1024));
           const bufPct = total > 0 ? Math.min(100, pct + Math.round((winBytes / total) * 1000) / 10) : 0;
-          const dest = job.destination || {};
-          const providerLabel = dest.provider === 'filejump' ? 'FileJump' : 'Google Drive';
           const selectedCount = (job.files || []).filter(f => f.selected !== false).length;
+          const activeFileObj = (job.files || []).find(f => f.status === 'streaming');
+          const activeFileName = job.active_file || (activeFileObj ? (activeFileObj.relative_path || activeFileObj.name) : '');
           const isExpanded = _torrentExpandedIds.has(job.id);
           const canPause = ['streaming', 'fetching_metadata', 'queued'].includes(job.status);
           const canResume = job.status === 'paused';
           const canRetry = job.status === 'error';
+          const downRate = Number(stats.download_rate || 0);
+          const peerUpRate = Number(stats.peer_upload_rate || 0);
+          const targetUpRate = Number(stats.upload_rate || 0);
+          const peersCount = Number(stats.peers || 0);
+          const seedsCount = Number(stats.seeds || 0);
+          const etaLabel = job.status === 'completed'
+            ? 'Done'
+            : (['streaming', 'fetching_metadata', 'queued'].includes(job.status)
+                ? `ETA ${formatTorrentEta(stats.eta_seconds)}`
+                : 'ETA —');
 
           const filesDrawer = isExpanded ? `
             <div class="torrent-files-drawer">
@@ -9259,7 +9299,7 @@ function renderTorrentsView(isSilentRefresh = false) {
                 const fSize = Number(f.size || 0);
                 const fUp = Number(f.uploaded_bytes || 0);
                 const fPct = f.status === 'completed' ? 100 : (fSize > 0 ? Math.min(100, Math.round((fUp / fSize) * 100)) : 0);
-                const fSt = getTorrentStatusInfo(f.status);
+                const fSt = getTorrentStatusInfo(f.status, dest.provider);
                 return `
                   <div class="torrent-file-row">
                     <div style="min-width:0">
@@ -9289,6 +9329,8 @@ function renderTorrentsView(isSilentRefresh = false) {
                 <div style="min-width:0;cursor:pointer" onclick="toggleTorrentExpand('${escAttr(job.id)}')">
                   <div class="torrent-title" title="${escHtml(job.name)}">${escHtml(job.name)}</div>
                   <div class="torrent-meta-inline">
+                    <span>${escHtml(providerLabel)}</span>
+                    <span aria-hidden="true">·</span>
                     <span>${escHtml(dest.account_name || providerLabel)}</span>
                     <span aria-hidden="true">·</span>
                     <span>${escHtml(dest.folder_path || '/')}</span>
@@ -9296,17 +9338,20 @@ function renderTorrentsView(isSilentRefresh = false) {
                     <span class="torrent-meta-mono">${selectedCount ? `${selectedCount} file${selectedCount === 1 ? '' : 's'}` : 'Resolving files'}</span>
                     ${total > 0 ? `<span aria-hidden="true">·</span><span class="torrent-meta-mono">${formatSize(total)}</span>` : ''}
                   </div>
+                  ${activeFileName && job.status === 'streaming'
+                    ? `<div style="font-size:11px;color:var(--color-text-muted);margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="Currently streaming: ${escHtml(activeFileName)}">Active: <span style="color:var(--color-text)">${escHtml(activeFileName)}</span></div>`
+                    : ''}
                   ${job.error_message ? `<div style="font-size:11px;color:var(--color-error);margin-top:4px">${escHtml(job.error_message)}</div>` : ''}
                 </div>
 
                 <div style="display:flex;flex-direction:column;gap:5px;min-width:0">
-                  <div class="torrent-prog-track" title="Solid: confirmed in cloud · Subtle: sliding-window buffer">
+                  <div class="torrent-prog-track" title="Solid: confirmed written to destination · Subtle: transient sliding-window buffer">
                     <div class="torrent-prog-window" style="width:${bufPct}%"></div>
                     <div class="torrent-prog-cloud ${job.status === 'completed' ? 'done' : (job.status === 'error' ? 'err' : '')}" style="width:${pct}%"></div>
                   </div>
                   <div class="torrent-meta-inline torrent-meta-mono" style="margin-top:0;justify-content:space-between">
                     <span>${pct.toFixed(1)}% · ${formatSize(uploaded)} / ${total > 0 ? formatSize(total) : '—'}</span>
-                    <span>${job.status === 'streaming' ? `ETA ${formatTorrentEta(stats.eta_seconds)}` : ''}</span>
+                    <span>${etaLabel}</span>
                   </div>
                 </div>
 
@@ -9316,13 +9361,14 @@ function renderTorrentsView(isSilentRefresh = false) {
                     <span>${escHtml(st.label)}</span>
                   </div>
                   <div class="torrent-meta-inline torrent-meta-mono" style="margin-top:0;font-size:11px">
-                    ${['streaming', 'fetching_metadata'].includes(job.status)
-                      ? `<span>↓ ${formatTorrentRate(stats.download_rate)} · ↑ ${formatTorrentRate(stats.upload_rate)}</span>`
-                      : `<span>Peers ${Number(stats.peers || 0)} · Buffer ${formatSize(winBytes)}</span>`}
+                    <span title="Swarm download speed">↓ ${formatTorrentRate(downRate)}</span>
+                    <span aria-hidden="true">·</span>
+                    <span title="Peer upload speed">↑ ${formatTorrentRate(peerUpRate)}</span>
+                    ${targetUpRate > 0 ? `<span aria-hidden="true">·</span><span title="Write speed to ${escHtml(providerLabel)}">→ ${formatTorrentRate(targetUpRate)}</span>` : ''}
                   </div>
-                  ${['streaming', 'fetching_metadata'].includes(job.status)
-                    ? `<div class="torrent-meta-mono" style="font-size:11px;color:var(--color-text-faint)">Peers ${Number(stats.peers || 0)} (${Number(stats.seeds || 0)} seeds) · Window ${formatSize(winBytes)} / ${formatSize(winCap)}</div>`
-                    : ''}
+                  <div class="torrent-meta-mono" style="font-size:11px;color:var(--color-text-faint)">
+                    Peers ${peersCount} (${seedsCount} seeds) · Buf ${formatSize(winBytes)} / ${formatSize(winCap)}
+                  </div>
                 </div>
 
                 <div class="torrent-actions">
@@ -9347,11 +9393,11 @@ function renderTorrentsView(isSilentRefresh = false) {
       </div>`
     : `<div class="empty-state" style="border:1px dashed var(--color-border);border-radius:var(--radius-lg);padding:var(--space-10) var(--space-4)">
          <svg data-lucide="magnet" width="44" height="44" style="color:var(--color-primary)"></svg>
-         <h3 style="font-size:var(--text-base);margin-top:var(--space-2)">${_torrentJobs.length ? 'No matching torrents in this filter' : 'Zero-Disk Torrent-to-Cloud Streaming'}</h3>
-         <p style="font-size:var(--text-xs);color:var(--color-text-muted);max-width:52ch;line-height:1.55">
+         <h3 style="font-size:var(--text-base);margin-top:var(--space-2)">${_torrentJobs.length ? 'No matching torrents in this filter' : 'Zero-Disk Torrent Streaming'}</h3>
+         <p style="font-size:var(--text-xs);color:var(--color-text-muted);max-width:54ch;line-height:1.55">
            ${_torrentJobs.length
              ? 'Switch filters above to view other torrent transfers.'
-             : 'Paste a magnet link or upload a .torrent file to stream verified pieces straight into Google Drive or FileJump with a bounded sliding-window buffer and zero persistent disk accumulation.'}
+             : 'Paste a magnet link or upload a .torrent file to stream verified pieces straight into Google Drive, FileJump, or your Local SMB NAS with a bounded sliding-window buffer and zero persistent container disk accumulation.'}
          </p>
          ${!_torrentJobs.length ? `<button class="btn btn-primary btn-sm" style="margin-top:var(--space-2)" onclick="openAddTorrentModal()"><svg data-lucide="plus" width="14" height="14"></svg> Add First Torrent</button>` : ''}
        </div>`;
@@ -9368,17 +9414,33 @@ function renderTorrentsView(isSilentRefresh = false) {
           <button class="torrent-filter-btn ${_torrentFilter==='error'?'active':''}" onclick="setTorrentFilter('error')">Failed (${counts.error})</button>
         </div>
         <div class="torrent-summary-line">
-          <span>Zero-Disk Stream</span>
+          <span title="Total swarm download speed">↓ ${formatTorrentRate(totalDownRate)}</span>
+          <span aria-hidden="true">·</span>
+          <span title="Total peer upload speed">↑ ${formatTorrentRate(totalPeerUpRate)}</span>
+          ${totalTargetRate > 0 ? `<span aria-hidden="true">·</span><span title="Total storage write speed">→ ${formatTorrentRate(totalTargetRate)}</span>` : ''}
+          <span aria-hidden="true">·</span>
+          <span>Peers ${totalPeers}</span>
           <span aria-hidden="true">·</span>
           <span>Window ${formatSize(activeWindowBytes)} / ${windowCapMb} MB</span>
-          <span aria-hidden="true">·</span>
-          <span>1 File at a Time</span>
         </div>
       </div>
       ${rowsHtml}
     </div>
   `;
   lucide.createIcons();
+}
+
+function getTorrentProviderAccounts(provider) {
+  if (provider === 'gdrive') return _gdAccounts;
+  if (provider === 'filejump') return _fjAccounts;
+  if (provider === 'smb') return _shares;
+  return [];
+}
+
+function getTorrentDefaultFolderStack(provider) {
+  return provider === 'smb'
+    ? [{ id: '/', name: '/' }]
+    : [{ id: 'root', name: '/' }];
 }
 
 function openAddTorrentModal() {
@@ -9389,13 +9451,15 @@ function openAddTorrentModal() {
   }
   const hasGD = _gdAccounts.length > 0;
   const hasFJ = _fjAccounts.length > 0;
-  if (!hasGD && !hasFJ) {
-    toast('Connect a Google Drive or FileJump account in Settings first', 'error');
+  const hasSMB = _shares.length > 0;
+  if (!hasGD && !hasFJ && !hasSMB) {
+    toast('Connect Google Drive, FileJump, or a Local SMB NAS share in Settings first', 'error');
     setView('settings', 'gdrive');
     return;
   }
-  const defaultProvider = hasGD ? 'gdrive' : 'filejump';
-  const defaultAcc = defaultProvider === 'gdrive' ? _gdAccounts[0] : _fjAccounts[0];
+  const defaultProvider = hasGD ? 'gdrive' : (hasFJ ? 'filejump' : 'smb');
+  const defaultList = getTorrentProviderAccounts(defaultProvider);
+  const defaultAcc = defaultList[0];
   _torrentModalState = {
     step: 1,
     sourceMode: 'magnet',
@@ -9404,7 +9468,7 @@ function openAddTorrentModal() {
     provider: defaultProvider,
     accountId: defaultAcc.id,
     accountName: defaultAcc.name,
-    folderStack: [{ id: 'root', name: '/' }],
+    folderStack: getTorrentDefaultFolderStack(defaultProvider),
     folderItems: [],
     folderLoading: false,
     conflictAction: _torrentSettings.default_conflict_action || 'keep_both',
@@ -9417,24 +9481,74 @@ function openAddTorrentModal() {
   loadTorrentModalFolders();
 }
 
+function updateTorrentModalFolderBrowserUI() {
+  const st = _torrentModalState;
+  if (!st || st.step !== 1) return false;
+  const container = document.getElementById('tor-folder-browser-section');
+  if (!container) return false;
+  const folderPath = st.folderStack.length > 1
+    ? '/' + st.folderStack.slice(1).map(s => s.name).join('/')
+    : '/';
+  container.innerHTML = `
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+      <label class="form-label" style="margin:0">Destination Folder: <code style="font-family:var(--font-mono);color:var(--color-primary)">${escHtml(folderPath)}</code></label>
+      ${st.folderStack.length > 1 ? `<button type="button" class="btn btn-ghost btn-sm" style="padding:2px 8px;font-size:11px" onclick="torrentModalFolderUp()">Up one level</button>` : ''}
+    </div>
+    <div class="torrent-folder-browser">
+      ${st.folderLoading
+        ? `<div style="padding:12px;font-size:12px;color:var(--color-text-muted)">Loading folders...</div>`
+        : (st.folderItems.length
+            ? st.folderItems.map(f => `
+                <div class="torrent-folder-item" onclick="torrentModalOpenFolder('${escAttr(f.id)}','${escAttr(f.name)}')">
+                  <span style="display:flex;align-items:center;gap:8px;min-width:0"><svg data-lucide="folder" width="14" height="14" style="color:var(--color-primary);flex-shrink:0"></svg><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(f.name)}</span></span>
+                  <svg data-lucide="chevron-right" width="14" height="14" style="color:var(--color-text-faint);flex-shrink:0"></svg>
+                </div>`).join('')
+            : `<div style="padding:12px;font-size:12px;color:var(--color-text-faint)">No subfolders here — files will stream directly into ${escHtml(folderPath)}</div>`)}
+    </div>
+  `;
+  const errEl = document.getElementById('tor-modal-error');
+  if (errEl) {
+    errEl.textContent = st.error || '';
+    errEl.style.display = st.error ? 'block' : 'none';
+  }
+  lucide.createIcons();
+  return true;
+}
+
 async function loadTorrentModalFolders() {
   const st = _torrentModalState;
   if (!st) return;
+  const reqProvider = st.provider;
+  const reqAccountId = st.accountId;
   st.folderLoading = true;
-  renderAddTorrentModal();
+  if (!updateTorrentModalFolderBrowserUI()) renderAddTorrentModal();
   try {
-    const cur = st.folderStack[st.folderStack.length - 1] || { id: 'root', name: '/' };
-    const ep = st.provider === 'gdrive'
-      ? `/api/gdrive/files?folder=${encodeURIComponent(cur.id)}&account_id=${encodeURIComponent(st.accountId)}`
-      : `/api/filejump/files?folder=${encodeURIComponent(cur.id)}&account_id=${encodeURIComponent(st.accountId)}`;
+    const cur = st.folderStack[st.folderStack.length - 1] || (st.provider === 'smb' ? { id: '/', name: '/' } : { id: 'root', name: '/' });
+    let ep;
+    if (st.provider === 'gdrive') {
+      ep = `/api/gdrive/files?folder=${encodeURIComponent(cur.id)}&account_id=${encodeURIComponent(st.accountId)}`;
+    } else if (st.provider === 'filejump') {
+      ep = `/api/filejump/files?folder=${encodeURIComponent(cur.id)}&account_id=${encodeURIComponent(st.accountId)}`;
+    } else {
+      ep = `/api/smb/browse/${encodeURIComponent(st.accountId)}?path=${encodeURIComponent(cur.id || '/')}`;
+    }
     const items = await apiJSON(ep);
-    st.folderItems = (Array.isArray(items) ? items : []).filter(i => i.type === 'folder');
+    if (_torrentModalState !== st || st.provider !== reqProvider || st.accountId !== reqAccountId) return;
+    st.folderItems = (Array.isArray(items) ? items : [])
+      .filter(i => i.type === 'folder')
+      .map(i => ({
+        id: st.provider === 'smb' ? (i.path || ((cur.id === '/' ? '' : cur.id) + '/' + i.name)) : i.id,
+        name: i.name,
+      }));
   } catch (e) {
+    if (_torrentModalState !== st) return;
     st.folderItems = [];
     st.error = 'Could not list folders: ' + e.message;
   } finally {
-    st.folderLoading = false;
-    renderAddTorrentModal();
+    if (_torrentModalState === st) {
+      st.folderLoading = false;
+      if (!updateTorrentModalFolderBrowserUI()) renderAddTorrentModal();
+    }
   }
 }
 
@@ -9448,25 +9562,26 @@ function torrentModalSetSource(mode) {
 function torrentModalSetProvider(provider) {
   const st = _torrentModalState;
   if (!st) return;
-  const list = provider === 'gdrive' ? _gdAccounts : _fjAccounts;
+  const list = getTorrentProviderAccounts(provider);
   if (!list.length) return;
   st.provider = provider;
   st.accountId = list[0].id;
   st.accountName = list[0].name;
-  st.folderStack = [{ id: 'root', name: '/' }];
+  st.folderStack = getTorrentDefaultFolderStack(provider);
   st.error = '';
+  renderAddTorrentModal();
   loadTorrentModalFolders();
 }
 
 function torrentModalSetAccount(accountId) {
   const st = _torrentModalState;
   if (!st) return;
-  const list = st.provider === 'gdrive' ? _gdAccounts : _fjAccounts;
+  const list = getTorrentProviderAccounts(st.provider);
   const acc = list.find(a => a.id === accountId) || list[0];
   if (!acc) return;
   st.accountId = acc.id;
   st.accountName = acc.name;
-  st.folderStack = [{ id: 'root', name: '/' }];
+  st.folderStack = getTorrentDefaultFolderStack(st.provider);
   st.error = '';
   loadTorrentModalFolders();
 }
@@ -9568,7 +9683,8 @@ async function torrentModalSubmit() {
     renderAddTorrentModal();
     return;
   }
-  const curFolder = st.folderStack[st.folderStack.length - 1] || { id: 'root', name: '/' };
+  const defaultRoot = st.provider === 'smb' ? { id: '/', name: '/' } : { id: 'root', name: '/' };
+  const curFolder = st.folderStack[st.folderStack.length - 1] || defaultRoot;
   const folderPath = st.folderStack.length > 1
     ? '/' + st.folderStack.slice(1).map(s => s.name).join('/')
     : '/';
@@ -9607,9 +9723,10 @@ async function torrentModalSubmit() {
         },
       });
     }
+    const targetLabel = getTorrentProviderLabel(st.provider);
     _torrentModalState = null;
     closeModal();
-    toast('Torrent queued for zero-disk cloud streaming', 'success');
+    toast(`Torrent queued for streaming to ${targetLabel}`, 'success');
     if (_view !== 'torrents') setView('torrents');
     await refreshTorrents(true);
   } catch (e) {
@@ -9622,8 +9739,9 @@ async function torrentModalSubmit() {
 function renderAddTorrentModal() {
   const st = _torrentModalState;
   if (!st) return;
-  const accounts = st.provider === 'gdrive' ? _gdAccounts : _fjAccounts;
+  const accounts = getTorrentProviderAccounts(st.provider);
   const folderPath = st.folderStack.length > 1 ? '/' + st.folderStack.slice(1).map(s => s.name).join('/') : '/';
+  const providerLabel = getTorrentProviderLabel(st.provider);
 
   if (st.step === 1) {
     showModal(`
@@ -9643,39 +9761,43 @@ function renderAddTorrentModal() {
             <textarea class="form-input" id="tor-magnet-input" rows="3" style="font-family:var(--font-mono);font-size:12px;resize:vertical" placeholder="magnet:?xt=urn:btih:...&dn=Example" oninput="if(_torrentModalState)_torrentModalState.magnetUri=this.value">${escHtml(st.magnetUri)}</textarea>
           </div>
         ` : `
-          <div class="torrent-dropzone" id="tor-file-dropzone"
-               onclick="document.getElementById('tor-file-input').click()"
-               ondragover="event.preventDefault();this.classList.add('dragover')"
-               ondragleave="this.classList.remove('dragover')"
-               ondrop="event.preventDefault();this.classList.remove('dragover');if(event.dataTransfer.files[0])torrentModalPickFile(event.dataTransfer.files[0])">
-            <input type="file" id="tor-file-input" accept=".torrent,application/x-bittorrent" style="display:none" onchange="if(this.files[0])torrentModalPickFile(this.files[0])" />
+          <label class="torrent-dropzone" id="tor-file-dropzone" for="tor-file-input"
+                 style="display:block;cursor:pointer"
+                 ondragover="event.preventDefault();this.classList.add('dragover')"
+                 ondragleave="this.classList.remove('dragover')"
+                 ondrop="event.preventDefault();this.classList.remove('dragover');if(event.dataTransfer.files[0])torrentModalPickFile(event.dataTransfer.files[0])">
+            <input type="file" id="tor-file-input" accept=".torrent,application/x-bittorrent"
+                   style="display:none"
+                   onclick="event.stopPropagation()"
+                   onchange="if(this.files && this.files[0])torrentModalPickFile(this.files[0])" />
             <svg data-lucide="upload-cloud" width="26" height="26" style="margin:0 auto var(--space-2);color:var(--color-primary)"></svg>
             <div style="font-size:var(--text-sm);font-weight:600;color:var(--color-text)">
               ${st.torrentFile ? escHtml(st.torrentFile.name) : 'Drop a .torrent file here or click to browse'}
             </div>
             <div style="font-size:11px;color:var(--color-text-muted);margin-top:4px">
-              ${st.torrentFile ? `${formatSize(st.torrentFile.size)} · Ready to inspect file tree` : 'Only metadata is inspected — media files stream straight to cloud'}
+              ${st.torrentFile ? `${formatSize(st.torrentFile.size)} · Click to choose a different file or press Inspect &amp; Continue` : 'Only metadata is inspected — media files stream straight to your selected storage'}
             </div>
-          </div>
+          </label>
         `}
 
         <div class="form-row">
           <div class="form-group">
-            <label class="form-label">Destination Cloud</label>
+            <label class="form-label">Destination Storage</label>
             <select class="form-input" onchange="torrentModalSetProvider(this.value)">
               ${_gdAccounts.length ? `<option value="gdrive" ${st.provider==='gdrive'?'selected':''}>Google Drive (${_gdAccounts.length})</option>` : ''}
               ${_fjAccounts.length ? `<option value="filejump" ${st.provider==='filejump'?'selected':''}>FileJump (${_fjAccounts.length})</option>` : ''}
+              ${_shares.length ? `<option value="smb" ${st.provider==='smb'?'selected':''}>Local SMB NAS (${_shares.length})</option>` : ''}
             </select>
           </div>
           <div class="form-group">
-            <label class="form-label">Account</label>
+            <label class="form-label">${st.provider === 'smb' ? 'SMB Share' : 'Account'}</label>
             <select class="form-input" onchange="torrentModalSetAccount(this.value)">
               ${accounts.map(a => `<option value="${escAttr(a.id)}" ${a.id===st.accountId?'selected':''}>${escHtml(a.name)}</option>`).join('')}
             </select>
           </div>
         </div>
 
-        <div class="form-group">
+        <div class="form-group" id="tor-folder-browser-section">
           <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
             <label class="form-label" style="margin:0">Destination Folder: <code style="font-family:var(--font-mono);color:var(--color-primary)">${escHtml(folderPath)}</code></label>
             ${st.folderStack.length > 1 ? `<button type="button" class="btn btn-ghost btn-sm" style="padding:2px 8px;font-size:11px" onclick="torrentModalFolderUp()">Up one level</button>` : ''}
@@ -9703,10 +9825,10 @@ function renderAddTorrentModal() {
         </div>
 
         <div style="font-size:11px;color:var(--color-text-muted);line-height:1.45">
-          Zero-disk stream: peak container scratch stays within ${Number(_torrentSettings.window_mb || 24)} MiB and releases immediately after cloud upload. Peer traffic uses the container's network connection.
+          Zero-disk stream: peak container scratch stays within ${Number(_torrentSettings.window_mb || 24)} MiB and releases immediately after writing to ${escHtml(providerLabel)}. Peer traffic uses the container's network connection.
         </div>
 
-        ${st.error ? `<div style="font-size:var(--text-xs);color:var(--color-error)">${escHtml(st.error)}</div>` : ''}
+        <div id="tor-modal-error" style="font-size:var(--text-xs);color:var(--color-error);display:${st.error ? 'block' : 'none'}">${escHtml(st.error || '')}</div>
       </div>
       <div class="modal-footer">
         <button class="btn btn-secondary" onclick="_torrentModalState=null;closeModal()">Cancel</button>
@@ -9731,6 +9853,8 @@ function renderAddTorrentModal() {
       <div>
         <div style="font-weight:600;font-size:var(--text-sm);color:var(--color-text)">${escHtml(info.name || 'Torrent')}</div>
         <div class="torrent-meta-inline torrent-meta-mono">
+          <span>${escHtml(providerLabel)}</span>
+          <span aria-hidden="true">·</span>
           <span>${escHtml(st.accountName)}</span>
           <span aria-hidden="true">·</span>
           <span>${escHtml(folderPath)}</span>
@@ -9761,7 +9885,7 @@ function renderAddTorrentModal() {
         </div>
       ` : `
         <div style="padding:var(--space-4);border:1px solid var(--color-border);border-radius:var(--radius-md);background:var(--color-surface-2);font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.55">
-          Magnet link validated (<code style="font-family:var(--font-mono)">${escHtml((info.info_hash || '').slice(0, 20))}</code>). SageDrive will connect to peers via DHT/trackers to resolve the file list automatically, then stream every file sequentially straight to <strong style="color:var(--color-text)">${escHtml(st.accountName)} (${escHtml(folderPath)})</strong>.
+          Magnet link validated (<code style="font-family:var(--font-mono)">${escHtml((info.info_hash || '').slice(0, 20))}</code>). SageDrive will connect to peers via DHT/trackers to resolve the file list automatically, then stream every file sequentially straight to <strong style="color:var(--color-text)">${escHtml(providerLabel)} · ${escHtml(st.accountName)} (${escHtml(folderPath)})</strong>.
         </div>
       `}
 
@@ -9770,7 +9894,7 @@ function renderAddTorrentModal() {
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="_torrentModalState.step=1;_torrentModalState.error='';renderAddTorrentModal()">Back</button>
       <button class="btn btn-primary" onclick="torrentModalSubmit()" ${st.busy ? 'disabled' : ''}>
-        ${st.busy ? 'Starting...' : 'Start Streaming to Cloud'}
+        ${st.busy ? 'Starting...' : `Start Streaming to ${escHtml(providerLabel)}`}
       </button>
     </div>
   `, 'max-width:620px;width:95vw');

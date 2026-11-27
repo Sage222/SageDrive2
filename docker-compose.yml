@@ -9,6 +9,8 @@ services:
     ports:
       - "8080:8080"
       - "445:445"
+      - "6881:6881/tcp"
+      - "6881:6881/udp"
     environment:
       - DATA_DIR=/app/data
       - SECRET_KEY=${SECRET_KEY}
@@ -22,6 +24,7 @@ services:
       - ./backend/gdrive_manager.py:/app/gdrive_manager.py:ro
       - ./backend/onedrive_manager.py:/app/onedrive_manager.py:ro
       - ./backend/filejump_manager.py:/app/filejump_manager.py:ro
+      - ./backend/torrent_manager.py:/app/torrent_manager.py:ro
       - ./frontend/public/index.html:/app/static/index.html
       - ./backend/main.py:/app/main.py
       - ./entrypoint.sh:/app/entrypoint.sh:ro

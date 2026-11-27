@@ -4579,6 +4579,631 @@ app.delete('/api/favorites', requireAuth, (req, res) => {
   return res.json({ ok: true, favorites: favs });
 });
 
+// ── Embedded Zero-Disk Torrent-to-Cloud Manager API ──────────────────────────
+const TORRENTS_STATE_FILE = path.join(DATA_DIR, 'torrents_state.json');
+const TORRENT_SETTINGS_FILE = path.join(DATA_DIR, 'torrent_settings.json');
+const DEFAULT_TORRENT_SETTINGS = {
+  listen_port: 6881,
+  window_mb: 24,
+  max_connections: 60,
+  download_rate_limit_kbps: 0,
+  default_conflict_action: 'keep_both',
+};
+
+const torrentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 },
+});
+
+function sanitizeTorrentRelPath(rawPath) {
+  const cleaned = String(rawPath || '').replace(/\x00/g, '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+  const parts = cleaned
+    .split('/')
+    .map((p) => p.trim())
+    .filter((p) => p && p !== '.' && p !== '..')
+    .map((p) => p.replace(/[<>:"|?*\x00-\x1f]+/g, '_'));
+  return parts.length ? parts.join('/') : 'file';
+}
+
+function bdecodeNext(buf, idx, depth = 0) {
+  if (depth > 64) throw new Error('Torrent metadata nesting too deep');
+  if (idx >= buf.length) throw new Error('Unexpected end of bencoded data');
+  const ch = buf[idx];
+  if (ch === 0x69) { // 'i'
+    const end = buf.indexOf(0x65, idx + 1);
+    if (end === -1) throw new Error('Unterminated bencode integer');
+    return [parseInt(buf.subarray(idx + 1, end).toString('ascii'), 10), end + 1];
+  }
+  if (ch === 0x6c) { // 'l'
+    let cur = idx + 1;
+    const out = [];
+    while (cur < buf.length && buf[cur] !== 0x65) {
+      const [val, next] = bdecodeNext(buf, cur, depth + 1);
+      out.push(val);
+      cur = next;
+    }
+    if (cur >= buf.length) throw new Error('Unterminated bencode list');
+    return [out, cur + 1];
+  }
+  if (ch === 0x64) { // 'd'
+    let cur = idx + 1;
+    const out = {};
+    while (cur < buf.length && buf[cur] !== 0x65) {
+      const [keyBuf, afterKey] = bdecodeNext(buf, cur, depth + 1);
+      if (!Buffer.isBuffer(keyBuf)) throw new Error('Bencode dict key must be bytes');
+      const keyStr = keyBuf.toString('utf-8');
+      const valStart = afterKey;
+      const [val, next] = bdecodeNext(buf, afterKey, depth + 1);
+      out[keyStr] = val;
+      if (depth === 0 && keyStr === 'info') {
+        out.__rawInfo = buf.subarray(valStart, next);
+      }
+      cur = next;
+    }
+    if (cur >= buf.length) throw new Error('Unterminated bencode dict');
+    return [out, cur + 1];
+  }
+  if (ch >= 0x30 && ch <= 0x39) {
+    const colon = buf.indexOf(0x3a, idx);
+    if (colon === -1) throw new Error('Invalid bencode string');
+    const len = parseInt(buf.subarray(idx, colon).toString('ascii'), 10);
+    if (!Number.isFinite(len) || len < 0) throw new Error('Invalid bencode string length');
+    const start = colon + 1;
+    const end = start + len;
+    if (end > buf.length) throw new Error('Truncated bencode string');
+    return [buf.subarray(start, end), end];
+  }
+  throw new Error(`Invalid bencode token at offset ${idx}`);
+}
+
+function parseTorrentBuffer(rawBuf) {
+  if (!rawBuf || !rawBuf.length) throw new Error('Empty .torrent file');
+  const [decoded] = bdecodeNext(rawBuf, 0, 0);
+  if (!decoded || typeof decoded !== 'object' || !decoded.info || typeof decoded.info !== 'object') {
+    throw new Error('Missing torrent info dictionary');
+  }
+  const info = decoded.info;
+  const infoHash = decoded.__rawInfo
+    ? crypto.createHash('sha1').update(decoded.__rawInfo).digest('hex').toLowerCase()
+    : crypto.randomBytes(20).toString('hex');
+  const rawName = info['name.utf-8'] || info.name;
+  const name = (Buffer.isBuffer(rawName) ? rawName.toString('utf-8') : String(rawName || 'Torrent')).trim() || 'Torrent';
+  const pieceLength = Number(info['piece length'] || 0) || 262144;
+  const files = [];
+  if (Array.isArray(info.files)) {
+    let offset = 0;
+    const rootDir = sanitizeTorrentRelPath(name);
+    info.files.forEach((entry, idx) => {
+      if (!entry || typeof entry !== 'object') return;
+      const pathArr = entry['path.utf-8'] || entry.path || [];
+      const parts = pathArr.map((p) => (Buffer.isBuffer(p) ? p.toString('utf-8') : String(p || '')));
+      const size = Math.max(0, Number(entry.length || 0) || 0);
+      if (parts.some((p) => p.startsWith('_____padding_file_'))) {
+        offset += size;
+        return;
+      }
+      const relPath = sanitizeTorrentRelPath(`${rootDir}/${parts.join('/')}`);
+      files.push({
+        index: idx,
+        name: path.posix.basename(relPath),
+        relative_path: relPath,
+        size,
+        offset,
+        selected: true,
+        uploaded_bytes: 0,
+        status: 'queued',
+        error: '',
+        cloud_file_id: '',
+      });
+      offset += size;
+    });
+  } else {
+    const size = Math.max(0, Number(info.length || 0) || 0);
+    const relPath = sanitizeTorrentRelPath(name);
+    files.push({
+      index: 0,
+      name: path.posix.basename(relPath),
+      relative_path: relPath,
+      size,
+      offset: 0,
+      selected: true,
+      uploaded_bytes: 0,
+      status: 'queued',
+      error: '',
+      cloud_file_id: '',
+    });
+  }
+  return {
+    source_type: 'torrent_file',
+    info_hash: infoHash,
+    name,
+    piece_length: pieceLength,
+    total_bytes: files.reduce((acc, f) => acc + f.size, 0),
+    files,
+    metadata_ready: true,
+  };
+}
+
+function parseMagnetUri(rawUri) {
+  const uri = String(rawUri || '').trim();
+  if (!uri.toLowerCase().startsWith('magnet:?')) {
+    throw new Error("Magnet URI must start with 'magnet:?'");
+  }
+  const u = new URL(uri);
+  const xts = u.searchParams.getAll('xt');
+  let infoHash = '';
+  for (const xt of xts) {
+    const low = xt.trim().toLowerCase();
+    if (low.startsWith('urn:btih:')) {
+      const h = low.slice(9).trim();
+      if (/^[0-9a-f]{40}$/.test(h) || /^[a-z2-7]{32}$/.test(h)) {
+        infoHash = h;
+        break;
+      }
+    } else if (low.startsWith('urn:btmh:')) {
+      const h = low.slice(9).trim();
+      if (h.length >= 40) {
+        infoHash = h;
+        break;
+      }
+    }
+  }
+  if (!infoHash) {
+    throw new Error('Invalid magnet link: missing valid BitTorrent info-hash (xt=urn:btih:...)');
+  }
+  const dn = (u.searchParams.get('dn') || '').trim();
+  const name = dn || `Torrent ${infoHash.slice(0, 10)}`;
+  return {
+    source_type: 'magnet',
+    magnet_uri: uri,
+    info_hash: infoHash,
+    name,
+    piece_length: 0,
+    total_bytes: 0,
+    files: [],
+    metadata_ready: false,
+  };
+}
+
+function validateTorrentSettings(raw) {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  const listen_port = Math.max(1024, Math.min(65535, parseInt(src.listen_port ?? DEFAULT_TORRENT_SETTINGS.listen_port, 10) || 6881));
+  const window_mb = Math.max(8, Math.min(64, parseInt(src.window_mb ?? DEFAULT_TORRENT_SETTINGS.window_mb, 10) || 24));
+  const max_connections = Math.max(10, Math.min(300, parseInt(src.max_connections ?? DEFAULT_TORRENT_SETTINGS.max_connections, 10) || 60));
+  const download_rate_limit_kbps = Math.max(0, Math.min(1000000, parseInt(src.download_rate_limit_kbps ?? 0, 10) || 0));
+  let default_conflict_action = String(src.default_conflict_action || 'keep_both').trim().toLowerCase();
+  if (!['keep_both', 'skip', 'replace'].includes(default_conflict_action)) default_conflict_action = 'keep_both';
+  return {
+    listen_port,
+    window_mb,
+    max_connections,
+    download_rate_limit_kbps,
+    default_conflict_action,
+    engine_available: true,
+    engine_version: 'preview-stream',
+  };
+}
+
+let torrentSettings = validateTorrentSettings(loadJson(TORRENT_SETTINGS_FILE, DEFAULT_TORRENT_SETTINGS));
+let torrentJobs = (() => {
+  const loaded = loadJson(TORRENTS_STATE_FILE, []);
+  if (!Array.isArray(loaded)) return [];
+  let changed = false;
+  for (const j of loaded) {
+    if (j && (j.status === 'streaming' || j.status === 'fetching_metadata')) {
+      j.status = 'paused';
+      if (j.stats) {
+        j.stats.download_rate = 0;
+        j.stats.upload_rate = 0;
+        j.stats.window_bytes = 0;
+      }
+      changed = true;
+    }
+  }
+  if (changed) saveJson(TORRENTS_STATE_FILE, loaded);
+  return loaded;
+})();
+
+function saveTorrentJobs() {
+  saveJson(TORRENTS_STATE_FILE, torrentJobs);
+}
+
+function recomputeTorrentTotals(job) {
+  const sel = (job.files || []).filter((f) => f.selected !== false);
+  const total = sel.reduce((a, f) => a + (Number(f.size) || 0), 0);
+  const uploaded = sel.reduce((a, f) => a + Math.min(Number(f.size) || 0, Number(f.uploaded_bytes) || 0), 0);
+  job.stats.total_bytes = total;
+  job.stats.uploaded_bytes = uploaded;
+  const rate = Number(job.stats.upload_rate || job.stats.download_rate || 0);
+  const rem = Math.max(0, total - uploaded);
+  job.stats.eta_seconds = rate > 0 && rem > 0 ? Math.ceil(rem / rate) : 0;
+}
+
+function writePreviewTorrentFileToCloud(job, fileRec) {
+  const dest = job.destination || {};
+  const provider = dest.provider;
+  const accountId = dest.account_id || 'default';
+  const baseFolderId = dest.folder_id || 'root';
+  const conflictAction = dest.conflict_action || 'keep_both';
+  const fsMap = provider === 'filejump' ? filejumpFSData : gdriveFSData;
+  const saveFn = provider === 'filejump' ? saveFileJumpFS : saveGDriveFS;
+  const folderMime = provider === 'filejump' ? 'application/vnd.filejump.folder' : 'application/vnd.google-apps.folder';
+  const nowIso = new Date().toISOString();
+
+  const segments = sanitizeTorrentRelPath(fileRec.relative_path || fileRec.name).split('/');
+  let parentId = baseFolderId;
+  for (let i = 0; i < segments.length - 1; i++) {
+    const seg = segments[i];
+    const existingDir = Object.values(fsMap).find(
+      (it) =>
+        it &&
+        it.type === 'folder' &&
+        (it.parent || 'root') === parentId &&
+        (provider !== 'filejump' || (it.accountId || 'default') === accountId) &&
+        String(it.name || '').toLowerCase() === seg.toLowerCase()
+    );
+    if (existingDir) {
+      parentId = existingDir.id;
+    } else {
+      const dirId = `${provider === 'filejump' ? 'fj' : 'gd'}_tor_dir_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+      fsMap[dirId] = {
+        id: dirId,
+        accountId,
+        name: seg,
+        type: 'folder',
+        size: 0,
+        modified: nowIso,
+        mimeType: folderMime,
+        parent: parentId,
+      };
+      parentId = dirId;
+    }
+  }
+
+  let finalName = segments[segments.length - 1] || fileRec.name || 'torrent_file.bin';
+  const siblings = Object.values(fsMap).filter(
+    (it) =>
+      it &&
+      (it.parent || 'root') === parentId &&
+      (provider !== 'filejump' || (it.accountId || 'default') === accountId)
+  );
+  const matching = siblings.filter((it) => it.type === 'file' && String(it.name || '').toLowerCase() === finalName.toLowerCase());
+  if (matching.length) {
+    if (conflictAction === 'skip') {
+      return matching[0].id;
+    }
+    if (conflictAction === 'replace') {
+      for (const m of matching) delete fsMap[m.id];
+    } else {
+      const lowerNames = new Set(siblings.map((s) => String(s.name || '').toLowerCase()));
+      const dot = finalName.lastIndexOf('.');
+      const base = dot > 0 ? finalName.slice(0, dot) : finalName;
+      const ext = dot > 0 ? finalName.slice(dot) : '';
+      let n = 1;
+      while (lowerNames.has(`${base} (${n})${ext}`.toLowerCase())) n++;
+      finalName = `${base} (${n})${ext}`;
+    }
+  }
+
+  const fileId = `${provider === 'filejump' ? 'fj' : 'gd'}_tor_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+  const blobPath = path.join(BLOBS_DIR, `${fileId}.txt`);
+  fs.writeFileSync(
+    blobPath,
+    `Streamed via SageDrive Zero-Disk Torrent Engine\nTorrent: ${job.name}\nInfoHash: ${job.info_hash}\nFile: ${fileRec.relative_path}\nSize: ${fileRec.size} bytes\n`
+  );
+  fsMap[fileId] = {
+    id: fileId,
+    accountId,
+    name: finalName,
+    type: 'file',
+    size: Number(fileRec.size) || fs.statSync(blobPath).size,
+    modified: nowIso,
+    mimeType: getMimeType(finalName),
+    parent: parentId,
+    blobPath,
+  };
+  saveFn();
+  return fileId;
+}
+
+// Background ticker in preview mode to demonstrate 1-file-at-a-time sliding-window streaming
+setInterval(() => {
+  let dirty = false;
+  const winCap = Number(torrentSettings.window_mb || 24) * 1024 * 1024;
+  let active = torrentJobs.find((j) => j.status === 'streaming' || j.status === 'fetching_metadata');
+  if (!active) {
+    const queued = [...torrentJobs].reverse().find((j) => j.status === 'queued');
+    if (queued) {
+      queued.status = queued.metadata_ready ? 'streaming' : 'fetching_metadata';
+      queued.stats.window_cap_bytes = winCap;
+      queued.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+      active = queued;
+      dirty = true;
+    }
+  }
+  if (!active) return;
+
+  if (active.status === 'fetching_metadata') {
+    active.stats.peers = Math.min(28, (active.stats.peers || 0) + 7);
+    active.stats.seeds = Math.min(14, (active.stats.seeds || 0) + 4);
+    if (!active.files || !active.files.length) {
+      const cleanName = sanitizeTorrentRelPath(active.name || 'Torrent_Download');
+      const hasExt = /\.[a-z0-9]{2,5}$/i.test(cleanName);
+      active.files = [
+        {
+          index: 0,
+          name: hasExt ? path.posix.basename(cleanName) : `${cleanName}.mkv`,
+          relative_path: hasExt ? cleanName : `${cleanName}/${cleanName}.mkv`,
+          size: 48 * 1024 * 1024,
+          offset: 0,
+          selected: true,
+          uploaded_bytes: 0,
+          status: 'queued',
+          error: '',
+          cloud_file_id: '',
+        },
+        {
+          index: 1,
+          name: 'README.txt',
+          relative_path: hasExt ? 'README.txt' : `${cleanName}/README.txt`,
+          size: 2048,
+          offset: 48 * 1024 * 1024,
+          selected: true,
+          uploaded_bytes: 0,
+          status: 'queued',
+          error: '',
+          cloud_file_id: '',
+        },
+      ];
+    }
+    active.metadata_ready = true;
+    active.status = 'streaming';
+    recomputeTorrentTotals(active);
+    active.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+    saveTorrentJobs();
+    return;
+  }
+
+  // Advance the single active selected file
+  const nextFile = (active.files || []).find((f) => f.selected !== false && f.status !== 'completed' && f.status !== 'skipped');
+  if (!nextFile) {
+    active.status = 'completed';
+    active.completed_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+    active.updated_at = active.completed_at;
+    active.stats.download_rate = 0;
+    active.stats.upload_rate = 0;
+    active.stats.window_bytes = 0;
+    active.stats.eta_seconds = 0;
+    recomputeTorrentTotals(active);
+    addActivityLog(
+      active.created_by || 'admin',
+      'Torrent Completed',
+      'add',
+      `Streamed '${active.name}' straight to ${active.destination.account_name} (${active.destination.folder_path})`,
+      active.destination.account_name,
+      active.name
+    );
+    saveTorrentJobs();
+    return;
+  }
+
+  nextFile.status = 'streaming';
+  const step = Math.max(4 * 1024 * 1024, Math.ceil((Number(nextFile.size) || 1024 * 1024) / 6));
+  const remaining = Math.max(0, (Number(nextFile.size) || 0) - (Number(nextFile.uploaded_bytes) || 0));
+  const delta = Math.min(remaining, step);
+  nextFile.uploaded_bytes = (Number(nextFile.uploaded_bytes) || 0) + delta;
+  active.stats.download_rate = Math.round(step * 1.08);
+  active.stats.upload_rate = step;
+  active.stats.peers = 18;
+  active.stats.seeds = 11;
+  active.stats.window_cap_bytes = winCap;
+  active.stats.window_bytes = Math.min(winCap, Math.max(2 * 1024 * 1024, Math.min(remaining, Math.round(winCap * 0.72))));
+
+  if (nextFile.uploaded_bytes >= (Number(nextFile.size) || 0)) {
+    nextFile.uploaded_bytes = Number(nextFile.size) || 0;
+    nextFile.status = 'completed';
+    nextFile.cloud_file_id = writePreviewTorrentFileToCloud(active, nextFile);
+  }
+  recomputeTorrentTotals(active);
+  active.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+  dirty = true;
+  if (dirty) saveTorrentJobs();
+}, 1000);
+
+app.get('/api/torrents', requireAuth, (_req, res) => {
+  return res.json({
+    jobs: torrentJobs,
+    settings: torrentSettings,
+    engine_available: true,
+    engine_version: 'preview-stream',
+  });
+});
+
+app.get('/api/torrents/settings', requireAuth, (_req, res) => {
+  return res.json(torrentSettings);
+});
+
+app.post('/api/torrents/settings', requireAdmin, (req, res) => {
+  torrentSettings = validateTorrentSettings({ ...torrentSettings, ...(req.body || {}) });
+  saveJson(TORRENT_SETTINGS_FILE, torrentSettings);
+  addActivityLog(
+    req,
+    'Torrent Settings Updated',
+    'change',
+    `Port ${torrentSettings.listen_port}, window ${torrentSettings.window_mb} MiB, max peers ${torrentSettings.max_connections}`,
+    'Torrents',
+    'Engine Settings'
+  );
+  return res.json(torrentSettings);
+});
+
+app.post('/api/torrents/inspect', requireAdmin, torrentUpload.single('file'), (req, res) => {
+  try {
+    if (req.file && req.file.buffer) {
+      return res.json(parseTorrentBuffer(req.file.buffer));
+    }
+    const magnetUri = (req.body && req.body.magnet_uri) || '';
+    return res.json(parseMagnetUri(magnetUri));
+  } catch (e) {
+    return res.status(400).json({ error: e.message || 'Failed to inspect torrent source' });
+  }
+});
+
+app.post('/api/torrents', requireAdmin, torrentUpload.single('file'), (req, res) => {
+  try {
+    let destination = req.body && req.body.destination;
+    if (typeof destination === 'string') destination = JSON.parse(destination);
+    destination = destination || {};
+
+    let selectedIndices = req.body && req.body.selected_indices;
+    if (typeof selectedIndices === 'string') selectedIndices = JSON.parse(selectedIndices);
+
+    const provider = String(destination.provider || '').trim().toLowerCase();
+    if (!['gdrive', 'filejump'].includes(provider)) {
+      return res.status(400).json({ error: "Destination provider must be 'gdrive' or 'filejump'" });
+    }
+    const parsed = req.file && req.file.buffer
+      ? parseTorrentBuffer(req.file.buffer)
+      : parseMagnetUri((req.body && req.body.magnet_uri) || '');
+
+    const files = parsed.files || [];
+    if (Array.isArray(selectedIndices) && files.length) {
+      const selSet = new Set(selectedIndices.map((n) => Number(n)));
+      files.forEach((f) => {
+        f.selected = selSet.has(Number(f.index));
+        f.status = f.selected ? 'queued' : 'skipped';
+      });
+    }
+
+    const nowIso = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+    const conflictAction = ['keep_both', 'skip', 'replace'].includes(String(destination.conflict_action || '').toLowerCase())
+      ? String(destination.conflict_action).toLowerCase()
+      : torrentSettings.default_conflict_action;
+    const accountName = String(destination.account_name || (provider === 'gdrive' ? 'Google Drive' : 'FileJump')).trim();
+    const folderPath = String(destination.folder_path || '/').trim() || '/';
+    const job = {
+      id: `tor_${Math.floor(Date.now() / 1000)}_${crypto.randomBytes(4).toString('hex')}`,
+      info_hash: parsed.info_hash,
+      name: parsed.name,
+      source_type: parsed.source_type,
+      magnet_uri: parsed.magnet_uri || '',
+      destination: {
+        provider,
+        account_id: String(destination.account_id || 'default').trim() || 'default',
+        account_name: accountName,
+        folder_id: String(destination.folder_id || 'root').trim() || 'root',
+        folder_path: folderPath,
+        conflict_action: conflictAction,
+      },
+      status: 'queued',
+      metadata_ready: Boolean(parsed.metadata_ready),
+      error_message: '',
+      stats: {
+        total_bytes: files.filter((f) => f.selected !== false).reduce((a, f) => a + (Number(f.size) || 0), 0),
+        uploaded_bytes: 0,
+        download_rate: 0,
+        upload_rate: 0,
+        peers: 0,
+        seeds: 0,
+        window_bytes: 0,
+        window_cap_bytes: Number(torrentSettings.window_mb || 24) * 1024 * 1024,
+        eta_seconds: 0,
+      },
+      files,
+      created_at: nowIso,
+      updated_at: nowIso,
+      completed_at: '',
+      created_by: (req.session && req.session.username) || 'admin',
+    };
+    torrentJobs.unshift(job);
+    saveTorrentJobs();
+    addActivityLog(
+      req,
+      'Torrent Added',
+      'add',
+      `Queued '${job.name}' → ${accountName} (${folderPath}) [zero-disk stream]`,
+      accountName,
+      job.name
+    );
+    return res.status(201).json(job);
+  } catch (e) {
+    return res.status(400).json({ error: e.message || 'Failed to add torrent' });
+  }
+});
+
+app.get('/api/torrents/:id', requireAuth, (req, res) => {
+  const job = torrentJobs.find((j) => j.id === req.params.id);
+  if (!job) return res.status(404).json({ error: 'Torrent job not found' });
+  return res.json(job);
+});
+
+app.post('/api/torrents/:id/pause', requireAdmin, (req, res) => {
+  const job = torrentJobs.find((j) => j.id === req.params.id);
+  if (!job) return res.status(404).json({ error: 'Torrent job not found' });
+  if (job.status !== 'completed') {
+    job.status = 'paused';
+    job.stats.download_rate = 0;
+    job.stats.upload_rate = 0;
+    job.stats.window_bytes = 0;
+    (job.files || []).forEach((f) => { if (f.status === 'streaming') f.status = 'paused'; });
+    job.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+    saveTorrentJobs();
+    addActivityLog(req, 'Torrent Paused', 'change', `Paused torrent '${job.name}'`, 'Torrents', job.name);
+  }
+  return res.json(job);
+});
+
+app.post('/api/torrents/:id/resume', requireAdmin, (req, res) => {
+  const job = torrentJobs.find((j) => j.id === req.params.id);
+  if (!job) return res.status(404).json({ error: 'Torrent job not found' });
+  if (job.status !== 'completed') {
+    job.status = 'queued';
+    job.error_message = '';
+    (job.files || []).forEach((f) => {
+      if (f.selected !== false && (f.status === 'paused' || f.status === 'error')) {
+        f.status = 'queued';
+        f.error = '';
+      }
+    });
+    job.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+    saveTorrentJobs();
+    addActivityLog(req, 'Torrent Resumed', 'change', `Resumed torrent '${job.name}'`, 'Torrents', job.name);
+  }
+  return res.json(job);
+});
+
+app.post('/api/torrents/:id/retry', requireAdmin, (req, res) => {
+  const job = torrentJobs.find((j) => j.id === req.params.id);
+  if (!job) return res.status(404).json({ error: 'Torrent job not found' });
+  const fileIndex = req.body && req.body.file_index !== undefined && req.body.file_index !== null
+    ? Number(req.body.file_index)
+    : null;
+  job.status = 'queued';
+  job.error_message = '';
+  (job.files || []).forEach((f) => {
+    if (fileIndex !== null && Number(f.index) !== fileIndex) return;
+    if (f.selected !== false && f.status !== 'completed') {
+      f.status = 'queued';
+      f.error = '';
+      if (job.destination && job.destination.provider === 'filejump') f.uploaded_bytes = 0;
+    }
+  });
+  recomputeTorrentTotals(job);
+  job.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+  saveTorrentJobs();
+  addActivityLog(req, 'Torrent Retried', 'change', `Retrying torrent '${job.name}'`, 'Torrents', job.name);
+  return res.json(job);
+});
+
+app.delete('/api/torrents/:id', requireAdmin, (req, res) => {
+  const idx = torrentJobs.findIndex((j) => j.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: 'Torrent job not found' });
+  const removed = torrentJobs.splice(idx, 1)[0];
+  saveTorrentJobs();
+  addActivityLog(req, 'Torrent Removed', 'delete', `Removed torrent '${removed.name}' and cleared transient buffer`, 'Torrents', removed.name);
+  return res.json({ ok: true });
+});
+
 // ── Static & SPA Catch-all ────────────────────────────────────────────────────
 const staticDir = path.join(__dirname, 'frontend', 'public');
 app.use(express.static(staticDir));

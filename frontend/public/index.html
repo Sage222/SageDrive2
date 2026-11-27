@@ -713,6 +713,50 @@
       font-size:11px;color:var(--color-text-muted);
       font-family:var(--font-mono);font-variant-numeric:tabular-nums
     }
+
+    /* Zero-Disk Torrent-to-Cloud Manager */
+    .torrent-wrap{display:flex;flex-direction:column;gap:var(--space-4);max-width:1280px;width:100%;margin:0 auto}
+    .torrent-toolbar{display:flex;align-items:center;justify-content:space-between;gap:var(--space-3);flex-wrap:wrap}
+    .torrent-filter-bar{display:inline-flex;align-items:center;gap:2px;padding:3px;background:var(--color-surface);border:1px solid var(--color-border);border-radius:var(--radius-md)}
+    .torrent-filter-btn{padding:6px 12px;font-size:var(--text-xs);font-weight:500;color:var(--color-text-muted);border-radius:var(--radius-sm);white-space:nowrap;transition:background var(--transition-interactive),color var(--transition-interactive)}
+    .torrent-filter-btn:hover{color:var(--color-text);background:var(--color-surface-offset)}
+    .torrent-filter-btn.active{background:var(--color-primary-highlight);color:var(--color-primary);font-weight:600}
+    .torrent-summary-line{display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap;font-size:var(--text-xs);color:var(--color-text-muted);font-family:var(--font-mono);font-variant-numeric:tabular-nums}
+    .torrent-list-panel{background:var(--color-surface);border:1px solid var(--color-border);border-radius:var(--radius-lg);overflow:hidden}
+    .torrent-row{border-bottom:1px solid var(--color-divider);transition:background var(--transition-interactive)}
+    .torrent-row:last-child{border-bottom:none}
+    .torrent-row-main{display:grid;grid-template-columns:minmax(220px,2.2fr) minmax(180px,1.5fr) minmax(150px,1.1fr) auto;align-items:center;gap:var(--space-4);padding:var(--space-3) var(--space-4)}
+    .torrent-row-main:hover{background:var(--color-surface-2)}
+    .torrent-title{font-size:var(--text-sm);font-weight:600;color:var(--color-text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .torrent-meta-inline{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12px;color:var(--color-text-muted);margin-top:3px}
+    .torrent-meta-mono{font-family:var(--font-mono);font-variant-numeric:tabular-nums}
+    .torrent-prog-track{position:relative;height:6px;border-radius:999px;background:var(--color-surface-offset);overflow:hidden;width:100%}
+    .torrent-prog-window{position:absolute;top:0;left:0;bottom:0;background:color-mix(in oklab,var(--color-primary) 35%,transparent);transition:width 240ms ease}
+    .torrent-prog-cloud{position:absolute;top:0;left:0;bottom:0;background:var(--color-primary);transition:width 240ms ease}
+    .torrent-prog-cloud.done{background:var(--color-success)}
+    .torrent-prog-cloud.err{background:var(--color-error)}
+    .torrent-status-line{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:500;white-space:nowrap}
+    .torrent-status-streaming{color:var(--color-primary)}
+    .torrent-status-completed{color:var(--color-success)}
+    .torrent-status-error{color:var(--color-error)}
+    .torrent-status-paused,.torrent-status-queued{color:var(--color-warning)}
+    .torrent-actions{display:flex;align-items:center;gap:4px;flex-shrink:0}
+    .torrent-files-drawer{background:var(--color-bg);border-top:1px solid var(--color-divider);padding:var(--space-3) var(--space-4)}
+    .torrent-file-row{display:grid;grid-template-columns:1fr 90px 140px 90px auto;align-items:center;gap:var(--space-3);padding:6px 0;border-bottom:1px solid var(--color-divider);font-size:12px}
+    .torrent-file-row:last-child{border-bottom:none}
+    .torrent-dropzone{border:1px dashed var(--color-border);border-radius:var(--radius-md);padding:var(--space-6) var(--space-4);text-align:center;cursor:pointer;background:var(--color-surface-2);transition:border-color var(--transition-interactive),background var(--transition-interactive)}
+    .torrent-dropzone:hover,.torrent-dropzone.dragover{border-color:var(--color-primary);background:var(--color-primary-highlight)}
+    .torrent-folder-browser{border:1px solid var(--color-border);border-radius:var(--radius-md);background:var(--color-bg);max-height:175px;overflow-y:auto}
+    .torrent-folder-item{display:flex;align-items:center;justify-content:space-between;gap:var(--space-2);padding:7px 10px;font-size:12px;border-bottom:1px solid var(--color-divider);cursor:pointer;color:var(--color-text)}
+    .torrent-folder-item:last-child{border-bottom:none}
+    .torrent-folder-item:hover{background:var(--color-surface-offset)}
+    .torrent-checklist{border:1px solid var(--color-border);border-radius:var(--radius-md);background:var(--color-bg);max-height:240px;overflow-y:auto}
+    .torrent-check-row{display:flex;align-items:center;gap:10px;padding:7px 10px;border-bottom:1px solid var(--color-divider);font-size:12px}
+    .torrent-check-row:last-child{border-bottom:none}
+    @media(max-width:960px){
+      .torrent-row-main{grid-template-columns:1fr;gap:var(--space-2)}
+      .torrent-file-row{grid-template-columns:1fr auto;gap:var(--space-2)}
+    }
   </style>
 </head>
 <body>
@@ -775,6 +819,11 @@
       </div>
       <div id="sidebar-favorites"></div>
       <div class="sidebar-section" style="margin-top:var(--space-4)">App</div>
+      <div class="sidebar-item" data-view="torrents" onclick="setView('torrents')">
+        <svg data-lucide="magnet"></svg>
+        <span class="sidebar-item-label">Torrents</span>
+        <span id="sidebar-torrents-count" style="font-size:11px;font-family:var(--font-mono);font-variant-numeric:tabular-nums;color:var(--color-primary);display:none"></span>
+      </div>
       <div class="sidebar-item" data-view="settings" onclick="setView('settings')">
         <svg data-lucide="settings"></svg>
         <span class="sidebar-item-label">Settings</span>
@@ -857,6 +906,12 @@ let smbProxyCreds = {username:'sagedrive', configured:false, shares:[]};
 let _settingsTab = 'gdrive';
 let _oauthFormExpanded = false;
 let _loginLockoutTimer = null;
+let _torrentJobs = [];
+let _torrentSettings = {listen_port:6881, window_mb:24, max_connections:60, download_rate_limit_kbps:0, default_conflict_action:'keep_both', engine_available:true, engine_version:''};
+let _torrentFilter = 'all';
+let _torrentExpandedIds = new Set();
+let _torrentPollTimer = null;
+let _torrentModalState = null;
 let _currentFiles = [];
 let _selectedItems = new Map();
 let _mediaPlaylist = [];
@@ -1244,6 +1299,8 @@ async function initApp() {
   await refreshODStatus();
   await refreshFJStatus();
   await refreshFavorites();
+  await refreshTorrents(true);
+  startTorrentPolling();
   renderSidebar();
   renderTransferQueueUI();
   setView('welcome');
@@ -1700,6 +1757,7 @@ function setView(v, tab = null) {
   });
   renderSidebar();
   if (v === 'welcome') renderWelcome();
+  if (v === 'torrents') renderTorrentsView();
   if (v === 'settings') renderSettings();
 }
 
@@ -7012,9 +7070,10 @@ async function renderSettings() {
   await refreshODStatus();
   await refreshFJStatus();
   await refreshActivityLogs();
+  await refreshTorrents(true);
   try { smbProxyCreds = await apiJSON('/api/smb/proxy-credentials'); } catch(_) {}
 
-  const validTabs = ['gdrive', 'onedrive', 'filejump', 'smb', 'oauth', 'od_oauth', 'proxy', 'themes', 'system', 'logs'];
+  const validTabs = ['gdrive', 'onedrive', 'filejump', 'smb', 'oauth', 'od_oauth', 'proxy', 'torrents', 'themes', 'system', 'logs'];
   if (!validTabs.includes(_settingsTab)) {
     _settingsTab = 'gdrive';
   }
@@ -7026,6 +7085,7 @@ async function renderSettings() {
   const showOAuth     = _settingsTab === 'oauth';
   const showOdOAuth   = _settingsTab === 'od_oauth';
   const showProxy     = _settingsTab === 'proxy';
+  const showTorrents  = _settingsTab === 'torrents';
   const showThemes    = _settingsTab === 'themes';
   const showSystem    = _settingsTab === 'system';
   const showLogs      = _settingsTab === 'logs';
@@ -7141,6 +7201,9 @@ async function renderSettings() {
         </button>
         <button class="settings-tab ${_settingsTab==='proxy'?'active':''}" onclick="setSettingsTab('proxy')">
           <svg data-lucide="network"></svg> SMB Proxy
+        </button>
+        <button class="settings-tab ${_settingsTab==='torrents'?'active':''}" onclick="setSettingsTab('torrents')">
+          <svg data-lucide="magnet"></svg> Torrents
         </button>
         <button class="settings-tab ${_settingsTab==='themes'?'active':''}" onclick="setSettingsTab('themes')">
           <svg data-lucide="palette"></svg> Themes
@@ -7657,6 +7720,64 @@ async function renderSettings() {
             </button>
             <span id="smb-proxy-msg" style="font-size:var(--text-xs);color:var(--color-text-muted)"></span>
           </div>
+        </div>
+      </div>
+    </div>
+    ` : ''}
+
+    ${showTorrents ? `
+    <div class="card">
+      <div class="card-header">
+        <div style="display:flex;align-items:center;gap:var(--space-2)">
+          <svg data-lucide="magnet" width="16" height="16" style="color:var(--color-primary)"></svg>
+          <span class="card-title">Zero-Disk Torrent Engine</span>
+        </div>
+        <span style="font-size:var(--text-xs);font-family:var(--font-mono);color:${_torrentSettings.engine_available ? 'var(--color-success)' : 'var(--color-warning)'}">
+          ${_torrentSettings.engine_available ? `Engine Ready (${escHtml(_torrentSettings.engine_version || 'libtorrent')})` : 'libtorrent Not Installed'}
+        </span>
+      </div>
+      <div class="card-body" style="display:flex;flex-direction:column;gap:var(--space-4)">
+        <p style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.55">
+          Streams verified BitTorrent pieces sequentially straight into Google Drive or FileJump (1 file at a time) using a bounded sliding window and Linux hole-punching so container disk usage returns to 0 B. Peer traffic and cloud relays use the container's network connection; route Docker through a VPN container if swarm IP privacy is required.
+        </p>
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label" for="tor-set-port">BitTorrent Listen Port (TCP/UDP)</label>
+            <input class="form-input" id="tor-set-port" type="number" min="1024" max="65535" value="${Number(_torrentSettings.listen_port || 6881)}" ${_adminMode ? '' : 'disabled'} />
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="tor-set-window">Sliding Window Buffer Cap</label>
+            <select class="form-input" id="tor-set-window" ${_adminMode ? '' : 'disabled'}>
+              ${[16, 24, 32, 48].map(mb => `<option value="${mb}" ${Number(_torrentSettings.window_mb || 24) === mb ? 'selected' : ''}>${mb} MiB (keeps 1 GB container safe)</option>`).join('')}
+            </select>
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label" for="tor-set-peers">Max Peer Connections</label>
+            <input class="form-input" id="tor-set-peers" type="number" min="10" max="300" value="${Number(_torrentSettings.max_connections || 60)}" ${_adminMode ? '' : 'disabled'} />
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="tor-set-limit">Download Speed Cap (KB/s, 0 = unlimited)</label>
+            <input class="form-input" id="tor-set-limit" type="number" min="0" max="1000000" value="${Number(_torrentSettings.download_rate_limit_kbps || 0)}" ${_adminMode ? '' : 'disabled'} />
+          </div>
+        </div>
+        <div class="form-group" style="max-width:340px">
+          <label class="form-label" for="tor-set-conflict">Default Filename Conflict Policy</label>
+          <select class="form-input" id="tor-set-conflict" ${_adminMode ? '' : 'disabled'}>
+            <option value="keep_both" ${_torrentSettings.default_conflict_action === 'keep_both' ? 'selected' : ''}>Keep Both (append number)</option>
+            <option value="skip" ${_torrentSettings.default_conflict_action === 'skip' ? 'selected' : ''}>Skip Existing Files</option>
+            <option value="replace" ${_torrentSettings.default_conflict_action === 'replace' ? 'selected' : ''}>Replace Existing Files</option>
+          </select>
+        </div>
+        <div style="display:flex;align-items:center;gap:var(--space-3);flex-wrap:wrap">
+          <button class="btn btn-primary btn-sm" onclick="saveTorrentSettings()" ${_adminMode ? '' : 'disabled'}>
+            <svg data-lucide="save" width="14" height="14"></svg> Save Torrent Settings
+          </button>
+          <button class="btn btn-secondary btn-sm" onclick="setView('torrents')">
+            <svg data-lucide="magnet" width="14" height="14"></svg> Open Torrents Workspace
+          </button>
+          ${!_adminMode ? `<span style="font-size:var(--text-xs);color:var(--color-text-muted)">Unlock Administrator Functions above to modify engine settings.</span>` : ''}
         </div>
       </div>
     </div>
@@ -8553,6 +8674,785 @@ window.addEventListener('resize', checkMobile);
 
 if (location.hash === '#gdrive-connected' || location.hash === '#onedrive-connected') {
   history.replaceState(null,'',location.pathname);
+}
+
+// ── Embedded Zero-Disk Torrent-to-Cloud Manager UI ──────────────────────────
+function formatTorrentRate(bytesPerSec) {
+  const n = Number(bytesPerSec || 0);
+  if (!Number.isFinite(n) || n <= 0) return '0 B/s';
+  return `${formatSize(n)}/s`;
+}
+
+function formatTorrentEta(seconds) {
+  const s = Math.max(0, Math.round(Number(seconds || 0)));
+  if (!s) return '—';
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${sec}s`;
+  return `${sec}s`;
+}
+
+function updateSidebarTorrentCount() {
+  const el = document.getElementById('sidebar-torrents-count');
+  if (!el) return;
+  const activeCount = _torrentJobs.filter(j => ['streaming', 'fetching_metadata', 'queued'].includes(j.status)).length;
+  if (activeCount > 0) {
+    el.textContent = String(activeCount);
+    el.style.display = 'inline';
+  } else {
+    el.textContent = '';
+    el.style.display = 'none';
+  }
+}
+
+async function refreshTorrents(silent = false) {
+  if (!_token) return;
+  try {
+    const data = await apiJSON('/api/torrents');
+    if (data && Array.isArray(data.jobs)) {
+      _torrentJobs = data.jobs;
+    }
+    if (data && data.settings) {
+      _torrentSettings = data.settings;
+    }
+    updateSidebarTorrentCount();
+    if (_view === 'torrents') {
+      renderTorrentsView(true);
+    }
+  } catch (e) {
+    if (!silent && _view === 'torrents') {
+      toast('Failed to load torrents: ' + e.message, 'error');
+    }
+  }
+}
+
+function startTorrentPolling() {
+  if (_torrentPollTimer) clearTimeout(_torrentPollTimer);
+  const tick = async () => {
+    if (!_token) return;
+    const hasActive = _torrentJobs.some(j => ['streaming', 'fetching_metadata', 'queued'].includes(j.status));
+    if (_view === 'torrents' || hasActive) {
+      await refreshTorrents(true);
+    }
+    const nextMs = (_view === 'torrents' && hasActive) ? 1500 : (hasActive ? 3000 : (_view === 'torrents' ? 4000 : 12000));
+    _torrentPollTimer = setTimeout(tick, nextMs);
+  };
+  _torrentPollTimer = setTimeout(tick, 2000);
+}
+
+function setTorrentFilter(filterKey) {
+  _torrentFilter = filterKey || 'all';
+  renderTorrentsView(true);
+}
+
+function toggleTorrentExpand(jobId) {
+  if (_torrentExpandedIds.has(jobId)) {
+    _torrentExpandedIds.delete(jobId);
+  } else {
+    _torrentExpandedIds.add(jobId);
+  }
+  renderTorrentsView(true);
+}
+
+function getTorrentStatusInfo(status) {
+  switch (status) {
+    case 'streaming': return { label: 'Streaming to Cloud', cls: 'torrent-status-streaming', icon: 'radio' };
+    case 'fetching_metadata': return { label: 'Fetching Metadata', cls: 'torrent-status-streaming', icon: 'loader' };
+    case 'queued': return { label: 'Queued', cls: 'torrent-status-queued', icon: 'clock' };
+    case 'paused': return { label: 'Paused', cls: 'torrent-status-paused', icon: 'pause-circle' };
+    case 'completed': return { label: 'Completed', cls: 'torrent-status-completed', icon: 'check-circle-2' };
+    case 'error': return { label: 'Error', cls: 'torrent-status-error', icon: 'alert-triangle' };
+    default: return { label: String(status || 'Unknown'), cls: '', icon: 'circle' };
+  }
+}
+
+async function openTorrentDestination(jobId) {
+  const job = _torrentJobs.find(j => j.id === jobId);
+  if (!job || !job.destination) return;
+  const dest = job.destination;
+  if (dest.provider === 'gdrive') {
+    const acc = _gdAccounts.find(a => a.id === dest.account_id) || _gdAccounts[0];
+    if (!acc) { toast('Google Drive account is not connected', 'error'); return; }
+    _view = 'files';
+    _activeDrive = { type: 'gdrive', id: acc.id, name: acc.name, email: acc.email || '' };
+    _folderId = dest.folder_id || 'root';
+    _pathStack = [{ id: 'root', name: acc.name }];
+    if (_folderId !== 'root') {
+      _pathStack.push({ id: _folderId, name: (dest.folder_path || '/').split('/').filter(Boolean).pop() || 'Destination' });
+    }
+    document.querySelectorAll('.sidebar-item[data-view]').forEach(el => el.classList.remove('active'));
+    renderSidebar();
+    await loadGDriveFiles();
+  } else if (dest.provider === 'filejump') {
+    const acc = _fjAccounts.find(a => a.id === dest.account_id) || _fjAccounts[0];
+    if (!acc) { toast('FileJump account is not connected', 'error'); return; }
+    _view = 'files';
+    _activeDrive = { type: 'filejump', id: acc.id, name: acc.name, email: acc.email || '' };
+    _folderId = dest.folder_id || 'root';
+    _pathStack = [{ id: 'root', name: acc.name }];
+    if (_folderId !== 'root') {
+      _pathStack.push({ id: _folderId, name: (dest.folder_path || '/').split('/').filter(Boolean).pop() || 'Destination' });
+    }
+    document.querySelectorAll('.sidebar-item[data-view]').forEach(el => el.classList.remove('active'));
+    renderSidebar();
+    await loadFileJumpFiles();
+  }
+}
+
+async function torrentAction(jobId, action, fileIndex = null) {
+  if (!_adminMode) {
+    toast('Unlock Administrator Functions in Settings to manage torrents', 'error');
+    showAdminPinModal();
+    return;
+  }
+  try {
+    if (action === 'delete') {
+      const job = _torrentJobs.find(j => j.id === jobId);
+      const label = job ? job.name : 'this torrent';
+      showModal(`
+        <div class="modal-header">
+          <h3 class="modal-title">Remove Torrent</h3>
+          <button class="btn btn-ghost btn-icon" onclick="closeModal()"><svg data-lucide="x" width="16" height="16"></svg></button>
+        </div>
+        <div class="modal-body" style="font-size:var(--text-sm);color:var(--color-text-muted);line-height:1.5">
+          Remove <strong style="color:var(--color-text)">${escHtml(label)}</strong> from the queue and discard any transient sliding-window buffer? Files already uploaded to Google Drive or FileJump will remain intact.
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+          <button class="btn btn-danger" onclick="confirmDeleteTorrent('${escAttr(jobId)}')">Remove Torrent</button>
+        </div>
+      `);
+      return;
+    }
+    const opts = { method: 'POST' };
+    if (fileIndex !== null) opts.json = { file_index: fileIndex };
+    await apiJSON(`/api/torrents/${encodeURIComponent(jobId)}/${action}`, opts);
+    await refreshTorrents(true);
+    toast(action === 'pause' ? 'Torrent paused' : action === 'resume' ? 'Torrent resumed' : 'Retrying torrent transfer', 'success');
+  } catch (e) {
+    toast(e.message || 'Torrent action failed', 'error');
+  }
+}
+
+async function confirmDeleteTorrent(jobId) {
+  closeModal();
+  try {
+    await apiJSON(`/api/torrents/${encodeURIComponent(jobId)}`, { method: 'DELETE' });
+    _torrentExpandedIds.delete(jobId);
+    await refreshTorrents(true);
+    toast('Torrent removed and transient buffer cleared', 'success');
+  } catch (e) {
+    toast(e.message || 'Failed to remove torrent', 'error');
+  }
+}
+
+async function saveTorrentSettings() {
+  if (!_adminMode) {
+    showAdminPinModal();
+    return;
+  }
+  const payload = {
+    listen_port: parseInt(document.getElementById('tor-set-port')?.value || '6881', 10) || 6881,
+    window_mb: parseInt(document.getElementById('tor-set-window')?.value || '24', 10) || 24,
+    max_connections: parseInt(document.getElementById('tor-set-peers')?.value || '60', 10) || 60,
+    download_rate_limit_kbps: parseInt(document.getElementById('tor-set-limit')?.value || '0', 10) || 0,
+    default_conflict_action: document.getElementById('tor-set-conflict')?.value || 'keep_both',
+  };
+  try {
+    _torrentSettings = await apiJSON('/api/torrents/settings', { method: 'POST', json: payload });
+    toast('Torrent engine settings saved', 'success');
+    if (_view === 'settings') renderSettings();
+  } catch (e) {
+    toast('Failed to save torrent settings: ' + e.message, 'error');
+  }
+}
+
+function renderTorrentsView(isSilentRefresh = false) {
+  if (!isSilentRefresh) {
+    refreshTorrents(true);
+  }
+  setBreadcrumb([{ name: 'Torrents' }]);
+  setTopbarActions(`
+    <button class="btn btn-secondary btn-sm" onclick="setView('settings','torrents')" title="Configure zero-disk torrent engine settings">
+      <svg data-lucide="sliders" width="14" height="14"></svg> Engine Settings
+    </button>
+    <button class="btn btn-primary btn-sm" onclick="openAddTorrentModal()">
+      <svg data-lucide="plus" width="14" height="14"></svg> Add Torrent
+    </button>
+  `);
+
+  const counts = {
+    all: _torrentJobs.length,
+    active: _torrentJobs.filter(j => ['streaming', 'fetching_metadata'].includes(j.status)).length,
+    queued: _torrentJobs.filter(j => ['queued', 'paused'].includes(j.status)).length,
+    completed: _torrentJobs.filter(j => j.status === 'completed').length,
+    error: _torrentJobs.filter(j => j.status === 'error').length,
+  };
+  const filtered = _torrentJobs.filter(j => {
+    if (_torrentFilter === 'active') return ['streaming', 'fetching_metadata'].includes(j.status);
+    if (_torrentFilter === 'queued') return ['queued', 'paused'].includes(j.status);
+    if (_torrentFilter === 'completed') return j.status === 'completed';
+    if (_torrentFilter === 'error') return j.status === 'error';
+    return true;
+  });
+
+  const activeWindowBytes = _torrentJobs.reduce((acc, j) => acc + (['streaming', 'fetching_metadata'].includes(j.status) ? Number(j.stats?.window_bytes || 0) : 0), 0);
+  const windowCapMb = Number(_torrentSettings.window_mb || 24);
+  const engineWarn = _torrentSettings && _torrentSettings.engine_available === false
+    ? `<div style="padding:var(--space-3) var(--space-4);border:1px solid var(--color-warning);border-radius:var(--radius-md);background:color-mix(in oklab,var(--color-warning) 10%,transparent);font-size:var(--text-xs);color:var(--color-text);display:flex;align-items:center;gap:var(--space-2)">
+         <svg data-lucide="alert-triangle" width="16" height="16" style="color:var(--color-warning);flex-shrink:0"></svg>
+         <span><strong>libtorrent not detected in this container runtime.</strong> Rebuild the Docker image (<code style="font-family:var(--font-mono)">docker compose build</code>) to install native <code style="font-family:var(--font-mono)">python3-libtorrent</code>.</span>
+       </div>`
+    : '';
+
+  const rowsHtml = filtered.length
+    ? `<div class="torrent-list-panel">
+        ${filtered.map(job => {
+          const st = getTorrentStatusInfo(job.status);
+          const stats = job.stats || {};
+          const total = Number(stats.total_bytes || 0);
+          const uploaded = Number(stats.uploaded_bytes || 0);
+          const pct = job.status === 'completed' ? 100 : (total > 0 ? Math.min(100, Math.round((uploaded / total) * 1000) / 10) : 0);
+          const winBytes = Number(stats.window_bytes || 0);
+          const winCap = Number(stats.window_cap_bytes || (windowCapMb * 1024 * 1024));
+          const bufPct = total > 0 ? Math.min(100, pct + Math.round((winBytes / total) * 1000) / 10) : 0;
+          const dest = job.destination || {};
+          const providerLabel = dest.provider === 'filejump' ? 'FileJump' : 'Google Drive';
+          const selectedCount = (job.files || []).filter(f => f.selected !== false).length;
+          const isExpanded = _torrentExpandedIds.has(job.id);
+          const canPause = ['streaming', 'fetching_metadata', 'queued'].includes(job.status);
+          const canResume = job.status === 'paused';
+          const canRetry = job.status === 'error';
+
+          const filesDrawer = isExpanded ? `
+            <div class="torrent-files-drawer">
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:var(--space-2);margin-bottom:var(--space-2);font-size:11px;color:var(--color-text-muted)">
+                <span>Sequential 1-file-at-a-time stream · InfoHash <code style="font-family:var(--font-mono)">${escHtml((job.info_hash || '').slice(0, 16))}</code> · Policy: ${escHtml(dest.conflict_action || 'keep_both')}</span>
+                <button class="btn btn-ghost btn-sm" style="padding:3px 8px;font-size:11px" onclick="openTorrentDestination('${escAttr(job.id)}')">
+                  <svg data-lucide="folder-open" width="12" height="12"></svg> Open Destination
+                </button>
+              </div>
+              ${(job.files && job.files.length) ? job.files.map(f => {
+                const fSize = Number(f.size || 0);
+                const fUp = Number(f.uploaded_bytes || 0);
+                const fPct = f.status === 'completed' ? 100 : (fSize > 0 ? Math.min(100, Math.round((fUp / fSize) * 100)) : 0);
+                const fSt = getTorrentStatusInfo(f.status);
+                return `
+                  <div class="torrent-file-row">
+                    <div style="min-width:0">
+                      <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:${f.selected === false ? 'var(--color-text-faint)' : 'var(--color-text)'}" title="${escHtml(f.relative_path || f.name)}">
+                        ${escHtml(f.relative_path || f.name)}
+                      </div>
+                      ${f.error ? `<div style="font-size:11px;color:var(--color-error);margin-top:2px">${escHtml(f.error)}</div>` : ''}
+                    </div>
+                    <div class="torrent-meta-mono" style="text-align:right;color:var(--color-text-muted)">${formatSize(fSize)}</div>
+                    <div>
+                      <div class="torrent-prog-track"><div class="torrent-prog-cloud ${f.status === 'completed' ? 'done' : (f.status === 'error' ? 'err' : '')}" style="width:${fPct}%"></div></div>
+                    </div>
+                    <div class="torrent-meta-mono" style="text-align:right;color:var(--color-text-muted)">${f.selected === false ? 'Skipped' : `${fPct}%`}</div>
+                    <div style="display:flex;align-items:center;gap:4px">
+                      <span class="${fSt.cls}" style="font-size:11px">${escHtml(f.status === 'skipped' ? 'Skipped' : fSt.label)}</span>
+                      ${f.status === 'error' ? `<button class="btn btn-ghost btn-icon" style="width:24px;height:24px" onclick="torrentAction('${escAttr(job.id)}','retry',${Number(f.index)})" title="Retry this file"><svg data-lucide="rotate-cw" width="12" height="12"></svg></button>` : ''}
+                    </div>
+                  </div>
+                `;
+              }).join('') : `<div style="font-size:12px;color:var(--color-text-muted);padding:var(--space-2) 0">Waiting for swarm metadata to list files...</div>`}
+            </div>
+          ` : '';
+
+          return `
+            <div class="torrent-row">
+              <div class="torrent-row-main">
+                <div style="min-width:0;cursor:pointer" onclick="toggleTorrentExpand('${escAttr(job.id)}')">
+                  <div class="torrent-title" title="${escHtml(job.name)}">${escHtml(job.name)}</div>
+                  <div class="torrent-meta-inline">
+                    <span>${escHtml(dest.account_name || providerLabel)}</span>
+                    <span aria-hidden="true">·</span>
+                    <span>${escHtml(dest.folder_path || '/')}</span>
+                    <span aria-hidden="true">·</span>
+                    <span class="torrent-meta-mono">${selectedCount ? `${selectedCount} file${selectedCount === 1 ? '' : 's'}` : 'Resolving files'}</span>
+                    ${total > 0 ? `<span aria-hidden="true">·</span><span class="torrent-meta-mono">${formatSize(total)}</span>` : ''}
+                  </div>
+                  ${job.error_message ? `<div style="font-size:11px;color:var(--color-error);margin-top:4px">${escHtml(job.error_message)}</div>` : ''}
+                </div>
+
+                <div style="display:flex;flex-direction:column;gap:5px;min-width:0">
+                  <div class="torrent-prog-track" title="Solid: confirmed in cloud · Subtle: sliding-window buffer">
+                    <div class="torrent-prog-window" style="width:${bufPct}%"></div>
+                    <div class="torrent-prog-cloud ${job.status === 'completed' ? 'done' : (job.status === 'error' ? 'err' : '')}" style="width:${pct}%"></div>
+                  </div>
+                  <div class="torrent-meta-inline torrent-meta-mono" style="margin-top:0;justify-content:space-between">
+                    <span>${pct.toFixed(1)}% · ${formatSize(uploaded)} / ${total > 0 ? formatSize(total) : '—'}</span>
+                    <span>${job.status === 'streaming' ? `ETA ${formatTorrentEta(stats.eta_seconds)}` : ''}</span>
+                  </div>
+                </div>
+
+                <div style="display:flex;flex-direction:column;gap:3px;min-width:0">
+                  <div class="torrent-status-line ${st.cls}">
+                    <svg data-lucide="${st.icon}" width="13" height="13"></svg>
+                    <span>${escHtml(st.label)}</span>
+                  </div>
+                  <div class="torrent-meta-inline torrent-meta-mono" style="margin-top:0;font-size:11px">
+                    ${['streaming', 'fetching_metadata'].includes(job.status)
+                      ? `<span>↓ ${formatTorrentRate(stats.download_rate)} · ↑ ${formatTorrentRate(stats.upload_rate)}</span>`
+                      : `<span>Peers ${Number(stats.peers || 0)} · Buffer ${formatSize(winBytes)}</span>`}
+                  </div>
+                  ${['streaming', 'fetching_metadata'].includes(job.status)
+                    ? `<div class="torrent-meta-mono" style="font-size:11px;color:var(--color-text-faint)">Peers ${Number(stats.peers || 0)} (${Number(stats.seeds || 0)} seeds) · Window ${formatSize(winBytes)} / ${formatSize(winCap)}</div>`
+                    : ''}
+                </div>
+
+                <div class="torrent-actions">
+                  ${canPause ? `<button class="btn btn-ghost btn-icon" onclick="torrentAction('${escAttr(job.id)}','pause')" title="Pause transfer"><svg data-lucide="pause" width="15" height="15"></svg></button>` : ''}
+                  ${canResume ? `<button class="btn btn-ghost btn-icon" onclick="torrentAction('${escAttr(job.id)}','resume')" title="Resume transfer"><svg data-lucide="play" width="15" height="15"></svg></button>` : ''}
+                  ${canRetry ? `<button class="btn btn-ghost btn-icon" onclick="torrentAction('${escAttr(job.id)}','retry')" title="Retry transfer"><svg data-lucide="rotate-cw" width="15" height="15"></svg></button>` : ''}
+                  <button class="btn btn-ghost btn-icon" onclick="toggleTorrentExpand('${escAttr(job.id)}')" title="${isExpanded ? 'Hide files' : 'Inspect files'}">
+                    <svg data-lucide="${isExpanded ? 'chevron-up' : 'chevron-down'}" width="15" height="15"></svg>
+                  </button>
+                  <button class="btn btn-ghost btn-icon" onclick="openTorrentDestination('${escAttr(job.id)}')" title="Open destination folder">
+                    <svg data-lucide="folder-open" width="15" height="15"></svg>
+                  </button>
+                  <button class="btn btn-ghost btn-icon" style="color:var(--color-error)" onclick="torrentAction('${escAttr(job.id)}','delete')" title="Remove torrent">
+                    <svg data-lucide="trash-2" width="15" height="15"></svg>
+                  </button>
+                </div>
+              </div>
+              ${filesDrawer}
+            </div>
+          `;
+        }).join('')}
+      </div>`
+    : `<div class="empty-state" style="border:1px dashed var(--color-border);border-radius:var(--radius-lg);padding:var(--space-10) var(--space-4)">
+         <svg data-lucide="magnet" width="44" height="44" style="color:var(--color-primary)"></svg>
+         <h3 style="font-size:var(--text-base);margin-top:var(--space-2)">${_torrentJobs.length ? 'No matching torrents in this filter' : 'Zero-Disk Torrent-to-Cloud Streaming'}</h3>
+         <p style="font-size:var(--text-xs);color:var(--color-text-muted);max-width:52ch;line-height:1.55">
+           ${_torrentJobs.length
+             ? 'Switch filters above to view other torrent transfers.'
+             : 'Paste a magnet link or upload a .torrent file to stream verified pieces straight into Google Drive or FileJump with a bounded sliding-window buffer and zero persistent disk accumulation.'}
+         </p>
+         ${!_torrentJobs.length ? `<button class="btn btn-primary btn-sm" style="margin-top:var(--space-2)" onclick="openAddTorrentModal()"><svg data-lucide="plus" width="14" height="14"></svg> Add First Torrent</button>` : ''}
+       </div>`;
+
+  document.getElementById('content-area').innerHTML = `
+    <div class="torrent-wrap">
+      ${engineWarn}
+      <div class="torrent-toolbar">
+        <div class="torrent-filter-bar" role="tablist" aria-label="Filter torrents">
+          <button class="torrent-filter-btn ${_torrentFilter==='all'?'active':''}" onclick="setTorrentFilter('all')">All (${counts.all})</button>
+          <button class="torrent-filter-btn ${_torrentFilter==='active'?'active':''}" onclick="setTorrentFilter('active')">Active (${counts.active})</button>
+          <button class="torrent-filter-btn ${_torrentFilter==='queued'?'active':''}" onclick="setTorrentFilter('queued')">Queued (${counts.queued})</button>
+          <button class="torrent-filter-btn ${_torrentFilter==='completed'?'active':''}" onclick="setTorrentFilter('completed')">Completed (${counts.completed})</button>
+          <button class="torrent-filter-btn ${_torrentFilter==='error'?'active':''}" onclick="setTorrentFilter('error')">Failed (${counts.error})</button>
+        </div>
+        <div class="torrent-summary-line">
+          <span>Zero-Disk Stream</span>
+          <span aria-hidden="true">·</span>
+          <span>Window ${formatSize(activeWindowBytes)} / ${windowCapMb} MB</span>
+          <span aria-hidden="true">·</span>
+          <span>1 File at a Time</span>
+        </div>
+      </div>
+      ${rowsHtml}
+    </div>
+  `;
+  lucide.createIcons();
+}
+
+function openAddTorrentModal() {
+  if (!_adminMode) {
+    toast('Unlock Administrator Functions in Settings to add torrents', 'error');
+    showAdminPinModal();
+    return;
+  }
+  const hasGD = _gdAccounts.length > 0;
+  const hasFJ = _fjAccounts.length > 0;
+  if (!hasGD && !hasFJ) {
+    toast('Connect a Google Drive or FileJump account in Settings first', 'error');
+    setView('settings', 'gdrive');
+    return;
+  }
+  const defaultProvider = hasGD ? 'gdrive' : 'filejump';
+  const defaultAcc = defaultProvider === 'gdrive' ? _gdAccounts[0] : _fjAccounts[0];
+  _torrentModalState = {
+    step: 1,
+    sourceMode: 'magnet',
+    magnetUri: '',
+    torrentFile: null,
+    provider: defaultProvider,
+    accountId: defaultAcc.id,
+    accountName: defaultAcc.name,
+    folderStack: [{ id: 'root', name: '/' }],
+    folderItems: [],
+    folderLoading: false,
+    conflictAction: _torrentSettings.default_conflict_action || 'keep_both',
+    inspected: null,
+    selectedIndices: new Set(),
+    busy: false,
+    error: '',
+  };
+  renderAddTorrentModal();
+  loadTorrentModalFolders();
+}
+
+async function loadTorrentModalFolders() {
+  const st = _torrentModalState;
+  if (!st) return;
+  st.folderLoading = true;
+  renderAddTorrentModal();
+  try {
+    const cur = st.folderStack[st.folderStack.length - 1] || { id: 'root', name: '/' };
+    const ep = st.provider === 'gdrive'
+      ? `/api/gdrive/files?folder=${encodeURIComponent(cur.id)}&account_id=${encodeURIComponent(st.accountId)}`
+      : `/api/filejump/files?folder=${encodeURIComponent(cur.id)}&account_id=${encodeURIComponent(st.accountId)}`;
+    const items = await apiJSON(ep);
+    st.folderItems = (Array.isArray(items) ? items : []).filter(i => i.type === 'folder');
+  } catch (e) {
+    st.folderItems = [];
+    st.error = 'Could not list folders: ' + e.message;
+  } finally {
+    st.folderLoading = false;
+    renderAddTorrentModal();
+  }
+}
+
+function torrentModalSetSource(mode) {
+  if (!_torrentModalState) return;
+  _torrentModalState.sourceMode = mode;
+  _torrentModalState.error = '';
+  renderAddTorrentModal();
+}
+
+function torrentModalSetProvider(provider) {
+  const st = _torrentModalState;
+  if (!st) return;
+  const list = provider === 'gdrive' ? _gdAccounts : _fjAccounts;
+  if (!list.length) return;
+  st.provider = provider;
+  st.accountId = list[0].id;
+  st.accountName = list[0].name;
+  st.folderStack = [{ id: 'root', name: '/' }];
+  st.error = '';
+  loadTorrentModalFolders();
+}
+
+function torrentModalSetAccount(accountId) {
+  const st = _torrentModalState;
+  if (!st) return;
+  const list = st.provider === 'gdrive' ? _gdAccounts : _fjAccounts;
+  const acc = list.find(a => a.id === accountId) || list[0];
+  if (!acc) return;
+  st.accountId = acc.id;
+  st.accountName = acc.name;
+  st.folderStack = [{ id: 'root', name: '/' }];
+  st.error = '';
+  loadTorrentModalFolders();
+}
+
+function torrentModalOpenFolder(id, name) {
+  const st = _torrentModalState;
+  if (!st) return;
+  st.folderStack.push({ id, name });
+  loadTorrentModalFolders();
+}
+
+function torrentModalFolderUp() {
+  const st = _torrentModalState;
+  if (!st || st.folderStack.length <= 1) return;
+  st.folderStack.pop();
+  loadTorrentModalFolders();
+}
+
+function torrentModalPickFile(fileObj) {
+  const st = _torrentModalState;
+  if (!st || !fileObj) return;
+  st.torrentFile = fileObj;
+  st.error = '';
+  renderAddTorrentModal();
+}
+
+async function torrentModalInspectNext() {
+  const st = _torrentModalState;
+  if (!st || st.busy) return;
+  st.error = '';
+  if (st.sourceMode === 'magnet') {
+    const inp = document.getElementById('tor-magnet-input');
+    st.magnetUri = (inp ? inp.value : st.magnetUri || '').trim();
+    if (!st.magnetUri) {
+      st.error = 'Paste a valid magnet:? URI first';
+      renderAddTorrentModal();
+      return;
+    }
+  } else if (!st.torrentFile) {
+    st.error = 'Select or drop a .torrent file first';
+    renderAddTorrentModal();
+    return;
+  }
+
+  st.busy = true;
+  renderAddTorrentModal();
+  try {
+    let info;
+    if (st.sourceMode === 'file') {
+      const fd = new FormData();
+      fd.append('file', st.torrentFile, st.torrentFile.name);
+      const res = await fetch(`${API}/api/torrents/inspect`, {
+        method: 'POST',
+        headers: _token ? { Authorization: `Bearer ${_token}` } : {},
+        body: fd,
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `Inspect failed (${res.status})`);
+      info = data;
+    } else {
+      info = await apiJSON('/api/torrents/inspect', { method: 'POST', json: { magnet_uri: st.magnetUri } });
+    }
+    st.inspected = info;
+    st.selectedIndices = new Set((info.files || []).map(f => Number(f.index)));
+    st.step = 2;
+  } catch (e) {
+    st.error = e.message || 'Failed to inspect torrent source';
+  } finally {
+    st.busy = false;
+    renderAddTorrentModal();
+  }
+}
+
+function torrentModalToggleFile(idx, checked) {
+  const st = _torrentModalState;
+  if (!st) return;
+  if (checked) st.selectedIndices.add(Number(idx));
+  else st.selectedIndices.delete(Number(idx));
+  renderAddTorrentModal();
+}
+
+function torrentModalToggleAllFiles(selectAll) {
+  const st = _torrentModalState;
+  if (!st || !st.inspected) return;
+  if (selectAll) {
+    st.selectedIndices = new Set((st.inspected.files || []).map(f => Number(f.index)));
+  } else {
+    st.selectedIndices.clear();
+  }
+  renderAddTorrentModal();
+}
+
+async function torrentModalSubmit() {
+  const st = _torrentModalState;
+  if (!st || st.busy) return;
+  const files = (st.inspected && st.inspected.files) || [];
+  if (files.length && st.selectedIndices.size === 0) {
+    st.error = 'Select at least one file to stream';
+    renderAddTorrentModal();
+    return;
+  }
+  const curFolder = st.folderStack[st.folderStack.length - 1] || { id: 'root', name: '/' };
+  const folderPath = st.folderStack.length > 1
+    ? '/' + st.folderStack.slice(1).map(s => s.name).join('/')
+    : '/';
+  const destination = {
+    provider: st.provider,
+    account_id: st.accountId,
+    account_name: st.accountName,
+    folder_id: curFolder.id,
+    folder_path: folderPath,
+    conflict_action: st.conflictAction,
+  };
+
+  st.busy = true;
+  st.error = '';
+  renderAddTorrentModal();
+  try {
+    if (st.sourceMode === 'file' && st.torrentFile) {
+      const fd = new FormData();
+      fd.append('file', st.torrentFile, st.torrentFile.name);
+      fd.append('destination', JSON.stringify(destination));
+      if (files.length) fd.append('selected_indices', JSON.stringify(Array.from(st.selectedIndices)));
+      const res = await fetch(`${API}/api/torrents`, {
+        method: 'POST',
+        headers: _token ? { Authorization: `Bearer ${_token}` } : {},
+        body: fd,
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `Add torrent failed (${res.status})`);
+    } else {
+      await apiJSON('/api/torrents', {
+        method: 'POST',
+        json: {
+          magnet_uri: st.magnetUri,
+          destination,
+          selected_indices: files.length ? Array.from(st.selectedIndices) : null,
+        },
+      });
+    }
+    _torrentModalState = null;
+    closeModal();
+    toast('Torrent queued for zero-disk cloud streaming', 'success');
+    if (_view !== 'torrents') setView('torrents');
+    await refreshTorrents(true);
+  } catch (e) {
+    st.error = e.message || 'Failed to add torrent';
+    st.busy = false;
+    renderAddTorrentModal();
+  }
+}
+
+function renderAddTorrentModal() {
+  const st = _torrentModalState;
+  if (!st) return;
+  const accounts = st.provider === 'gdrive' ? _gdAccounts : _fjAccounts;
+  const folderPath = st.folderStack.length > 1 ? '/' + st.folderStack.slice(1).map(s => s.name).join('/') : '/';
+
+  if (st.step === 1) {
+    showModal(`
+      <div class="modal-header">
+        <h3 class="modal-title">Add Torrent · Step 1 of 2</h3>
+        <button class="btn btn-ghost btn-icon" onclick="_torrentModalState=null;closeModal()"><svg data-lucide="x" width="16" height="16"></svg></button>
+      </div>
+      <div class="modal-body" style="display:flex;flex-direction:column;gap:var(--space-4)">
+        <div class="torrent-filter-bar" style="align-self:flex-start">
+          <button type="button" class="torrent-filter-btn ${st.sourceMode==='magnet'?'active':''}" onclick="torrentModalSetSource('magnet')">Magnet Link</button>
+          <button type="button" class="torrent-filter-btn ${st.sourceMode==='file'?'active':''}" onclick="torrentModalSetSource('file')">.torrent File</button>
+        </div>
+
+        ${st.sourceMode === 'magnet' ? `
+          <div class="form-group">
+            <label class="form-label" for="tor-magnet-input">Magnet URI</label>
+            <textarea class="form-input" id="tor-magnet-input" rows="3" style="font-family:var(--font-mono);font-size:12px;resize:vertical" placeholder="magnet:?xt=urn:btih:...&dn=Example" oninput="if(_torrentModalState)_torrentModalState.magnetUri=this.value">${escHtml(st.magnetUri)}</textarea>
+          </div>
+        ` : `
+          <div class="torrent-dropzone" id="tor-file-dropzone"
+               onclick="document.getElementById('tor-file-input').click()"
+               ondragover="event.preventDefault();this.classList.add('dragover')"
+               ondragleave="this.classList.remove('dragover')"
+               ondrop="event.preventDefault();this.classList.remove('dragover');if(event.dataTransfer.files[0])torrentModalPickFile(event.dataTransfer.files[0])">
+            <input type="file" id="tor-file-input" accept=".torrent,application/x-bittorrent" style="display:none" onchange="if(this.files[0])torrentModalPickFile(this.files[0])" />
+            <svg data-lucide="upload-cloud" width="26" height="26" style="margin:0 auto var(--space-2);color:var(--color-primary)"></svg>
+            <div style="font-size:var(--text-sm);font-weight:600;color:var(--color-text)">
+              ${st.torrentFile ? escHtml(st.torrentFile.name) : 'Drop a .torrent file here or click to browse'}
+            </div>
+            <div style="font-size:11px;color:var(--color-text-muted);margin-top:4px">
+              ${st.torrentFile ? `${formatSize(st.torrentFile.size)} · Ready to inspect file tree` : 'Only metadata is inspected — media files stream straight to cloud'}
+            </div>
+          </div>
+        `}
+
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label">Destination Cloud</label>
+            <select class="form-input" onchange="torrentModalSetProvider(this.value)">
+              ${_gdAccounts.length ? `<option value="gdrive" ${st.provider==='gdrive'?'selected':''}>Google Drive (${_gdAccounts.length})</option>` : ''}
+              ${_fjAccounts.length ? `<option value="filejump" ${st.provider==='filejump'?'selected':''}>FileJump (${_fjAccounts.length})</option>` : ''}
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Account</label>
+            <select class="form-input" onchange="torrentModalSetAccount(this.value)">
+              ${accounts.map(a => `<option value="${escAttr(a.id)}" ${a.id===st.accountId?'selected':''}>${escHtml(a.name)}</option>`).join('')}
+            </select>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+            <label class="form-label" style="margin:0">Destination Folder: <code style="font-family:var(--font-mono);color:var(--color-primary)">${escHtml(folderPath)}</code></label>
+            ${st.folderStack.length > 1 ? `<button type="button" class="btn btn-ghost btn-sm" style="padding:2px 8px;font-size:11px" onclick="torrentModalFolderUp()">Up one level</button>` : ''}
+          </div>
+          <div class="torrent-folder-browser">
+            ${st.folderLoading
+              ? `<div style="padding:12px;font-size:12px;color:var(--color-text-muted)">Loading folders...</div>`
+              : (st.folderItems.length
+                  ? st.folderItems.map(f => `
+                      <div class="torrent-folder-item" onclick="torrentModalOpenFolder('${escAttr(f.id)}','${escAttr(f.name)}')">
+                        <span style="display:flex;align-items:center;gap:8px;min-width:0"><svg data-lucide="folder" width="14" height="14" style="color:var(--color-primary);flex-shrink:0"></svg><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(f.name)}</span></span>
+                        <svg data-lucide="chevron-right" width="14" height="14" style="color:var(--color-text-faint);flex-shrink:0"></svg>
+                      </div>`).join('')
+                  : `<div style="padding:12px;font-size:12px;color:var(--color-text-faint)">No subfolders here — files will stream directly into ${escHtml(folderPath)}</div>`)}
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label">If a file with the same name exists</label>
+          <select class="form-input" onchange="if(_torrentModalState)_torrentModalState.conflictAction=this.value">
+            <option value="keep_both" ${st.conflictAction==='keep_both'?'selected':''}>Keep Both (Recommended)</option>
+            <option value="skip" ${st.conflictAction==='skip'?'selected':''}>Skip Existing</option>
+            <option value="replace" ${st.conflictAction==='replace'?'selected':''}>Replace Existing</option>
+          </select>
+        </div>
+
+        <div style="font-size:11px;color:var(--color-text-muted);line-height:1.45">
+          Zero-disk stream: peak container scratch stays within ${Number(_torrentSettings.window_mb || 24)} MiB and releases immediately after cloud upload. Peer traffic uses the container's network connection.
+        </div>
+
+        ${st.error ? `<div style="font-size:var(--text-xs);color:var(--color-error)">${escHtml(st.error)}</div>` : ''}
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="_torrentModalState=null;closeModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="torrentModalInspectNext()" ${st.busy ? 'disabled' : ''}>
+          ${st.busy ? 'Inspecting...' : 'Inspect & Continue'}
+        </button>
+      </div>
+    `, 'max-width:600px;width:95vw');
+    return;
+  }
+
+  const info = st.inspected || {};
+  const files = info.files || [];
+  const selectedBytes = files.filter(f => st.selectedIndices.has(Number(f.index))).reduce((a, f) => a + Number(f.size || 0), 0);
+
+  showModal(`
+    <div class="modal-header">
+      <h3 class="modal-title">Review &amp; Select Files · Step 2 of 2</h3>
+      <button class="btn btn-ghost btn-icon" onclick="_torrentModalState=null;closeModal()"><svg data-lucide="x" width="16" height="16"></svg></button>
+    </div>
+    <div class="modal-body" style="display:flex;flex-direction:column;gap:var(--space-4)">
+      <div>
+        <div style="font-weight:600;font-size:var(--text-sm);color:var(--color-text)">${escHtml(info.name || 'Torrent')}</div>
+        <div class="torrent-meta-inline torrent-meta-mono">
+          <span>${escHtml(st.accountName)}</span>
+          <span aria-hidden="true">·</span>
+          <span>${escHtml(folderPath)}</span>
+          <span aria-hidden="true">·</span>
+          <span>${escHtml((info.info_hash || '').slice(0, 16))}</span>
+        </div>
+      </div>
+
+      ${files.length ? `
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:var(--space-2);font-size:12px">
+          <span class="torrent-meta-mono" style="color:var(--color-text-muted)">${st.selectedIndices.size} of ${files.length} files selected (${formatSize(selectedBytes)})</span>
+          <div style="display:flex;gap:var(--space-2)">
+            <button type="button" class="btn btn-ghost btn-sm" style="padding:2px 8px;font-size:11px" onclick="torrentModalToggleAllFiles(true)">Select All</button>
+            <button type="button" class="btn btn-ghost btn-sm" style="padding:2px 8px;font-size:11px" onclick="torrentModalToggleAllFiles(false)">Deselect All</button>
+          </div>
+        </div>
+        <div class="torrent-checklist">
+          ${files.map(f => {
+            const checked = st.selectedIndices.has(Number(f.index));
+            return `
+              <label class="torrent-check-row" style="cursor:pointer">
+                <input type="checkbox" ${checked ? 'checked' : ''} onchange="torrentModalToggleFile(${Number(f.index)}, this.checked)" />
+                <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(f.relative_path || f.name)}">${escHtml(f.relative_path || f.name)}</span>
+                <span class="torrent-meta-mono" style="color:var(--color-text-muted);flex-shrink:0">${formatSize(f.size)}</span>
+              </label>
+            `;
+          }).join('')}
+        </div>
+      ` : `
+        <div style="padding:var(--space-4);border:1px solid var(--color-border);border-radius:var(--radius-md);background:var(--color-surface-2);font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.55">
+          Magnet link validated (<code style="font-family:var(--font-mono)">${escHtml((info.info_hash || '').slice(0, 20))}</code>). SageDrive will connect to peers via DHT/trackers to resolve the file list automatically, then stream every file sequentially straight to <strong style="color:var(--color-text)">${escHtml(st.accountName)} (${escHtml(folderPath)})</strong>.
+        </div>
+      `}
+
+      ${st.error ? `<div style="font-size:var(--text-xs);color:var(--color-error)">${escHtml(st.error)}</div>` : ''}
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="_torrentModalState.step=1;_torrentModalState.error='';renderAddTorrentModal()">Back</button>
+      <button class="btn btn-primary" onclick="torrentModalSubmit()" ${st.busy ? 'disabled' : ''}>
+        ${st.busy ? 'Starting...' : 'Start Streaming to Cloud'}
+      </button>
+    </div>
+  `, 'max-width:620px;width:95vw');
 }
 
 (async () => {

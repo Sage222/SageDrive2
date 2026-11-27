@@ -10,7 +10,7 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
-import auth, smb_manager, gdrive_manager, onedrive_manager, filejump_manager
+import auth, smb_manager, gdrive_manager, onedrive_manager, filejump_manager, torrent_manager
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 CORS(app, supports_credentials=True, expose_headers=["Content-Length", "Content-Range", "Accept-Ranges", "Content-Disposition"])
@@ -4501,6 +4501,165 @@ def delete_favorite_folder():
     )
     return jsonify({"ok": True, "favorites": favs})
 
+
+# ── Embedded Zero-Disk Torrent-to-Cloud Manager API ──────────────────────────
+def _get_torrent_mgr():
+    return torrent_manager.get_manager(activity_logger=add_activity_log)
+
+
+@app.get("/api/torrents")
+@auth.require_auth
+def list_torrents():
+    mgr = _get_torrent_mgr()
+    settings = mgr.get_settings()
+    return jsonify({
+        "jobs": mgr.list_jobs(),
+        "settings": settings,
+        "engine_available": settings.get("engine_available", False),
+        "engine_version": settings.get("engine_version", ""),
+    })
+
+
+@app.get("/api/torrents/settings")
+@auth.require_auth
+def get_torrent_settings():
+    return jsonify(_get_torrent_mgr().get_settings())
+
+
+@app.post("/api/torrents/settings")
+@auth.require_admin
+def save_torrent_settings():
+    body = request.get_json(force=True) or {}
+    uname = (getattr(request, "user", None) or {}).get("username", "admin")
+    try:
+        updated = _get_torrent_mgr().update_settings(body, user=uname)
+        return jsonify(updated)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.post("/api/torrents/inspect")
+@auth.require_admin
+def inspect_torrent():
+    try:
+        if "file" in request.files:
+            f = request.files["file"]
+            raw = f.read(torrent_manager.MAX_TORRENT_FILE_BYTES + 1)
+            if len(raw) > torrent_manager.MAX_TORRENT_FILE_BYTES:
+                return jsonify({"error": "Torrent file exceeds 15 MiB limit"}), 400
+            info = _get_torrent_mgr().inspect_source(torrent_bytes=raw)
+            return jsonify(info)
+        body = request.get_json(silent=True) or {}
+        magnet_uri = body.get("magnet_uri") or request.form.get("magnet_uri") or ""
+        info = _get_torrent_mgr().inspect_source(magnet_uri=magnet_uri)
+        return jsonify(info)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.post("/api/torrents")
+@auth.require_admin
+def create_torrent_job():
+    uname = (getattr(request, "user", None) or {}).get("username", "admin")
+    try:
+        torrent_bytes = None
+        magnet_uri = None
+        destination = {}
+        selected_indices = None
+
+        if request.content_type and "multipart/form-data" in request.content_type.lower():
+            if "file" in request.files:
+                f = request.files["file"]
+                torrent_bytes = f.read(torrent_manager.MAX_TORRENT_FILE_BYTES + 1)
+                if len(torrent_bytes) > torrent_manager.MAX_TORRENT_FILE_BYTES:
+                    return jsonify({"error": "Torrent file exceeds 15 MiB limit"}), 400
+            magnet_uri = request.form.get("magnet_uri") or None
+            dest_raw = request.form.get("destination")
+            if dest_raw:
+                destination = json.loads(dest_raw)
+            sel_raw = request.form.get("selected_indices")
+            if sel_raw:
+                selected_indices = json.loads(sel_raw)
+        else:
+            body = request.get_json(force=True) or {}
+            magnet_uri = body.get("magnet_uri") or None
+            destination = body.get("destination") or {}
+            selected_indices = body.get("selected_indices")
+
+        job = _get_torrent_mgr().create_job(
+            destination=destination,
+            magnet_uri=magnet_uri,
+            torrent_bytes=torrent_bytes,
+            selected_indices=selected_indices,
+            created_by=uname,
+        )
+        return jsonify(job), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.get("/api/torrents/<job_id>")
+@auth.require_auth
+def get_torrent_job(job_id):
+    job = _get_torrent_mgr().get_job(job_id)
+    if not job:
+        return jsonify({"error": "Torrent job not found"}), 404
+    return jsonify(job)
+
+
+@app.post("/api/torrents/<job_id>/pause")
+@auth.require_admin
+def pause_torrent_job(job_id):
+    uname = (getattr(request, "user", None) or {}).get("username", "admin")
+    try:
+        return jsonify(_get_torrent_mgr().pause_job(job_id, user=uname))
+    except KeyError:
+        return jsonify({"error": "Torrent job not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.post("/api/torrents/<job_id>/resume")
+@auth.require_admin
+def resume_torrent_job(job_id):
+    uname = (getattr(request, "user", None) or {}).get("username", "admin")
+    try:
+        return jsonify(_get_torrent_mgr().resume_job(job_id, user=uname))
+    except KeyError:
+        return jsonify({"error": "Torrent job not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.post("/api/torrents/<job_id>/retry")
+@auth.require_admin
+def retry_torrent_job(job_id):
+    uname = (getattr(request, "user", None) or {}).get("username", "admin")
+    body = request.get_json(silent=True) or {}
+    file_index = body.get("file_index")
+    try:
+        return jsonify(_get_torrent_mgr().retry_job(job_id, file_index=file_index, user=uname))
+    except KeyError:
+        return jsonify({"error": "Torrent job not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.delete("/api/torrents/<job_id>")
+@auth.require_admin
+def delete_torrent_job(job_id):
+    uname = (getattr(request, "user", None) or {}).get("username", "admin")
+    try:
+        _get_torrent_mgr().delete_job(job_id, user=uname)
+        return jsonify({"ok": True})
+    except KeyError:
+        return jsonify({"error": "Torrent job not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+# Initialize torrent manager on startup so paused jobs & scratch cleanup run cleanly
+_get_torrent_mgr()
 
 # Trigger initial multi-drive SMB proxy reconciliation in background on startup
 threading.Thread(target=lambda: _reconcile_smb_proxy(), daemon=True).start()

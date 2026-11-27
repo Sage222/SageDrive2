@@ -268,6 +268,7 @@ with open('/etc/samba/smb.conf', 'w') as f:
 import shutil
 shutil.rmtree("/root/.cache/rclone", ignore_errors=True)
 shutil.rmtree("/app/data/upload_sessions", ignore_errors=True)
+shutil.rmtree("/tmp/sagedrive_torrents", ignore_errors=True)
 
 mounted_count = 0
 for idx, acc in enumerate(accounts):

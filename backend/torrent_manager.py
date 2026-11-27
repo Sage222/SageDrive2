@@ -1,6 +1,7 @@
 import base64
 import ctypes
 import hashlib
+import importlib
 import json
 import mimetypes
 import os
@@ -8,6 +9,9 @@ import posixpath
 import re
 import secrets
 import shutil
+import site
+import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -17,14 +21,36 @@ from urllib.parse import parse_qs, unquote, urlparse
 import filejump_manager
 import gdrive_manager
 
-try:
-    import libtorrent as lt
-    LIBTORRENT_AVAILABLE = True
-    LIBTORRENT_VERSION = getattr(lt, "__version__", getattr(lt, "version", "available"))
-except Exception:
-    lt = None
-    LIBTORRENT_AVAILABLE = False
-    LIBTORRENT_VERSION = None
+lt = None
+LIBTORRENT_AVAILABLE = False
+LIBTORRENT_VERSION = None
+
+
+def _ensure_dist_packages_on_path():
+    """Ensure Debian/Ubuntu system dist-packages are visible to Python inside Docker."""
+    for candidate in ("/usr/lib/python3/dist-packages", "/usr/local/lib/python3/dist-packages"):
+        if os.path.isdir(candidate) and candidate not in sys.path:
+            sys.path.append(candidate)
+
+
+def _try_import_libtorrent():
+    global lt, LIBTORRENT_AVAILABLE, LIBTORRENT_VERSION
+    _ensure_dist_packages_on_path()
+    try:
+        importlib.invalidate_caches()
+        mod = importlib.import_module("libtorrent")
+        lt = mod
+        LIBTORRENT_AVAILABLE = True
+        LIBTORRENT_VERSION = str(getattr(mod, "__version__", getattr(mod, "version", "available")) or "available")
+        return True
+    except Exception:
+        lt = None
+        LIBTORRENT_AVAILABLE = False
+        LIBTORRENT_VERSION = None
+        return False
+
+
+_try_import_libtorrent()
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 TORRENTS_STATE_FILE = DATA_DIR / "torrents_state.json"
@@ -35,10 +61,31 @@ SCRATCH_ROOT = Path(os.environ.get("TORRENT_SCRATCH_DIR", "/tmp/sagedrive_torren
 MAX_TORRENT_FILE_BYTES = 15 * 1024 * 1024  # 15 MiB cap for .torrent metadata uploads
 DEFAULT_SETTINGS = {
     "listen_port": 6881,
+    "listen_interface": "0.0.0.0",
     "window_mb": 24,
     "max_connections": 60,
-    "download_rate_limit_kbps": 0,  # 0 = unlimited
+    "max_uploads": 4,
+    "download_rate_limit_kbps": 0,    # 0 = unlimited
+    "upload_rate_limit_kbps": 256,    # 0 = unlimited; modest default avoids starving cloud uploads
     "default_conflict_action": "keep_both",
+    "enable_dht": True,
+    "enable_pex": True,
+    "enable_lsd": False,
+    "enable_upnp": True,
+    "enable_natpmp": True,
+    "enable_utp": True,
+    "encryption_mode": "enabled",     # disabled | enabled | forced
+    "anonymous_mode": False,
+    "extra_trackers": "",
+    "proxy_type": "none",             # none | socks5 | socks4 | http
+    "proxy_hostname": "",
+    "proxy_port": 1080,
+    "proxy_username": "",
+    "proxy_password": "",
+    "proxy_peer_connections": True,
+    "proxy_tracker_connections": True,
+    "proxy_hostnames": True,
+    "force_proxy": False,
 }
 
 # Linux fallocate flags for releasing already-streamed blocks back to the OS
@@ -451,6 +498,7 @@ class _ActiveJobStreamer:
 class TorrentManager:
     def __init__(self, activity_logger=None):
         self._lock = threading.RLock()
+        self._install_lock = threading.Lock()
         self._activity_logger = activity_logger
         self._jobs = []
         self._settings = dict(DEFAULT_SETTINGS)
@@ -479,6 +527,38 @@ class TorrentManager:
             except Exception:
                 pass
 
+    @staticmethod
+    def _as_bool(val, default=False):
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, (int, float)):
+            return bool(val)
+        if isinstance(val, str):
+            low = val.strip().lower()
+            if low in ("1", "true", "yes", "on"):
+                return True
+            if low in ("0", "false", "no", "off"):
+                return False
+        return bool(default)
+
+    @staticmethod
+    def _parse_extra_trackers(raw_text: str):
+        out = []
+        seen = set()
+        for line in str(raw_text or "").replace(",", "\n").splitlines():
+            url = line.strip()
+            if not url:
+                continue
+            low = url.lower()
+            if not (low.startswith("udp://") or low.startswith("http://") or low.startswith("https://") or low.startswith("wss://") or low.startswith("ws://")):
+                continue
+            if url not in seen:
+                seen.add(url)
+                out.append(url)
+            if len(out) >= 50:
+                break
+        return out
+
     def _load_settings(self):
         if TORRENT_SETTINGS_FILE.exists():
             try:
@@ -486,30 +566,110 @@ class TorrentManager:
                 if isinstance(raw, dict):
                     merged = dict(DEFAULT_SETTINGS)
                     merged.update(raw)
-                    self._settings = self._validate_settings(merged)
+                    self._settings = self._validate_settings(merged, existing=raw)
                     return
             except Exception:
                 pass
         self._settings = dict(DEFAULT_SETTINGS)
 
-    def _validate_settings(self, raw: dict):
-        listen_port = int(raw.get("listen_port", DEFAULT_SETTINGS["listen_port"]) or 6881)
+    def _validate_settings(self, raw: dict, existing: dict = None):
+        prev = existing or {}
+        try:
+            listen_port = int(raw.get("listen_port", DEFAULT_SETTINGS["listen_port"]))
+        except Exception:
+            listen_port = DEFAULT_SETTINGS["listen_port"]
         listen_port = max(1024, min(65535, listen_port))
-        window_mb = int(raw.get("window_mb", DEFAULT_SETTINGS["window_mb"]) or 24)
+
+        listen_interface = re.sub(r"[^0-9a-zA-Z._:\-\[\]]+", "", str(raw.get("listen_interface") or "0.0.0.0").strip())[:128]
+        if not listen_interface:
+            listen_interface = "0.0.0.0"
+
+        try:
+            window_mb = int(raw.get("window_mb", DEFAULT_SETTINGS["window_mb"]))
+        except Exception:
+            window_mb = DEFAULT_SETTINGS["window_mb"]
         window_mb = max(8, min(64, window_mb))
-        max_conn = int(raw.get("max_connections", DEFAULT_SETTINGS["max_connections"]) or 60)
-        max_conn = max(10, min(300, max_conn))
-        dl_limit = int(raw.get("download_rate_limit_kbps", 0) or 0)
+
+        try:
+            max_conn = int(raw.get("max_connections", DEFAULT_SETTINGS["max_connections"]))
+        except Exception:
+            max_conn = DEFAULT_SETTINGS["max_connections"]
+        max_conn = max(10, min(500, max_conn))
+
+        try:
+            max_uploads = int(raw.get("max_uploads", DEFAULT_SETTINGS["max_uploads"]))
+        except Exception:
+            max_uploads = DEFAULT_SETTINGS["max_uploads"]
+        max_uploads = max(-1, min(200, max_uploads))
+
+        try:
+            dl_limit = int(raw.get("download_rate_limit_kbps", DEFAULT_SETTINGS["download_rate_limit_kbps"]))
+        except Exception:
+            dl_limit = DEFAULT_SETTINGS["download_rate_limit_kbps"]
         dl_limit = max(0, min(1_000_000, dl_limit))
+
+        try:
+            ul_limit = int(raw.get("upload_rate_limit_kbps", DEFAULT_SETTINGS["upload_rate_limit_kbps"]))
+        except Exception:
+            ul_limit = DEFAULT_SETTINGS["upload_rate_limit_kbps"]
+        ul_limit = max(0, min(1_000_000, ul_limit))
+
         conflict = str(raw.get("default_conflict_action") or "keep_both").strip().lower()
         if conflict not in ("keep_both", "skip", "replace"):
             conflict = "keep_both"
+
+        enc_mode = str(raw.get("encryption_mode") or "enabled").strip().lower()
+        if enc_mode not in ("disabled", "enabled", "forced"):
+            enc_mode = "enabled"
+
+        proxy_type = str(raw.get("proxy_type") or "none").strip().lower()
+        if proxy_type not in ("none", "socks5", "socks4", "http"):
+            proxy_type = "none"
+
+        proxy_hostname = re.sub(r"[\s\r\n]+", "", str(raw.get("proxy_hostname") or "").strip())[:255]
+        try:
+            proxy_port = int(raw.get("proxy_port", DEFAULT_SETTINGS["proxy_port"]))
+        except Exception:
+            proxy_port = DEFAULT_SETTINGS["proxy_port"]
+        proxy_port = max(1, min(65535, proxy_port))
+
+        proxy_username = str(raw.get("proxy_username") or "").strip()[:128]
+        if self._as_bool(raw.get("clear_proxy_password"), False):
+            proxy_password = ""
+        elif "proxy_password" in raw and str(raw.get("proxy_password") or "") != "":
+            proxy_password = str(raw.get("proxy_password"))[:256]
+        else:
+            proxy_password = str(prev.get("proxy_password") or "")
+
+        extra_trackers = "\n".join(self._parse_extra_trackers(raw.get("extra_trackers", "")))
+
         return {
             "listen_port": listen_port,
+            "listen_interface": listen_interface,
             "window_mb": window_mb,
             "max_connections": max_conn,
+            "max_uploads": max_uploads,
             "download_rate_limit_kbps": dl_limit,
+            "upload_rate_limit_kbps": ul_limit,
             "default_conflict_action": conflict,
+            "enable_dht": self._as_bool(raw.get("enable_dht"), DEFAULT_SETTINGS["enable_dht"]),
+            "enable_pex": self._as_bool(raw.get("enable_pex"), DEFAULT_SETTINGS["enable_pex"]),
+            "enable_lsd": self._as_bool(raw.get("enable_lsd"), DEFAULT_SETTINGS["enable_lsd"]),
+            "enable_upnp": self._as_bool(raw.get("enable_upnp"), DEFAULT_SETTINGS["enable_upnp"]),
+            "enable_natpmp": self._as_bool(raw.get("enable_natpmp"), DEFAULT_SETTINGS["enable_natpmp"]),
+            "enable_utp": self._as_bool(raw.get("enable_utp"), DEFAULT_SETTINGS["enable_utp"]),
+            "encryption_mode": enc_mode,
+            "anonymous_mode": self._as_bool(raw.get("anonymous_mode"), DEFAULT_SETTINGS["anonymous_mode"]),
+            "extra_trackers": extra_trackers,
+            "proxy_type": proxy_type,
+            "proxy_hostname": proxy_hostname,
+            "proxy_port": proxy_port,
+            "proxy_username": proxy_username,
+            "proxy_password": proxy_password,
+            "proxy_peer_connections": self._as_bool(raw.get("proxy_peer_connections"), DEFAULT_SETTINGS["proxy_peer_connections"]),
+            "proxy_tracker_connections": self._as_bool(raw.get("proxy_tracker_connections"), DEFAULT_SETTINGS["proxy_tracker_connections"]),
+            "proxy_hostnames": self._as_bool(raw.get("proxy_hostnames"), DEFAULT_SETTINGS["proxy_hostnames"]),
+            "force_proxy": self._as_bool(raw.get("force_proxy"), DEFAULT_SETTINGS["force_proxy"]),
         }
 
     def _save_settings(self):
@@ -519,29 +679,158 @@ class TorrentManager:
         os.replace(tmp, TORRENT_SETTINGS_FILE)
 
     def get_settings(self):
+        if not LIBTORRENT_AVAILABLE:
+            _try_import_libtorrent()
         with self._lock:
             out = dict(self._settings)
+            out["proxy_password_set"] = bool(out.get("proxy_password"))
+            out["proxy_password"] = ""
             out["engine_available"] = LIBTORRENT_AVAILABLE
             out["engine_version"] = str(LIBTORRENT_VERSION or "")
             return out
 
     def update_settings(self, updates: dict, user="admin"):
         with self._lock:
+            prev = dict(self._settings)
             merged = dict(self._settings)
             merged.update(updates or {})
-            self._settings = self._validate_settings(merged)
+            self._settings = self._validate_settings(merged, existing=prev)
             self._save_settings()
             if self._session is not None:
                 self._apply_session_settings(self._session)
+            proxy_desc = (
+                f", proxy {self._settings['proxy_type'].upper()}://{self._settings['proxy_hostname']}:{self._settings['proxy_port']}"
+                if self._settings["proxy_type"] != "none" and self._settings["proxy_hostname"]
+                else ""
+            )
             self._log(
                 "Torrent Settings Updated",
                 "change",
-                f"Port {self._settings['listen_port']}, window {self._settings['window_mb']} MiB, max peers {self._settings['max_connections']}",
+                (
+                    f"Port {self._settings['listen_port']}, window {self._settings['window_mb']} MiB, "
+                    f"DL {self._settings['download_rate_limit_kbps']} KB/s, UL {self._settings['upload_rate_limit_kbps']} KB/s, "
+                    f"enc {self._settings['encryption_mode']}{proxy_desc}"
+                ),
                 drive="Torrents",
                 target="Engine Settings",
                 user=user,
             )
             return self.get_settings()
+
+    def install_engine(self, user="admin"):
+        """Install libtorrent at runtime inside the running Docker container (pip wheel or apt python3-libtorrent)."""
+        with self._install_lock:
+            if _try_import_libtorrent():
+                return {
+                    "ok": True,
+                    "already_installed": True,
+                    "engine_available": True,
+                    "engine_version": str(LIBTORRENT_VERSION or ""),
+                    "method": "existing",
+                    "message": f"libtorrent ({LIBTORRENT_VERSION}) is already installed and ready.",
+                }
+
+            logs = []
+            # 1) Try prebuilt binary wheel via pip (fast, no compiler required)
+            try:
+                res = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "--no-cache-dir", "--prefer-binary", "libtorrent"],
+                    capture_output=True,
+                    text=True,
+                    timeout=240,
+                    shell=False,
+                )
+                snippet = ((res.stdout or "") + "\n" + (res.stderr or "")).strip()[-1200:]
+                logs.append(f"[pip] exit={res.returncode}\n{snippet}")
+                if _try_import_libtorrent():
+                    self._log(
+                        "Torrent Engine Installed",
+                        "add",
+                        f"Installed libtorrent {LIBTORRENT_VERSION} via pip binary wheel",
+                        drive="Torrents",
+                        target="libtorrent",
+                        user=user,
+                    )
+                    self._wake_event.set()
+                    return {
+                        "ok": True,
+                        "already_installed": False,
+                        "engine_available": True,
+                        "engine_version": str(LIBTORRENT_VERSION or ""),
+                        "method": "pip",
+                        "message": f"Successfully installed libtorrent {LIBTORRENT_VERSION} via pip.",
+                    }
+            except Exception as exc:
+                logs.append(f"[pip] exception: {exc}")
+
+            # 2) Fallback: Debian/Ubuntu apt-get python3-libtorrent + site-packages .pth bridge
+            if shutil.which("apt-get"):
+                env = dict(os.environ)
+                env["DEBIAN_FRONTEND"] = "noninteractive"
+                try:
+                    upd = subprocess.run(
+                        ["apt-get", "update"],
+                        capture_output=True,
+                        text=True,
+                        timeout=180,
+                        shell=False,
+                        env=env,
+                    )
+                    inst = subprocess.run(
+                        ["apt-get", "install", "-y", "--no-install-recommends", "python3-libtorrent"],
+                        capture_output=True,
+                        text=True,
+                        timeout=240,
+                        shell=False,
+                        env=env,
+                    )
+                    snippet = ((upd.stderr or "") + "\n" + (inst.stdout or "") + "\n" + (inst.stderr or "")).strip()[-1200:]
+                    logs.append(f"[apt] exit={inst.returncode}\n{snippet}")
+                    try:
+                        sp_dirs = site.getsitepackages()
+                        if sp_dirs and os.path.isdir("/usr/lib/python3/dist-packages"):
+                            pth = Path(sp_dirs[0]) / "debian_dist_packages.pth"
+                            pth.write_text("/usr/lib/python3/dist-packages\n", encoding="utf-8")
+                    except Exception:
+                        pass
+                    if _try_import_libtorrent():
+                        self._log(
+                            "Torrent Engine Installed",
+                            "add",
+                            f"Installed python3-libtorrent {LIBTORRENT_VERSION} via apt-get",
+                            drive="Torrents",
+                            target="libtorrent",
+                            user=user,
+                        )
+                        self._wake_event.set()
+                        return {
+                            "ok": True,
+                            "already_installed": False,
+                            "engine_available": True,
+                            "engine_version": str(LIBTORRENT_VERSION or ""),
+                            "method": "apt",
+                            "message": f"Successfully installed python3-libtorrent {LIBTORRENT_VERSION} via apt.",
+                        }
+                except Exception as exc:
+                    logs.append(f"[apt] exception: {exc}")
+
+            detail = "\n\n".join(logs)[-1500:]
+            self._log(
+                "Torrent Engine Install Failed",
+                "change",
+                "Runtime libtorrent install failed; rebuild Docker image with python:3.11-slim-bookworm",
+                drive="Torrents",
+                target="libtorrent",
+                user=user,
+            )
+            return {
+                "ok": False,
+                "engine_available": False,
+                "engine_version": "",
+                "method": "none",
+                "message": "Could not install libtorrent at runtime. Rebuild the Docker image (`docker compose build --no-cache`) to bundle libtorrent natively.",
+                "details": detail,
+            }
 
     def _load_jobs(self):
         if TORRENTS_STATE_FILE.exists():
@@ -579,41 +868,115 @@ class TorrentManager:
                     return j
             return None
 
-    def _ensure_session(self):
-        if not LIBTORRENT_AVAILABLE:
-            raise RuntimeError(
-                "libtorrent is not installed in this runtime. Rebuild the Docker container to enable live BitTorrent streaming."
-            )
-        if self._session is None:
-            settings = {
-                "listen_interfaces": f"0.0.0.0:{self._settings['listen_port']}",
-                "enable_dht": True,
-                "enable_lsd": False,
-                "enable_upnp": True,
-                "enable_natpmp": True,
-                "connections_limit": self._settings["max_connections"],
-                "download_rate_limit": self._settings["download_rate_limit_kbps"] * 1024,
-                "upload_rate_limit": 256 * 1024,  # modest upload cap so cloud uplink isn't starved
-                "alert_mask": lt.alert.category_t.error_notification | lt.alert.category_t.status_notification,
-            }
-            self._session = lt.session(settings)
-            try:
-                self._session.add_dht_router("router.bittorrent.com", 6881)
-                self._session.add_dht_router("router.utorrent.com", 6881)
-                self._session.add_dht_router("dht.transmissionbt.com", 6881)
-            except Exception:
-                pass
-        return self._session
+    def _build_session_settings(self):
+        s = self._settings
+        iface = s.get("listen_interface") or "0.0.0.0"
+        port = int(s.get("listen_port") or 6881)
+        if ":" in iface and not iface.startswith("["):
+            listen_str = f"[{iface}]:{port}"
+        else:
+            listen_str = f"{iface}:{port}"
+
+        enc_enum = getattr(lt, "enc_policy", None)
+        enc_map = {
+            "forced": getattr(enc_enum, "pe_forced", 0) if enc_enum else 0,
+            "enabled": getattr(enc_enum, "pe_enabled", 1) if enc_enum else 1,
+            "disabled": getattr(enc_enum, "pe_disabled", 2) if enc_enum else 2,
+        }
+        enc_val = enc_map.get(s.get("encryption_mode", "enabled"), enc_map["enabled"])
+
+        ptype_enum = getattr(lt, "proxy_type_t", None)
+        p_none = getattr(ptype_enum, "none", 0) if ptype_enum else 0
+        p_socks4 = getattr(ptype_enum, "socks4", 1) if ptype_enum else 1
+        p_socks5 = getattr(ptype_enum, "socks5", 2) if ptype_enum else 2
+        p_socks5_pw = getattr(ptype_enum, "socks5_pw", 3) if ptype_enum else 3
+        p_http = getattr(ptype_enum, "http", 4) if ptype_enum else 4
+        p_http_pw = getattr(ptype_enum, "http_pw", 5) if ptype_enum else 5
+
+        ptype_str = s.get("proxy_type", "none")
+        phost = (s.get("proxy_hostname") or "").strip()
+        puser = s.get("proxy_username") or ""
+        ppass = s.get("proxy_password") or ""
+        has_auth = bool(puser or ppass)
+
+        if ptype_str == "none" or not phost:
+            proxy_type_val = p_none
+            phost = ""
+            pport = 0
+            puser = ""
+            ppass = ""
+            force_proxy_val = False
+        else:
+            pport = int(s.get("proxy_port") or 1080)
+            if ptype_str == "socks5":
+                proxy_type_val = p_socks5_pw if has_auth else p_socks5
+            elif ptype_str == "socks4":
+                proxy_type_val = p_socks4
+            elif ptype_str == "http":
+                proxy_type_val = p_http_pw if has_auth else p_http
+            else:
+                proxy_type_val = p_none
+            force_proxy_val = bool(s.get("force_proxy", False))
+
+        utp_enabled = bool(s.get("enable_utp", True))
+        return {
+            "listen_interfaces": listen_str,
+            "enable_dht": bool(s.get("enable_dht", True)),
+            "enable_lsd": bool(s.get("enable_lsd", False)),
+            "enable_upnp": bool(s.get("enable_upnp", True)),
+            "enable_natpmp": bool(s.get("enable_natpmp", True)),
+            "enable_incoming_utp": utp_enabled,
+            "enable_outgoing_utp": utp_enabled,
+            "connections_limit": int(s.get("max_connections") or 60),
+            "unchoke_slots_limit": int(s.get("max_uploads", 4)),
+            "download_rate_limit": int(s.get("download_rate_limit_kbps") or 0) * 1024,
+            "upload_rate_limit": int(s.get("upload_rate_limit_kbps") or 0) * 1024,
+            "in_enc_policy": enc_val,
+            "out_enc_policy": enc_val,
+            "anonymous_mode": bool(s.get("anonymous_mode", False)),
+            "proxy_type": proxy_type_val,
+            "proxy_hostname": phost,
+            "proxy_port": pport,
+            "proxy_username": puser,
+            "proxy_password": ppass,
+            "proxy_peer_connections": bool(s.get("proxy_peer_connections", True)),
+            "proxy_tracker_connections": bool(s.get("proxy_tracker_connections", True)),
+            "proxy_hostnames": bool(s.get("proxy_hostnames", True)),
+            "force_proxy": force_proxy_val,
+        }
 
     def _apply_session_settings(self, ses):
+        pack = self._build_session_settings()
         try:
-            ses.apply_settings({
-                "listen_interfaces": f"0.0.0.0:{self._settings['listen_port']}",
-                "connections_limit": self._settings["max_connections"],
-                "download_rate_limit": self._settings["download_rate_limit_kbps"] * 1024,
-            })
+            ses.apply_settings(pack)
+            return
         except Exception:
-            pass
+            # Some keys (e.g. force_proxy in libtorrent 2.0) may be deprecated; apply valid keys individually
+            for k, v in pack.items():
+                try:
+                    ses.apply_settings({k: v})
+                except Exception:
+                    pass
+
+    def _ensure_session(self):
+        if not LIBTORRENT_AVAILABLE and not _try_import_libtorrent():
+            raise RuntimeError(
+                "libtorrent is not installed in this runtime. Click 'Install libtorrent Now' in Settings → Torrents or rebuild the Docker container."
+            )
+        if self._session is None:
+            base = {
+                "alert_mask": lt.alert.category_t.error_notification | lt.alert.category_t.status_notification,
+            }
+            self._session = lt.session(base)
+            self._apply_session_settings(self._session)
+            if self._settings.get("enable_dht", True):
+                try:
+                    self._session.add_dht_router("router.bittorrent.com", 6881)
+                    self._session.add_dht_router("router.utorrent.com", 6881)
+                    self._session.add_dht_router("dht.transmissionbt.com", 6881)
+                except Exception:
+                    pass
+        return self._session
 
     def _start_worker(self):
         if self._worker_started:
@@ -894,12 +1257,28 @@ class TorrentManager:
                 atp.ti = tinfo
                 atp.save_path = str(save_dir)
                 atp.storage_mode = lt.storage_mode_t.storage_mode_sparse
-                handle = ses.add_torrent(atp)
             else:
                 atp = lt.parse_magnet_uri(job_snap["magnet_uri"])
                 atp.save_path = str(save_dir)
                 atp.storage_mode = lt.storage_mode_t.storage_mode_sparse
-                handle = ses.add_torrent(atp)
+
+            if not self._settings.get("enable_pex", True):
+                try:
+                    tflags = getattr(lt, "torrent_flags", None)
+                    disable_pex = getattr(tflags, "disable_pex", None) if tflags else None
+                    if disable_pex is not None:
+                        atp.flags |= disable_pex
+                except Exception:
+                    pass
+
+            handle = ses.add_torrent(atp)
+
+            extra_trackers = self._parse_extra_trackers(self._settings.get("extra_trackers", ""))
+            for tr_url in extra_trackers:
+                try:
+                    handle.add_tracker({"url": tr_url, "tier": 1})
+                except Exception:
+                    pass
 
             # Wait for magnet metadata if needed
             meta_deadline = time.time() + 180.0

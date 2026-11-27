@@ -907,7 +907,17 @@ let _settingsTab = 'gdrive';
 let _oauthFormExpanded = false;
 let _loginLockoutTimer = null;
 let _torrentJobs = [];
-let _torrentSettings = {listen_port:6881, window_mb:24, max_connections:60, download_rate_limit_kbps:0, default_conflict_action:'keep_both', engine_available:true, engine_version:''};
+let _torrentSettings = {
+  listen_port:6881, listen_interface:'0.0.0.0', window_mb:24, max_connections:60, max_uploads:4,
+  download_rate_limit_kbps:0, upload_rate_limit_kbps:256, default_conflict_action:'keep_both',
+  enable_dht:true, enable_pex:true, enable_lsd:false, enable_upnp:true, enable_natpmp:true, enable_utp:true,
+  encryption_mode:'enabled', anonymous_mode:false, extra_trackers:'',
+  proxy_type:'none', proxy_hostname:'', proxy_port:1080, proxy_username:'', proxy_password:'', proxy_password_set:false,
+  proxy_peer_connections:true, proxy_tracker_connections:true, proxy_hostnames:true, force_proxy:false,
+  engine_available:true, engine_version:''
+};
+let _torrentInstallingEngine = false;
+let _torrentInstallNotice = null;
 let _torrentFilter = 'all';
 let _torrentExpandedIds = new Set();
 let _torrentPollTimer = null;
@@ -7726,59 +7736,251 @@ async function renderSettings() {
     ` : ''}
 
     ${showTorrents ? `
-    <div class="card">
-      <div class="card-header">
-        <div style="display:flex;align-items:center;gap:var(--space-2)">
-          <svg data-lucide="magnet" width="16" height="16" style="color:var(--color-primary)"></svg>
-          <span class="card-title">Zero-Disk Torrent Engine</span>
+    <div style="display:flex;flex-direction:column;gap:var(--space-4)">
+      <!-- Engine Status, Bandwidth & Connection Limits -->
+      <div class="card">
+        <div class="card-header">
+          <div style="display:flex;align-items:center;gap:var(--space-2)">
+            <svg data-lucide="magnet" width="16" height="16" style="color:var(--color-primary)"></svg>
+            <span class="card-title">Zero-Disk Torrent Engine &amp; Bandwidth Limits</span>
+          </div>
+          <span style="font-size:var(--text-xs);font-family:var(--font-mono);color:${_torrentSettings.engine_available ? 'var(--color-success)' : 'var(--color-warning)'}">
+            ${_torrentSettings.engine_available ? `Engine Ready (${escHtml(_torrentSettings.engine_version || 'libtorrent')})` : 'libtorrent Not Installed'}
+          </span>
         </div>
-        <span style="font-size:var(--text-xs);font-family:var(--font-mono);color:${_torrentSettings.engine_available ? 'var(--color-success)' : 'var(--color-warning)'}">
-          ${_torrentSettings.engine_available ? `Engine Ready (${escHtml(_torrentSettings.engine_version || 'libtorrent')})` : 'libtorrent Not Installed'}
-        </span>
+        <div class="card-body" style="display:flex;flex-direction:column;gap:var(--space-4)">
+          <p style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.55">
+            Streams verified BitTorrent pieces sequentially straight into Google Drive or FileJump (1 file at a time) using a bounded sliding window and Linux hole-punching so container disk usage returns to 0 B.
+          </p>
+
+          ${!_torrentSettings.engine_available ? `
+          <div style="padding:var(--space-3) var(--space-4);border:1px solid var(--color-warning);border-radius:var(--radius-md);background:color-mix(in oklab,var(--color-warning) 10%,transparent);display:flex;align-items:center;justify-content:space-between;gap:var(--space-3);flex-wrap:wrap">
+            <div style="display:flex;align-items:flex-start;gap:var(--space-2);min-width:220px;flex:1">
+              <svg data-lucide="alert-triangle" width="16" height="16" style="color:var(--color-warning);flex-shrink:0;margin-top:2px"></svg>
+              <div style="font-size:var(--text-xs);line-height:1.5">
+                <strong>libtorrent is not installed in this container.</strong> Install it directly into the running container now, or rebuild the Docker image (<code style="font-family:var(--font-mono)">docker compose build --no-cache</code>) which now bundles <code style="font-family:var(--font-mono)">libtorrent</code> automatically.
+              </div>
+            </div>
+            <button class="btn btn-primary btn-sm" onclick="installTorrentEngine()" ${(!_adminMode || _torrentInstallingEngine) ? 'disabled' : ''}>
+              <svg data-lucide="${_torrentInstallingEngine ? 'loader' : 'download'}" width="14" height="14"></svg>
+              ${_torrentInstallingEngine ? 'Installing libtorrent...' : 'Install libtorrent Now'}
+            </button>
+          </div>
+          ` : ''}
+
+          ${_torrentInstallNotice ? `
+          <div style="padding:var(--space-3) var(--space-4);border:1px solid ${_torrentInstallNotice.ok ? 'var(--color-success)' : 'var(--color-error)'};border-radius:var(--radius-md);background:color-mix(in oklab,${_torrentInstallNotice.ok ? 'var(--color-success)' : 'var(--color-error)'} 10%,transparent);font-size:var(--text-xs);line-height:1.5">
+            <div style="font-weight:600;color:${_torrentInstallNotice.ok ? 'var(--color-success)' : 'var(--color-error)'}">${escHtml(_torrentInstallNotice.message || '')}</div>
+            ${_torrentInstallNotice.details ? `<pre style="margin:var(--space-2) 0 0;padding:var(--space-2);background:var(--color-surface-offset);border-radius:var(--radius-sm);font-family:var(--font-mono);font-size:11px;white-space:pre-wrap;max-height:140px;overflow:auto;color:var(--color-text-muted)">${escHtml(_torrentInstallNotice.details)}</pre>` : ''}
+          </div>
+          ` : ''}
+
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" for="tor-set-limit">Download Speed Cap (KB/s, 0 = unlimited)</label>
+              <input class="form-input" id="tor-set-limit" type="number" min="0" max="1000000" value="${Number(_torrentSettings.download_rate_limit_kbps ?? 0)}" ${_adminMode ? '' : 'disabled'} />
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="tor-set-ul-limit">Upload Speed Cap (KB/s, 0 = unlimited)</label>
+              <input class="form-input" id="tor-set-ul-limit" type="number" min="0" max="1000000" value="${Number(_torrentSettings.upload_rate_limit_kbps ?? 256)}" ${_adminMode ? '' : 'disabled'} />
+              <div style="font-size:11px;color:var(--color-text-faint);margin-top:3px">Limits BitTorrent peer upload bandwidth so cloud uploads are not starved.</div>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" for="tor-set-window">Sliding Window Buffer Cap</label>
+              <select class="form-input" id="tor-set-window" ${_adminMode ? '' : 'disabled'}>
+                ${[16, 24, 32, 48, 64].map(mb => `<option value="${mb}" ${Number(_torrentSettings.window_mb || 24) === mb ? 'selected' : ''}>${mb} MiB (peak transient container buffer)</option>`).join('')}
+              </select>
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="tor-set-conflict">Default Filename Conflict Policy</label>
+              <select class="form-input" id="tor-set-conflict" ${_adminMode ? '' : 'disabled'}>
+                <option value="keep_both" ${_torrentSettings.default_conflict_action === 'keep_both' ? 'selected' : ''}>Keep Both (append number)</option>
+                <option value="skip" ${_torrentSettings.default_conflict_action === 'skip' ? 'selected' : ''}>Skip Existing Files</option>
+                <option value="replace" ${_torrentSettings.default_conflict_action === 'replace' ? 'selected' : ''}>Replace Existing Files</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" for="tor-set-peers">Max Peer Connections (10–500)</label>
+              <input class="form-input" id="tor-set-peers" type="number" min="10" max="500" value="${Number(_torrentSettings.max_connections ?? 60)}" ${_adminMode ? '' : 'disabled'} />
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="tor-set-uploads">Max Upload Slots (-1 = unlimited)</label>
+              <input class="form-input" id="tor-set-uploads" type="number" min="-1" max="200" value="${Number(_torrentSettings.max_uploads ?? 4)}" ${_adminMode ? '' : 'disabled'} />
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" for="tor-set-port">BitTorrent Listen Port (TCP/UDP)</label>
+              <input class="form-input" id="tor-set-port" type="number" min="1024" max="65535" value="${Number(_torrentSettings.listen_port || 6881)}" ${_adminMode ? '' : 'disabled'} />
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="tor-set-iface">Network Bind Interface / IP</label>
+              <input class="form-input" id="tor-set-iface" type="text" value="${escHtml(_torrentSettings.listen_interface || '0.0.0.0')}" placeholder="0.0.0.0 or wg0 / tun0" ${_adminMode ? '' : 'disabled'} />
+              <div style="font-size:11px;color:var(--color-text-faint);margin-top:3px">Bind to <code style="font-family:var(--font-mono)">0.0.0.0</code> for all interfaces, or a VPN interface name/IP.</div>
+            </div>
+          </div>
+        </div>
       </div>
-      <div class="card-body" style="display:flex;flex-direction:column;gap:var(--space-4)">
-        <p style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.55">
-          Streams verified BitTorrent pieces sequentially straight into Google Drive or FileJump (1 file at a time) using a bounded sliding window and Linux hole-punching so container disk usage returns to 0 B. Peer traffic and cloud relays use the container's network connection; route Docker through a VPN container if swarm IP privacy is required.
-        </p>
-        <div class="form-row">
-          <div class="form-group">
-            <label class="form-label" for="tor-set-port">BitTorrent Listen Port (TCP/UDP)</label>
-            <input class="form-input" id="tor-set-port" type="number" min="1024" max="65535" value="${Number(_torrentSettings.listen_port || 6881)}" ${_adminMode ? '' : 'disabled'} />
+
+      <!-- Protocol, Encryption & Discovery -->
+      <div class="card">
+        <div class="card-header">
+          <div style="display:flex;align-items:center;gap:var(--space-2)">
+            <svg data-lucide="shield" width="16" height="16" style="color:var(--color-primary)"></svg>
+            <span class="card-title">Protocol, Encryption &amp; Peer Discovery</span>
           </div>
+          <span style="font-size:var(--text-xs);font-family:var(--font-mono);color:var(--color-text-muted)">
+            Encryption: ${escHtml((_torrentSettings.encryption_mode || 'enabled').toUpperCase())}
+          </span>
+        </div>
+        <div class="card-body" style="display:flex;flex-direction:column;gap:var(--space-4)">
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" for="tor-set-enc">Protocol Encryption (PE/MSE)</label>
+              <select class="form-input" id="tor-set-enc" ${_adminMode ? '' : 'disabled'}>
+                <option value="enabled" ${(_torrentSettings.encryption_mode || 'enabled') === 'enabled' ? 'selected' : ''}>Enabled (Prefer encrypted, allow fallback)</option>
+                <option value="forced" ${_torrentSettings.encryption_mode === 'forced' ? 'selected' : ''}>Forced (Require encrypted peers only)</option>
+                <option value="disabled" ${_torrentSettings.encryption_mode === 'disabled' ? 'selected' : ''}>Disabled (Plaintext connections)</option>
+              </select>
+            </div>
+            <div class="form-group" style="display:flex;flex-direction:column;justify-content:center">
+              <label style="display:flex;align-items:center;gap:var(--space-2);font-size:var(--text-xs);font-weight:600;color:var(--color-text);cursor:pointer">
+                <input type="checkbox" id="tor-set-anon" ${_torrentSettings.anonymous_mode ? 'checked' : ''} ${_adminMode ? '' : 'disabled'} />
+                Anonymous Mode (strip client fingerprint &amp; local IPs)
+              </label>
+              <div style="font-size:11px;color:var(--color-text-faint);margin-top:4px;padding-left:22px">Prevents announcing client user-agent or internal network addresses to trackers and peers.</div>
+            </div>
+          </div>
+
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:var(--space-3);padding:var(--space-3);background:var(--color-surface-offset);border:1px solid var(--color-divider);border-radius:var(--radius-md)">
+            <label style="display:flex;align-items:center;gap:var(--space-2);font-size:var(--text-xs);color:var(--color-text);cursor:pointer">
+              <input type="checkbox" id="tor-set-dht" ${_torrentSettings.enable_dht !== false ? 'checked' : ''} ${_adminMode ? '' : 'disabled'} />
+              Enable DHT (Trackerless Discovery)
+            </label>
+            <label style="display:flex;align-items:center;gap:var(--space-2);font-size:var(--text-xs);color:var(--color-text);cursor:pointer">
+              <input type="checkbox" id="tor-set-pex" ${_torrentSettings.enable_pex !== false ? 'checked' : ''} ${_adminMode ? '' : 'disabled'} />
+              Enable PEX (Peer Exchange)
+            </label>
+            <label style="display:flex;align-items:center;gap:var(--space-2);font-size:var(--text-xs);color:var(--color-text);cursor:pointer">
+              <input type="checkbox" id="tor-set-utp" ${_torrentSettings.enable_utp !== false ? 'checked' : ''} ${_adminMode ? '' : 'disabled'} />
+              Enable uTP (UDP Transport)
+            </label>
+            <label style="display:flex;align-items:center;gap:var(--space-2);font-size:var(--text-xs);color:var(--color-text);cursor:pointer">
+              <input type="checkbox" id="tor-set-upnp" ${_torrentSettings.enable_upnp !== false ? 'checked' : ''} ${_adminMode ? '' : 'disabled'} />
+              Enable UPnP Port Forwarding
+            </label>
+            <label style="display:flex;align-items:center;gap:var(--space-2);font-size:var(--text-xs);color:var(--color-text);cursor:pointer">
+              <input type="checkbox" id="tor-set-natpmp" ${_torrentSettings.enable_natpmp !== false ? 'checked' : ''} ${_adminMode ? '' : 'disabled'} />
+              Enable NAT-PMP Port Mapping
+            </label>
+            <label style="display:flex;align-items:center;gap:var(--space-2);font-size:var(--text-xs);color:var(--color-text);cursor:pointer">
+              <input type="checkbox" id="tor-set-lsd" ${_torrentSettings.enable_lsd ? 'checked' : ''} ${_adminMode ? '' : 'disabled'} />
+              Enable LSD (Local Peer Discovery)
+            </label>
+          </div>
+
           <div class="form-group">
-            <label class="form-label" for="tor-set-window">Sliding Window Buffer Cap</label>
-            <select class="form-input" id="tor-set-window" ${_adminMode ? '' : 'disabled'}>
-              ${[16, 24, 32, 48].map(mb => `<option value="${mb}" ${Number(_torrentSettings.window_mb || 24) === mb ? 'selected' : ''}>${mb} MiB (keeps 1 GB container safe)</option>`).join('')}
-            </select>
+            <label class="form-label" for="tor-set-trackers">Extra Default Trackers (optional, one URL per line)</label>
+            <textarea class="form-input" id="tor-set-trackers" rows="3" style="font-family:var(--font-mono);font-size:12px;resize:vertical" placeholder="udp://tracker.opentrackr.org:1337/announce&#10;https://tracker.example.com/announce" ${_adminMode ? '' : 'disabled'}>${escHtml(_torrentSettings.extra_trackers || '')}</textarea>
           </div>
         </div>
-        <div class="form-row">
-          <div class="form-group">
-            <label class="form-label" for="tor-set-peers">Max Peer Connections</label>
-            <input class="form-input" id="tor-set-peers" type="number" min="10" max="300" value="${Number(_torrentSettings.max_connections || 60)}" ${_adminMode ? '' : 'disabled'} />
+      </div>
+
+      <!-- SOCKS5 / SOCKS4 / HTTP Proxy Configuration -->
+      <div class="card">
+        <div class="card-header">
+          <div style="display:flex;align-items:center;gap:var(--space-2)">
+            <svg data-lucide="globe" width="16" height="16" style="color:var(--color-primary)"></svg>
+            <span class="card-title">Proxy Configuration (SOCKS5 / HTTP)</span>
           </div>
-          <div class="form-group">
-            <label class="form-label" for="tor-set-limit">Download Speed Cap (KB/s, 0 = unlimited)</label>
-            <input class="form-input" id="tor-set-limit" type="number" min="0" max="1000000" value="${Number(_torrentSettings.download_rate_limit_kbps || 0)}" ${_adminMode ? '' : 'disabled'} />
+          <span style="font-size:var(--text-xs);font-family:var(--font-mono);color:${(_torrentSettings.proxy_type && _torrentSettings.proxy_type !== 'none' && _torrentSettings.proxy_hostname) ? 'var(--color-primary)' : 'var(--color-text-muted)'}">
+            ${(_torrentSettings.proxy_type && _torrentSettings.proxy_type !== 'none' && _torrentSettings.proxy_hostname)
+              ? `${escHtml(_torrentSettings.proxy_type.toUpperCase())} · ${escHtml(_torrentSettings.proxy_hostname)}:${Number(_torrentSettings.proxy_port || 1080)}`
+              : 'Direct Connection'}
+          </span>
+        </div>
+        <div class="card-body" style="display:flex;flex-direction:column;gap:var(--space-4)">
+          <p style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.55">
+            Route BitTorrent peer connections, tracker announces, and DNS lookups through a SOCKS5, SOCKS4, or HTTP proxy. Applies live to the libtorrent session without restarting the container.
+          </p>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" for="tor-set-proxy-type">Proxy Type</label>
+              <select class="form-input" id="tor-set-proxy-type" onchange="onTorrentProxyTypeChange()" ${_adminMode ? '' : 'disabled'}>
+                <option value="none" ${(_torrentSettings.proxy_type || 'none') === 'none' ? 'selected' : ''}>None (Direct)</option>
+                <option value="socks5" ${_torrentSettings.proxy_type === 'socks5' ? 'selected' : ''}>SOCKS5 (Recommended for VPN proxies)</option>
+                <option value="socks4" ${_torrentSettings.proxy_type === 'socks4' ? 'selected' : ''}>SOCKS4</option>
+                <option value="http" ${_torrentSettings.proxy_type === 'http' ? 'selected' : ''}>HTTP / HTTPS Proxy</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="tor-set-proxy-host">Proxy Hostname / IP</label>
+              <input class="form-input" id="tor-set-proxy-host" type="text" value="${escHtml(_torrentSettings.proxy_hostname || '')}" placeholder="proxy.example.com or 10.8.0.1" ${(!_adminMode || (_torrentSettings.proxy_type || 'none') === 'none') ? 'disabled' : ''} />
+            </div>
+            <div class="form-group" style="max-width:160px">
+              <label class="form-label" for="tor-set-proxy-port">Proxy Port</label>
+              <input class="form-input" id="tor-set-proxy-port" type="number" min="1" max="65535" value="${Number(_torrentSettings.proxy_port || 1080)}" ${(!_adminMode || (_torrentSettings.proxy_type || 'none') === 'none') ? 'disabled' : ''} />
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" for="tor-set-proxy-user">Proxy Username (optional)</label>
+              <input class="form-input" id="tor-set-proxy-user" type="text" autocomplete="off" value="${escHtml(_torrentSettings.proxy_username || '')}" placeholder="Leave blank if no auth" ${(!_adminMode || (_torrentSettings.proxy_type || 'none') === 'none' || _torrentSettings.proxy_type === 'socks4') ? 'disabled' : ''} />
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="tor-set-proxy-pass">
+                Proxy Password (optional)
+                ${_torrentSettings.proxy_password_set ? `<span style="font-size:11px;color:var(--color-success);font-weight:500;margin-left:6px">Saved</span>` : ''}
+              </label>
+              <div style="display:flex;gap:var(--space-2);align-items:center">
+                <input class="form-input" id="tor-set-proxy-pass" type="password" autocomplete="new-password" value="" placeholder="${_torrentSettings.proxy_password_set ? '•••••••• (leave blank to keep saved password)' : 'Leave blank if no auth'}" ${(!_adminMode || (_torrentSettings.proxy_type || 'none') === 'none' || _torrentSettings.proxy_type === 'socks4') ? 'disabled' : ''} />
+                ${_torrentSettings.proxy_password_set ? `
+                <button type="button" class="btn btn-secondary btn-sm" onclick="clearTorrentProxyPassword()" ${_adminMode ? '' : 'disabled'} title="Remove saved proxy password">
+                  Clear
+                </button>` : ''}
+              </div>
+            </div>
+          </div>
+
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:var(--space-3);padding:var(--space-3);background:var(--color-surface-offset);border:1px solid var(--color-divider);border-radius:var(--radius-md)">
+            <label style="display:flex;align-items:center;gap:var(--space-2);font-size:var(--text-xs);color:var(--color-text);cursor:pointer">
+              <input type="checkbox" id="tor-set-proxy-peers" ${_torrentSettings.proxy_peer_connections !== false ? 'checked' : ''} ${(!_adminMode || (_torrentSettings.proxy_type || 'none') === 'none') ? 'disabled' : ''} />
+              Proxy Peer Connections
+            </label>
+            <label style="display:flex;align-items:center;gap:var(--space-2);font-size:var(--text-xs);color:var(--color-text);cursor:pointer">
+              <input type="checkbox" id="tor-set-proxy-trackers" ${_torrentSettings.proxy_tracker_connections !== false ? 'checked' : ''} ${(!_adminMode || (_torrentSettings.proxy_type || 'none') === 'none') ? 'disabled' : ''} />
+              Proxy Tracker Connections
+            </label>
+            <label style="display:flex;align-items:center;gap:var(--space-2);font-size:var(--text-xs);color:var(--color-text);cursor:pointer">
+              <input type="checkbox" id="tor-set-proxy-dns" ${_torrentSettings.proxy_hostnames !== false ? 'checked' : ''} ${(!_adminMode || (_torrentSettings.proxy_type || 'none') === 'none') ? 'disabled' : ''} />
+              Resolve Hostnames via Proxy (Prevent DNS Leaks)
+            </label>
+            <label style="display:flex;align-items:center;gap:var(--space-2);font-size:var(--text-xs);color:var(--color-text);cursor:pointer">
+              <input type="checkbox" id="tor-set-force-proxy" ${_torrentSettings.force_proxy ? 'checked' : ''} ${(!_adminMode || (_torrentSettings.proxy_type || 'none') === 'none') ? 'disabled' : ''} />
+              Force Proxy (Kill Switch — Disable Non-Proxy Fallback)
+            </label>
           </div>
         </div>
-        <div class="form-group" style="max-width:340px">
-          <label class="form-label" for="tor-set-conflict">Default Filename Conflict Policy</label>
-          <select class="form-input" id="tor-set-conflict" ${_adminMode ? '' : 'disabled'}>
-            <option value="keep_both" ${_torrentSettings.default_conflict_action === 'keep_both' ? 'selected' : ''}>Keep Both (append number)</option>
-            <option value="skip" ${_torrentSettings.default_conflict_action === 'skip' ? 'selected' : ''}>Skip Existing Files</option>
-            <option value="replace" ${_torrentSettings.default_conflict_action === 'replace' ? 'selected' : ''}>Replace Existing Files</option>
-          </select>
-        </div>
-        <div style="display:flex;align-items:center;gap:var(--space-3);flex-wrap:wrap">
-          <button class="btn btn-primary btn-sm" onclick="saveTorrentSettings()" ${_adminMode ? '' : 'disabled'}>
-            <svg data-lucide="save" width="14" height="14"></svg> Save Torrent Settings
-          </button>
-          <button class="btn btn-secondary btn-sm" onclick="setView('torrents')">
-            <svg data-lucide="magnet" width="14" height="14"></svg> Open Torrents Workspace
-          </button>
-          ${!_adminMode ? `<span style="font-size:var(--text-xs);color:var(--color-text-muted)">Unlock Administrator Functions above to modify engine settings.</span>` : ''}
-        </div>
+      </div>
+
+      <!-- Unified Save Bar -->
+      <div style="display:flex;align-items:center;gap:var(--space-3);flex-wrap:wrap">
+        <button class="btn btn-primary btn-sm" onclick="saveTorrentSettings()" ${_adminMode ? '' : 'disabled'}>
+          <svg data-lucide="save" width="14" height="14"></svg> Save All Torrent Settings
+        </button>
+        <button class="btn btn-secondary btn-sm" onclick="setView('torrents')">
+          <svg data-lucide="magnet" width="14" height="14"></svg> Open Torrents Workspace
+        </button>
+        ${!_adminMode ? `<span style="font-size:var(--text-xs);color:var(--color-text-muted)">Unlock Administrator Functions above to modify engine settings.</span>` : ''}
       </div>
     </div>
     ` : ''}
@@ -8848,21 +9050,134 @@ async function confirmDeleteTorrent(jobId) {
   }
 }
 
+function onTorrentProxyTypeChange() {
+  const ptype = document.getElementById('tor-set-proxy-type')?.value || 'none';
+  const isNone = ptype === 'none';
+  const isSocks4 = ptype === 'socks4';
+  const setDis = (id, dis) => {
+    const el = document.getElementById(id);
+    if (el) el.disabled = !_adminMode || dis;
+  };
+  setDis('tor-set-proxy-host', isNone);
+  setDis('tor-set-proxy-port', isNone);
+  setDis('tor-set-proxy-user', isNone || isSocks4);
+  setDis('tor-set-proxy-pass', isNone || isSocks4);
+  setDis('tor-set-proxy-peers', isNone);
+  setDis('tor-set-proxy-trackers', isNone);
+  setDis('tor-set-proxy-dns', isNone);
+  setDis('tor-set-force-proxy', isNone);
+}
+
+async function clearTorrentProxyPassword() {
+  if (!_adminMode) {
+    showAdminPinModal();
+    return;
+  }
+  try {
+    _torrentSettings = await apiJSON('/api/torrents/settings', {
+      method: 'POST',
+      json: { clear_proxy_password: true },
+    });
+    toast('Saved proxy password cleared', 'success');
+    if (_view === 'settings') renderSettings();
+  } catch (e) {
+    toast('Failed to clear proxy password: ' + e.message, 'error');
+  }
+}
+
+async function installTorrentEngine() {
+  if (!_adminMode) {
+    toast('Unlock Administrator Functions in Settings to install libtorrent', 'error');
+    showAdminPinModal();
+    return;
+  }
+  if (_torrentInstallingEngine) return;
+  _torrentInstallingEngine = true;
+  _torrentInstallNotice = { ok: true, message: 'Installing libtorrent inside container (this may take 15–60 seconds)...' };
+  if (_view === 'settings') renderSettings();
+  if (_view === 'torrents') renderTorrentsView(true);
+  try {
+    const res = await fetch(`${API}/api/torrents/install-engine`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(_token ? { Authorization: `Bearer ${_token}` } : {}),
+      },
+      body: '{}',
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.ok) {
+      _torrentInstallNotice = {
+        ok: true,
+        message: data.message || `libtorrent (${data.engine_version || 'installed'}) is ready.`,
+      };
+      toast(_torrentInstallNotice.message, 'success');
+      await refreshTorrents(true);
+    } else {
+      _torrentInstallNotice = {
+        ok: false,
+        message: data.message || data.error || 'Failed to install libtorrent inside container.',
+        details: data.details || '',
+      };
+      toast(_torrentInstallNotice.message, 'error');
+    }
+  } catch (e) {
+    _torrentInstallNotice = {
+      ok: false,
+      message: 'Install request failed: ' + (e.message || String(e)),
+    };
+    toast(_torrentInstallNotice.message, 'error');
+  } finally {
+    _torrentInstallingEngine = false;
+    if (_view === 'settings') renderSettings();
+    if (_view === 'torrents') renderTorrentsView(true);
+  }
+}
+
 async function saveTorrentSettings() {
   if (!_adminMode) {
     showAdminPinModal();
     return;
   }
-  const payload = {
-    listen_port: parseInt(document.getElementById('tor-set-port')?.value || '6881', 10) || 6881,
-    window_mb: parseInt(document.getElementById('tor-set-window')?.value || '24', 10) || 24,
-    max_connections: parseInt(document.getElementById('tor-set-peers')?.value || '60', 10) || 60,
-    download_rate_limit_kbps: parseInt(document.getElementById('tor-set-limit')?.value || '0', 10) || 0,
-    default_conflict_action: document.getElementById('tor-set-conflict')?.value || 'keep_both',
+  const intVal = (id, fallback) => {
+    const raw = document.getElementById(id)?.value;
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) ? n : fallback;
   };
+  const payload = {
+    listen_port: intVal('tor-set-port', 6881),
+    listen_interface: (document.getElementById('tor-set-iface')?.value || '0.0.0.0').trim() || '0.0.0.0',
+    window_mb: intVal('tor-set-window', 24),
+    max_connections: intVal('tor-set-peers', 60),
+    max_uploads: intVal('tor-set-uploads', 4),
+    download_rate_limit_kbps: intVal('tor-set-limit', 0),
+    upload_rate_limit_kbps: intVal('tor-set-ul-limit', 256),
+    default_conflict_action: document.getElementById('tor-set-conflict')?.value || 'keep_both',
+    encryption_mode: document.getElementById('tor-set-enc')?.value || 'enabled',
+    anonymous_mode: Boolean(document.getElementById('tor-set-anon')?.checked),
+    enable_dht: Boolean(document.getElementById('tor-set-dht')?.checked),
+    enable_pex: Boolean(document.getElementById('tor-set-pex')?.checked),
+    enable_utp: Boolean(document.getElementById('tor-set-utp')?.checked),
+    enable_upnp: Boolean(document.getElementById('tor-set-upnp')?.checked),
+    enable_natpmp: Boolean(document.getElementById('tor-set-natpmp')?.checked),
+    enable_lsd: Boolean(document.getElementById('tor-set-lsd')?.checked),
+    extra_trackers: document.getElementById('tor-set-trackers')?.value || '',
+    proxy_type: document.getElementById('tor-set-proxy-type')?.value || 'none',
+    proxy_hostname: (document.getElementById('tor-set-proxy-host')?.value || '').trim(),
+    proxy_port: intVal('tor-set-proxy-port', 1080),
+    proxy_username: (document.getElementById('tor-set-proxy-user')?.value || '').trim(),
+    proxy_peer_connections: Boolean(document.getElementById('tor-set-proxy-peers')?.checked),
+    proxy_tracker_connections: Boolean(document.getElementById('tor-set-proxy-trackers')?.checked),
+    proxy_hostnames: Boolean(document.getElementById('tor-set-proxy-dns')?.checked),
+    force_proxy: Boolean(document.getElementById('tor-set-force-proxy')?.checked),
+  };
+  const passInput = document.getElementById('tor-set-proxy-pass')?.value || '';
+  if (passInput) {
+    payload.proxy_password = passInput;
+  }
   try {
     _torrentSettings = await apiJSON('/api/torrents/settings', { method: 'POST', json: payload });
-    toast('Torrent engine settings saved', 'success');
+    toast('Torrent engine settings saved and applied', 'success');
     if (_view === 'settings') renderSettings();
   } catch (e) {
     toast('Failed to save torrent settings: ' + e.message, 'error');
@@ -8901,9 +9216,15 @@ function renderTorrentsView(isSilentRefresh = false) {
   const activeWindowBytes = _torrentJobs.reduce((acc, j) => acc + (['streaming', 'fetching_metadata'].includes(j.status) ? Number(j.stats?.window_bytes || 0) : 0), 0);
   const windowCapMb = Number(_torrentSettings.window_mb || 24);
   const engineWarn = _torrentSettings && _torrentSettings.engine_available === false
-    ? `<div style="padding:var(--space-3) var(--space-4);border:1px solid var(--color-warning);border-radius:var(--radius-md);background:color-mix(in oklab,var(--color-warning) 10%,transparent);font-size:var(--text-xs);color:var(--color-text);display:flex;align-items:center;gap:var(--space-2)">
-         <svg data-lucide="alert-triangle" width="16" height="16" style="color:var(--color-warning);flex-shrink:0"></svg>
-         <span><strong>libtorrent not detected in this container runtime.</strong> Rebuild the Docker image (<code style="font-family:var(--font-mono)">docker compose build</code>) to install native <code style="font-family:var(--font-mono)">python3-libtorrent</code>.</span>
+    ? `<div style="padding:var(--space-3) var(--space-4);border:1px solid var(--color-warning);border-radius:var(--radius-md);background:color-mix(in oklab,var(--color-warning) 10%,transparent);font-size:var(--text-xs);color:var(--color-text);display:flex;align-items:center;justify-content:space-between;gap:var(--space-3);flex-wrap:wrap">
+         <div style="display:flex;align-items:center;gap:var(--space-2);min-width:220px;flex:1">
+           <svg data-lucide="alert-triangle" width="16" height="16" style="color:var(--color-warning);flex-shrink:0"></svg>
+           <span><strong>libtorrent not detected in this container runtime.</strong> Install it right now into the container or rebuild the Docker image (<code style="font-family:var(--font-mono)">docker compose build --no-cache</code>).</span>
+         </div>
+         <button class="btn btn-primary btn-sm" onclick="installTorrentEngine()" ${_torrentInstallingEngine ? 'disabled' : ''}>
+           <svg data-lucide="${_torrentInstallingEngine ? 'loader' : 'download'}" width="14" height="14"></svg>
+           ${_torrentInstallingEngine ? 'Installing libtorrent...' : 'Install libtorrent Now'}
+         </button>
        </div>`
     : '';
 

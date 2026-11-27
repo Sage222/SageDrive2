@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
 # Install existing dependencies + Samba, Rclone, FUSE, FFmpeg, and native libtorrent
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -19,7 +19,10 @@ RUN sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf
 WORKDIR /app
 ENV DATA_DIR=/app/data
 COPY backend/requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt \
+    && (python3 -c "import libtorrent; print('libtorrent ready (apt):', getattr(libtorrent, '__version__', libtorrent.version))" \
+        || (pip install --no-cache-dir --prefer-binary libtorrent && python3 -c "import libtorrent; print('libtorrent ready (pip):', getattr(libtorrent, '__version__', libtorrent.version))"))
 
 # Copy backend files to /app
 COPY backend/ ./

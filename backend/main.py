@@ -4538,6 +4538,18 @@ def save_torrent_settings():
         return jsonify({"error": str(e)}), 400
 
 
+@app.post("/api/torrents/install-engine")
+@auth.require_admin
+def install_torrent_engine():
+    uname = (getattr(request, "user", None) or {}).get("username", "admin")
+    try:
+        result = _get_torrent_mgr().install_engine(user=uname)
+        status_code = 200 if result.get("ok") else 500
+        return jsonify(result), status_code
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "message": str(e)}), 500
+
+
 @app.post("/api/torrents/inspect")
 @auth.require_admin
 def inspect_torrent():

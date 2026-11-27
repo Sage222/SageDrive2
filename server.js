@@ -4584,10 +4584,31 @@ const TORRENTS_STATE_FILE = path.join(DATA_DIR, 'torrents_state.json');
 const TORRENT_SETTINGS_FILE = path.join(DATA_DIR, 'torrent_settings.json');
 const DEFAULT_TORRENT_SETTINGS = {
   listen_port: 6881,
+  listen_interface: '0.0.0.0',
   window_mb: 24,
   max_connections: 60,
+  max_uploads: 4,
   download_rate_limit_kbps: 0,
+  upload_rate_limit_kbps: 256,
   default_conflict_action: 'keep_both',
+  enable_dht: true,
+  enable_pex: true,
+  enable_lsd: false,
+  enable_upnp: true,
+  enable_natpmp: true,
+  enable_utp: true,
+  encryption_mode: 'enabled',
+  anonymous_mode: false,
+  extra_trackers: '',
+  proxy_type: 'none',
+  proxy_hostname: '',
+  proxy_port: 1080,
+  proxy_username: '',
+  proxy_password: '',
+  proxy_peer_connections: true,
+  proxy_tracker_connections: true,
+  proxy_hostnames: true,
+  force_proxy: false,
 };
 
 const torrentUpload = multer({
@@ -4765,26 +4786,99 @@ function parseMagnetUri(rawUri) {
   };
 }
 
-function validateTorrentSettings(raw) {
+function asTorrentBool(val, defVal) {
+  if (typeof val === 'boolean') return val;
+  if (typeof val === 'number') return Boolean(val);
+  if (typeof val === 'string') {
+    const low = val.trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(low)) return true;
+    if (['0', 'false', 'no', 'off'].includes(low)) return false;
+  }
+  return Boolean(defVal);
+}
+
+function validateTorrentSettings(raw, existing = {}) {
   const src = raw && typeof raw === 'object' ? raw : {};
-  const listen_port = Math.max(1024, Math.min(65535, parseInt(src.listen_port ?? DEFAULT_TORRENT_SETTINGS.listen_port, 10) || 6881));
-  const window_mb = Math.max(8, Math.min(64, parseInt(src.window_mb ?? DEFAULT_TORRENT_SETTINGS.window_mb, 10) || 24));
-  const max_connections = Math.max(10, Math.min(300, parseInt(src.max_connections ?? DEFAULT_TORRENT_SETTINGS.max_connections, 10) || 60));
-  const download_rate_limit_kbps = Math.max(0, Math.min(1000000, parseInt(src.download_rate_limit_kbps ?? 0, 10) || 0));
+  const prev = existing && typeof existing === 'object' ? existing : {};
+  const parseNum = (v, fallback) => {
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) ? n : fallback;
+  };
+  const listen_port = Math.max(1024, Math.min(65535, parseNum(src.listen_port, DEFAULT_TORRENT_SETTINGS.listen_port)));
+  const listen_interface = String(src.listen_interface || '0.0.0.0').trim().replace(/[^0-9a-zA-Z._:\-\[\]]+/g, '').slice(0, 128) || '0.0.0.0';
+  const window_mb = Math.max(8, Math.min(64, parseNum(src.window_mb, DEFAULT_TORRENT_SETTINGS.window_mb)));
+  const max_connections = Math.max(10, Math.min(500, parseNum(src.max_connections, DEFAULT_TORRENT_SETTINGS.max_connections)));
+  const max_uploads = Math.max(-1, Math.min(200, parseNum(src.max_uploads, DEFAULT_TORRENT_SETTINGS.max_uploads)));
+  const download_rate_limit_kbps = Math.max(0, Math.min(1000000, parseNum(src.download_rate_limit_kbps, DEFAULT_TORRENT_SETTINGS.download_rate_limit_kbps)));
+  const upload_rate_limit_kbps = Math.max(0, Math.min(1000000, parseNum(src.upload_rate_limit_kbps, DEFAULT_TORRENT_SETTINGS.upload_rate_limit_kbps)));
   let default_conflict_action = String(src.default_conflict_action || 'keep_both').trim().toLowerCase();
   if (!['keep_both', 'skip', 'replace'].includes(default_conflict_action)) default_conflict_action = 'keep_both';
+  let encryption_mode = String(src.encryption_mode || 'enabled').trim().toLowerCase();
+  if (!['disabled', 'enabled', 'forced'].includes(encryption_mode)) encryption_mode = 'enabled';
+  let proxy_type = String(src.proxy_type || 'none').trim().toLowerCase();
+  if (!['none', 'socks5', 'socks4', 'http'].includes(proxy_type)) proxy_type = 'none';
+  const proxy_hostname = String(src.proxy_hostname || '').trim().replace(/[\s\r\n]+/g, '').slice(0, 255);
+  const proxy_port = Math.max(1, Math.min(65535, parseNum(src.proxy_port, DEFAULT_TORRENT_SETTINGS.proxy_port)));
+  const proxy_username = String(src.proxy_username || '').trim().slice(0, 128);
+  let proxy_password = String(prev.proxy_password || '');
+  if (asTorrentBool(src.clear_proxy_password, false)) {
+    proxy_password = '';
+  } else if (typeof src.proxy_password === 'string' && src.proxy_password !== '') {
+    proxy_password = src.proxy_password.slice(0, 256);
+  }
+  const trackers = [];
+  const seenTr = new Set();
+  for (const line of String(src.extra_trackers || '').replace(/,/g, '\n').split(/\r?\n/)) {
+    const u = line.trim();
+    const low = u.toLowerCase();
+    if (!u || !(low.startsWith('udp://') || low.startsWith('http://') || low.startsWith('https://') || low.startsWith('wss://') || low.startsWith('ws://'))) continue;
+    if (!seenTr.has(u)) {
+      seenTr.add(u);
+      trackers.push(u);
+    }
+    if (trackers.length >= 50) break;
+  }
   return {
     listen_port,
+    listen_interface,
     window_mb,
     max_connections,
+    max_uploads,
     download_rate_limit_kbps,
+    upload_rate_limit_kbps,
     default_conflict_action,
+    enable_dht: asTorrentBool(src.enable_dht, DEFAULT_TORRENT_SETTINGS.enable_dht),
+    enable_pex: asTorrentBool(src.enable_pex, DEFAULT_TORRENT_SETTINGS.enable_pex),
+    enable_lsd: asTorrentBool(src.enable_lsd, DEFAULT_TORRENT_SETTINGS.enable_lsd),
+    enable_upnp: asTorrentBool(src.enable_upnp, DEFAULT_TORRENT_SETTINGS.enable_upnp),
+    enable_natpmp: asTorrentBool(src.enable_natpmp, DEFAULT_TORRENT_SETTINGS.enable_natpmp),
+    enable_utp: asTorrentBool(src.enable_utp, DEFAULT_TORRENT_SETTINGS.enable_utp),
+    encryption_mode,
+    anonymous_mode: asTorrentBool(src.anonymous_mode, DEFAULT_TORRENT_SETTINGS.anonymous_mode),
+    extra_trackers: trackers.join('\n'),
+    proxy_type,
+    proxy_hostname,
+    proxy_port,
+    proxy_username,
+    proxy_password,
+    proxy_peer_connections: asTorrentBool(src.proxy_peer_connections, DEFAULT_TORRENT_SETTINGS.proxy_peer_connections),
+    proxy_tracker_connections: asTorrentBool(src.proxy_tracker_connections, DEFAULT_TORRENT_SETTINGS.proxy_tracker_connections),
+    proxy_hostnames: asTorrentBool(src.proxy_hostnames, DEFAULT_TORRENT_SETTINGS.proxy_hostnames),
+    force_proxy: asTorrentBool(src.force_proxy, DEFAULT_TORRENT_SETTINGS.force_proxy),
     engine_available: true,
     engine_version: 'preview-stream',
   };
 }
 
-let torrentSettings = validateTorrentSettings(loadJson(TORRENT_SETTINGS_FILE, DEFAULT_TORRENT_SETTINGS));
+function publicTorrentSettings(cfg) {
+  const out = { ...cfg };
+  out.proxy_password_set = Boolean(cfg.proxy_password);
+  out.proxy_password = '';
+  return out;
+}
+
+const loadedRawTorrentSettings = loadJson(TORRENT_SETTINGS_FILE, DEFAULT_TORRENT_SETTINGS);
+let torrentSettings = validateTorrentSettings(loadedRawTorrentSettings, loadedRawTorrentSettings);
 let torrentJobs = (() => {
   const loaded = loadJson(TORRENTS_STATE_FILE, []);
   if (!Array.isArray(loaded)) return [];
@@ -5013,28 +5107,42 @@ setInterval(() => {
 app.get('/api/torrents', requireAuth, (_req, res) => {
   return res.json({
     jobs: torrentJobs,
-    settings: torrentSettings,
+    settings: publicTorrentSettings(torrentSettings),
     engine_available: true,
     engine_version: 'preview-stream',
   });
 });
 
 app.get('/api/torrents/settings', requireAuth, (_req, res) => {
-  return res.json(torrentSettings);
+  return res.json(publicTorrentSettings(torrentSettings));
 });
 
 app.post('/api/torrents/settings', requireAdmin, (req, res) => {
-  torrentSettings = validateTorrentSettings({ ...torrentSettings, ...(req.body || {}) });
+  torrentSettings = validateTorrentSettings({ ...torrentSettings, ...(req.body || {}) }, torrentSettings);
   saveJson(TORRENT_SETTINGS_FILE, torrentSettings);
+  const proxyDesc = torrentSettings.proxy_type !== 'none' && torrentSettings.proxy_hostname
+    ? `, proxy ${torrentSettings.proxy_type.toUpperCase()}://${torrentSettings.proxy_hostname}:${torrentSettings.proxy_port}`
+    : '';
   addActivityLog(
     req,
     'Torrent Settings Updated',
     'change',
-    `Port ${torrentSettings.listen_port}, window ${torrentSettings.window_mb} MiB, max peers ${torrentSettings.max_connections}`,
+    `Port ${torrentSettings.listen_port}, window ${torrentSettings.window_mb} MiB, DL ${torrentSettings.download_rate_limit_kbps} KB/s, UL ${torrentSettings.upload_rate_limit_kbps} KB/s, enc ${torrentSettings.encryption_mode}${proxyDesc}`,
     'Torrents',
     'Engine Settings'
   );
-  return res.json(torrentSettings);
+  return res.json(publicTorrentSettings(torrentSettings));
+});
+
+app.post('/api/torrents/install-engine', requireAdmin, (_req, res) => {
+  return res.json({
+    ok: true,
+    already_installed: true,
+    engine_available: true,
+    engine_version: 'preview-stream',
+    method: 'preview',
+    message: 'libtorrent streaming engine is already ready in this environment.',
+  });
 });
 
 app.post('/api/torrents/inspect', requireAdmin, torrentUpload.single('file'), (req, res) => {

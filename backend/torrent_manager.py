@@ -624,7 +624,23 @@ class _ActiveJobStreamer:
 
     def on_bytes_streamed(self, file_idx: int, uploaded_bytes: int, delta: int):
         self._up_bytes_window += max(0, int(delta))
+        now = time.time()
+        dt = max(0.15, now - self._up_rate_ts)
+        if dt >= 0.5:
+            self._up_rate = int(self._up_bytes_window / dt)
+            self._up_bytes_window = 0
+            self._up_rate_ts = now
+        elif self._up_rate == 0 and self._up_bytes_window > 0:
+            self._up_rate = int(self._up_bytes_window / dt)
         self.manager._update_file_progress(self.job_id, file_idx, uploaded_bytes)
+        try:
+            finfo = self.tinfo.files()
+            abs_pos = int(finfo.file_offset(file_idx)) + int(uploaded_bytes)
+            cur_piece = max(0, min(self.num_pieces - 1, abs_pos // self.piece_length))
+            _, last_piece = self.file_piece_bounds(file_idx)
+            self.refresh_stats(cur_piece, last_piece, force=True)
+        except Exception:
+            pass
 
 
 class TorrentManager:
@@ -1782,7 +1798,7 @@ class TorrentManager:
             smb_manager.upload_chunk(share_id, resolved_path, b"", offset=0, truncate=True)
             return resolved_path
 
-        chunk_unit = 4 * 1024 * 1024  # 4 MiB sequential SMB writes
+        chunk_unit = 1 * 1024 * 1024  # 1 MiB sequential SMB writes for responsive live progress
         offset = 0
         fd = None
         punched_up_to = 0

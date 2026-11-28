@@ -1014,8 +1014,14 @@ def spa(path):
     static = Path(app.static_folder)
     target = static / path
     if path and target.exists():
-        return send_from_directory(app.static_folder, path)
-    return send_from_directory(app.static_folder, "index.html")
+        resp = send_from_directory(app.static_folder, path)
+    else:
+        resp = send_from_directory(app.static_folder, "index.html")
+    if not path or path.endswith(".html"):
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+    return resp
 
 # ── Persistent Activity Logs (Capped at 500 entries) ─────────────────────────
 _LOGS_FILE = Path(os.environ.get("DATA_DIR", "/app/data")) / "activity_logs.json"

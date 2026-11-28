@@ -2260,6 +2260,15 @@ function fmtSize(bytes) {
   return (bytes/1073741824).toFixed(2)+'GB';
 }
 
+function formatSize(bytes) {
+  const n = Number(bytes || 0);
+  if (!Number.isFinite(n) || n <= 0) return '0 B';
+  if (n < 1024) return `${Math.round(n)} B`;
+  if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1073741824) return `${(n / 1048576).toFixed(1)} MB`;
+  return `${(n / 1073741824).toFixed(2)} GB`;
+}
+
 function fmtDate(ts) {
   if (!ts) return '';
   const d = typeof ts==='number' ? new Date(ts*1000) : new Date(ts);
@@ -7080,14 +7089,21 @@ function copyTextToClipboard(text, label = 'Copied to clipboard') {
 }
 
 async function renderSettings() {
+  if (_view !== 'settings') return;
   setBreadcrumb([{name:'Settings'}]);
   setTopbarActions('');
   await refreshShares();
+  if (_view !== 'settings') return;
   await refreshGDStatus();
+  if (_view !== 'settings') return;
   await refreshODStatus();
+  if (_view !== 'settings') return;
   await refreshFJStatus();
+  if (_view !== 'settings') return;
   await refreshActivityLogs();
+  if (_view !== 'settings') return;
   await refreshTorrents(true);
+  if (_view !== 'settings') return;
   try { smbProxyCreds = await apiJSON('/api/smb/proxy-credentials'); } catch(_) {}
   if (_view !== 'settings') return;
 
@@ -9036,17 +9052,19 @@ async function torrentAction(jobId, action, fileIndex = null) {
     if (action === 'delete') {
       const job = _torrentJobs.find(j => j.id === jobId);
       const label = job ? job.name : 'this torrent';
+      const isActive = job && ['streaming', 'fetching_metadata', 'queued', 'paused'].includes(job.status);
+      const destLabel = job && job.destination ? getTorrentProviderLabel(job.destination.provider) : 'your destination storage';
       showModal(`
         <div class="modal-header">
-          <h3 class="modal-title">Remove Torrent</h3>
+          <h3 class="modal-title">${isActive ? 'Cancel Torrent' : 'Remove Torrent'}</h3>
           <button class="btn btn-ghost btn-icon" onclick="closeModal()"><svg data-lucide="x" width="16" height="16"></svg></button>
         </div>
         <div class="modal-body" style="font-size:var(--text-sm);color:var(--color-text-muted);line-height:1.5">
-          Remove <strong style="color:var(--color-text)">${escHtml(label)}</strong> from the queue and discard any transient sliding-window buffer? Files already uploaded to Google Drive or FileJump will remain intact.
+          ${isActive ? 'Cancel and remove' : 'Remove'} <strong style="color:var(--color-text)">${escHtml(label)}</strong> from the queue and discard any transient sliding-window buffer? Files already written to ${escHtml(destLabel)} will remain intact.
         </div>
         <div class="modal-footer">
-          <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-          <button class="btn btn-danger" onclick="confirmDeleteTorrent('${escAttr(jobId)}')">Remove Torrent</button>
+          <button class="btn btn-secondary" onclick="closeModal()">Keep</button>
+          <button class="btn btn-danger" onclick="confirmDeleteTorrent('${escAttr(jobId)}')">${isActive ? 'Cancel Torrent' : 'Remove Torrent'}</button>
         </div>
       `);
       return;
@@ -9208,13 +9226,14 @@ async function saveTorrentSettings() {
 }
 
 function renderTorrentsView(isSilentRefresh = false) {
+  if (_view !== 'torrents') return;
   if (!isSilentRefresh) {
     refreshTorrents(true);
   }
   setBreadcrumb([{ name: 'Torrents' }]);
   setTopbarActions(`
-    <button class="btn btn-secondary btn-sm" onclick="setView('settings','torrents')" title="Configure zero-disk torrent engine settings">
-      <svg data-lucide="sliders" width="14" height="14"></svg> Engine Settings
+    <button class="btn btn-secondary btn-sm" onclick="refreshTorrents(false)" title="Refresh torrent queue and live speeds">
+      <svg data-lucide="refresh-cw" width="14" height="14"></svg> Refresh
     </button>
     <button class="btn btn-primary btn-sm" onclick="openAddTorrentModal()">
       <svg data-lucide="plus" width="14" height="14"></svg> Add Torrent
@@ -9242,47 +9261,37 @@ function renderTorrentsView(isSilentRefresh = false) {
   const totalPeerUpRate = activeJobs.reduce((acc, j) => acc + Number(j.stats?.peer_upload_rate || 0), 0);
   const totalTargetRate = activeJobs.reduce((acc, j) => acc + Number(j.stats?.upload_rate || 0), 0);
   const totalPeers = activeJobs.reduce((acc, j) => acc + Number(j.stats?.peers || 0), 0);
-  const windowCapMb = Number(_torrentSettings.window_mb || 24);
-  const engineWarn = _torrentSettings && _torrentSettings.engine_available === false
-    ? `<div style="padding:var(--space-3) var(--space-4);border:1px solid var(--color-warning);border-radius:var(--radius-md);background:color-mix(in oklab,var(--color-warning) 10%,transparent);font-size:var(--text-xs);color:var(--color-text);display:flex;align-items:center;justify-content:space-between;gap:var(--space-3);flex-wrap:wrap">
-         <div style="display:flex;align-items:center;gap:var(--space-2);min-width:220px;flex:1">
-           <svg data-lucide="alert-triangle" width="16" height="16" style="color:var(--color-warning);flex-shrink:0"></svg>
-           <span><strong>libtorrent not detected in this container runtime.</strong> Install it right now into the container or rebuild the Docker image (<code style="font-family:var(--font-mono)">docker compose build --no-cache</code>).</span>
-         </div>
-         <button class="btn btn-primary btn-sm" onclick="installTorrentEngine()" ${_torrentInstallingEngine ? 'disabled' : ''}>
-           <svg data-lucide="${_torrentInstallingEngine ? 'loader' : 'download'}" width="14" height="14"></svg>
-           ${_torrentInstallingEngine ? 'Installing libtorrent...' : 'Install libtorrent Now'}
-         </button>
-       </div>`
-    : '';
+  const windowCapMb = Number((_torrentSettings && _torrentSettings.window_mb) || 24);
 
   const rowsHtml = filtered.length
     ? `<div class="torrent-list-panel">
-        ${filtered.map(job => {
+        ${filtered.map((job, idx) => {
           const dest = job.destination || {};
           const providerLabel = getTorrentProviderLabel(dest.provider);
           const st = getTorrentStatusInfo(job.status, dest.provider);
           const stats = job.stats || {};
           const total = Number(stats.total_bytes || 0);
           const uploaded = Number(stats.uploaded_bytes || 0);
-          const pct = job.status === 'completed' ? 100 : (total > 0 ? Math.min(100, Math.round((uploaded / total) * 1000) / 10) : 0);
           const winBytes = Number(stats.window_bytes || 0);
           const winCap = Number(stats.window_cap_bytes || (windowCapMb * 1024 * 1024));
+          const pct = job.status === 'completed' ? 100 : (total > 0 ? Math.min(100, Math.round((uploaded / total) * 1000) / 10) : 0);
           const bufPct = total > 0 ? Math.min(100, pct + Math.round((winBytes / total) * 1000) / 10) : 0;
           const selectedCount = (job.files || []).filter(f => f.selected !== false).length;
+          const completedFilesCount = (job.files || []).filter(f => f.selected !== false && f.status === 'completed').length;
           const activeFileObj = (job.files || []).find(f => f.status === 'streaming');
           const activeFileName = job.active_file || (activeFileObj ? (activeFileObj.relative_path || activeFileObj.name) : '');
           const isExpanded = _torrentExpandedIds.has(job.id);
           const canPause = ['streaming', 'fetching_metadata', 'queued'].includes(job.status);
           const canResume = job.status === 'paused';
           const canRetry = job.status === 'error';
+          const isActiveOrQueued = ['streaming', 'fetching_metadata', 'queued', 'paused'].includes(job.status);
           const downRate = Number(stats.download_rate || 0);
           const peerUpRate = Number(stats.peer_upload_rate || 0);
           const targetUpRate = Number(stats.upload_rate || 0);
           const peersCount = Number(stats.peers || 0);
           const seedsCount = Number(stats.seeds || 0);
           const etaLabel = job.status === 'completed'
-            ? 'Done'
+            ? 'Completed'
             : (['streaming', 'fetching_metadata', 'queued'].includes(job.status)
                 ? `ETA ${formatTorrentEta(stats.eta_seconds)}`
                 : 'ETA —');
@@ -9290,7 +9299,7 @@ function renderTorrentsView(isSilentRefresh = false) {
           const filesDrawer = isExpanded ? `
             <div class="torrent-files-drawer">
               <div style="display:flex;align-items:center;justify-content:space-between;gap:var(--space-2);margin-bottom:var(--space-2);font-size:11px;color:var(--color-text-muted)">
-                <span>Sequential 1-file-at-a-time stream · InfoHash <code style="font-family:var(--font-mono)">${escHtml((job.info_hash || '').slice(0, 16))}</code> · Policy: ${escHtml(dest.conflict_action || 'keep_both')}</span>
+                <span>Queue #${idx + 1} · Sequential 1-file-at-a-time stream · InfoHash <code style="font-family:var(--font-mono)">${escHtml((job.info_hash || '').slice(0, 16))}</code> · Policy: ${escHtml(dest.conflict_action || 'keep_both')}</span>
                 <button class="btn btn-ghost btn-sm" style="padding:3px 8px;font-size:11px" onclick="openTorrentDestination('${escAttr(job.id)}')">
                   <svg data-lucide="folder-open" width="12" height="12"></svg> Open Destination
                 </button>
@@ -9327,7 +9336,7 @@ function renderTorrentsView(isSilentRefresh = false) {
             <div class="torrent-row">
               <div class="torrent-row-main">
                 <div style="min-width:0;cursor:pointer" onclick="toggleTorrentExpand('${escAttr(job.id)}')">
-                  <div class="torrent-title" title="${escHtml(job.name)}">${escHtml(job.name)}</div>
+                  <div class="torrent-title" title="${escHtml(job.name)}">#${idx + 1} · ${escHtml(job.name)}</div>
                   <div class="torrent-meta-inline">
                     <span>${escHtml(providerLabel)}</span>
                     <span aria-hidden="true">·</span>
@@ -9335,17 +9344,18 @@ function renderTorrentsView(isSilentRefresh = false) {
                     <span aria-hidden="true">·</span>
                     <span>${escHtml(dest.folder_path || '/')}</span>
                     <span aria-hidden="true">·</span>
-                    <span class="torrent-meta-mono">${selectedCount ? `${selectedCount} file${selectedCount === 1 ? '' : 's'}` : 'Resolving files'}</span>
-                    ${total > 0 ? `<span aria-hidden="true">·</span><span class="torrent-meta-mono">${formatSize(total)}</span>` : ''}
+                    <span class="torrent-meta-mono">${selectedCount ? `${completedFilesCount}/${selectedCount} file${selectedCount === 1 ? '' : 's'}` : 'Resolving files'}</span>
+                    <span aria-hidden="true">·</span>
+                    <span class="torrent-meta-mono">Size ${total > 0 ? formatSize(total) : 'Resolving…'}</span>
                   </div>
                   ${activeFileName && job.status === 'streaming'
-                    ? `<div style="font-size:11px;color:var(--color-text-muted);margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="Currently streaming: ${escHtml(activeFileName)}">Active: <span style="color:var(--color-text)">${escHtml(activeFileName)}</span></div>`
+                    ? `<div style="font-size:11px;color:var(--color-text-muted);margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="Currently downloading: ${escHtml(activeFileName)}">Downloading: <span style="color:var(--color-text)">${escHtml(activeFileName)}</span></div>`
                     : ''}
                   ${job.error_message ? `<div style="font-size:11px;color:var(--color-error);margin-top:4px">${escHtml(job.error_message)}</div>` : ''}
                 </div>
 
                 <div style="display:flex;flex-direction:column;gap:5px;min-width:0">
-                  <div class="torrent-prog-track" title="Solid: confirmed written to destination · Subtle: transient sliding-window buffer">
+                  <div class="torrent-prog-track" title="Solid: written to destination · Subtle: buffered in sliding window">
                     <div class="torrent-prog-window" style="width:${bufPct}%"></div>
                     <div class="torrent-prog-cloud ${job.status === 'completed' ? 'done' : (job.status === 'error' ? 'err' : '')}" style="width:${pct}%"></div>
                   </div>
@@ -9361,28 +9371,28 @@ function renderTorrentsView(isSilentRefresh = false) {
                     <span>${escHtml(st.label)}</span>
                   </div>
                   <div class="torrent-meta-inline torrent-meta-mono" style="margin-top:0;font-size:11px">
-                    <span title="Swarm download speed">↓ ${formatTorrentRate(downRate)}</span>
+                    <span title="Download speed from peers">DL ↓ ${formatTorrentRate(downRate)}</span>
                     <span aria-hidden="true">·</span>
-                    <span title="Peer upload speed">↑ ${formatTorrentRate(peerUpRate)}</span>
-                    ${targetUpRate > 0 ? `<span aria-hidden="true">·</span><span title="Write speed to ${escHtml(providerLabel)}">→ ${formatTorrentRate(targetUpRate)}</span>` : ''}
+                    <span title="Upload speed to peers">UL ↑ ${formatTorrentRate(peerUpRate)}</span>
+                    ${targetUpRate > 0 ? `<span aria-hidden="true">·</span><span title="Write speed to ${escHtml(providerLabel)}">Write → ${formatTorrentRate(targetUpRate)}</span>` : ''}
                   </div>
                   <div class="torrent-meta-mono" style="font-size:11px;color:var(--color-text-faint)">
                     Peers ${peersCount} (${seedsCount} seeds) · Buf ${formatSize(winBytes)} / ${formatSize(winCap)}
                   </div>
                 </div>
 
-                <div class="torrent-actions">
-                  ${canPause ? `<button class="btn btn-ghost btn-icon" onclick="torrentAction('${escAttr(job.id)}','pause')" title="Pause transfer"><svg data-lucide="pause" width="15" height="15"></svg></button>` : ''}
-                  ${canResume ? `<button class="btn btn-ghost btn-icon" onclick="torrentAction('${escAttr(job.id)}','resume')" title="Resume transfer"><svg data-lucide="play" width="15" height="15"></svg></button>` : ''}
-                  ${canRetry ? `<button class="btn btn-ghost btn-icon" onclick="torrentAction('${escAttr(job.id)}','retry')" title="Retry transfer"><svg data-lucide="rotate-cw" width="15" height="15"></svg></button>` : ''}
-                  <button class="btn btn-ghost btn-icon" onclick="toggleTorrentExpand('${escAttr(job.id)}')" title="${isExpanded ? 'Hide files' : 'Inspect files'}">
-                    <svg data-lucide="${isExpanded ? 'chevron-up' : 'chevron-down'}" width="15" height="15"></svg>
+                <div class="torrent-actions" style="flex-wrap:wrap;justify-content:flex-end">
+                  ${canPause ? `<button class="btn btn-secondary btn-sm" style="padding:4px 9px;font-size:11px" onclick="torrentAction('${escAttr(job.id)}','pause')" title="Pause torrent download"><svg data-lucide="pause" width="13" height="13"></svg> Pause</button>` : ''}
+                  ${canResume ? `<button class="btn btn-primary btn-sm" style="padding:4px 9px;font-size:11px" onclick="torrentAction('${escAttr(job.id)}','resume')" title="Resume torrent download"><svg data-lucide="play" width="13" height="13"></svg> Resume</button>` : ''}
+                  ${canRetry ? `<button class="btn btn-primary btn-sm" style="padding:4px 9px;font-size:11px" onclick="torrentAction('${escAttr(job.id)}','retry')" title="Retry torrent download"><svg data-lucide="rotate-cw" width="13" height="13"></svg> Retry</button>` : ''}
+                  <button class="btn btn-ghost btn-sm" style="padding:4px 8px;font-size:11px" onclick="toggleTorrentExpand('${escAttr(job.id)}')" title="${isExpanded ? 'Hide files in torrent' : 'Show files in torrent'}">
+                    <svg data-lucide="${isExpanded ? 'chevron-up' : 'chevron-down'}" width="13" height="13"></svg> Files
                   </button>
-                  <button class="btn btn-ghost btn-icon" onclick="openTorrentDestination('${escAttr(job.id)}')" title="Open destination folder">
-                    <svg data-lucide="folder-open" width="15" height="15"></svg>
+                  <button class="btn btn-ghost btn-sm" style="padding:4px 8px;font-size:11px" onclick="openTorrentDestination('${escAttr(job.id)}')" title="Open destination folder">
+                    <svg data-lucide="folder-open" width="13" height="13"></svg> Folder
                   </button>
-                  <button class="btn btn-ghost btn-icon" style="color:var(--color-error)" onclick="torrentAction('${escAttr(job.id)}','delete')" title="Remove torrent">
-                    <svg data-lucide="trash-2" width="15" height="15"></svg>
+                  <button class="btn btn-ghost btn-sm" style="padding:4px 8px;font-size:11px;color:var(--color-error)" onclick="torrentAction('${escAttr(job.id)}','delete')" title="${isActiveOrQueued ? 'Cancel and remove torrent' : 'Remove torrent from list'}">
+                    <svg data-lucide="x-circle" width="13" height="13"></svg> ${isActiveOrQueued ? 'Cancel' : 'Remove'}
                   </button>
                 </div>
               </div>
@@ -9393,18 +9403,17 @@ function renderTorrentsView(isSilentRefresh = false) {
       </div>`
     : `<div class="empty-state" style="border:1px dashed var(--color-border);border-radius:var(--radius-lg);padding:var(--space-10) var(--space-4)">
          <svg data-lucide="magnet" width="44" height="44" style="color:var(--color-primary)"></svg>
-         <h3 style="font-size:var(--text-base);margin-top:var(--space-2)">${_torrentJobs.length ? 'No matching torrents in this filter' : 'Zero-Disk Torrent Streaming'}</h3>
+         <h3 style="font-size:var(--text-base);margin-top:var(--space-2)">${_torrentJobs.length ? 'No matching torrents in this filter' : 'No Active Torrents in Queue'}</h3>
          <p style="font-size:var(--text-xs);color:var(--color-text-muted);max-width:54ch;line-height:1.55">
            ${_torrentJobs.length
              ? 'Switch filters above to view other torrent transfers.'
-             : 'Paste a magnet link or upload a .torrent file to stream verified pieces straight into Google Drive, FileJump, or your Local SMB NAS with a bounded sliding-window buffer and zero persistent container disk accumulation.'}
+             : 'Add a magnet link or .torrent file to monitor download progress, speeds, size, peers, ETA, and pause/resume/cancel controls while streaming straight to Google Drive, FileJump, or your Local SMB NAS.'}
          </p>
-         ${!_torrentJobs.length ? `<button class="btn btn-primary btn-sm" style="margin-top:var(--space-2)" onclick="openAddTorrentModal()"><svg data-lucide="plus" width="14" height="14"></svg> Add First Torrent</button>` : ''}
+         ${!_torrentJobs.length ? `<button class="btn btn-primary btn-sm" style="margin-top:var(--space-2)" onclick="openAddTorrentModal()"><svg data-lucide="plus" width="14" height="14"></svg> Add Torrent</button>` : ''}
        </div>`;
 
   document.getElementById('content-area').innerHTML = `
     <div class="torrent-wrap">
-      ${engineWarn}
       <div class="torrent-toolbar">
         <div class="torrent-filter-bar" role="tablist" aria-label="Filter torrents">
           <button class="torrent-filter-btn ${_torrentFilter==='all'?'active':''}" onclick="setTorrentFilter('all')">All (${counts.all})</button>
@@ -9414,14 +9423,14 @@ function renderTorrentsView(isSilentRefresh = false) {
           <button class="torrent-filter-btn ${_torrentFilter==='error'?'active':''}" onclick="setTorrentFilter('error')">Failed (${counts.error})</button>
         </div>
         <div class="torrent-summary-line">
-          <span title="Total swarm download speed">↓ ${formatTorrentRate(totalDownRate)}</span>
+          <span title="Total swarm download speed">DL ↓ ${formatTorrentRate(totalDownRate)}</span>
           <span aria-hidden="true">·</span>
-          <span title="Total peer upload speed">↑ ${formatTorrentRate(totalPeerUpRate)}</span>
-          ${totalTargetRate > 0 ? `<span aria-hidden="true">·</span><span title="Total storage write speed">→ ${formatTorrentRate(totalTargetRate)}</span>` : ''}
+          <span title="Total peer upload speed">UL ↑ ${formatTorrentRate(totalPeerUpRate)}</span>
+          ${totalTargetRate > 0 ? `<span aria-hidden="true">·</span><span title="Total storage write speed">Write → ${formatTorrentRate(totalTargetRate)}</span>` : ''}
           <span aria-hidden="true">·</span>
           <span>Peers ${totalPeers}</span>
           <span aria-hidden="true">·</span>
-          <span>Window ${formatSize(activeWindowBytes)} / ${windowCapMb} MB</span>
+          <span>Buffer ${formatSize(activeWindowBytes)} / ${windowCapMb} MB</span>
         </div>
       </div>
       ${rowsHtml}

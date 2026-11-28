@@ -25,29 +25,51 @@ import smb_manager
 lt = None
 LIBTORRENT_AVAILABLE = False
 LIBTORRENT_VERSION = None
+LIBTORRENT_SOURCE = ""
 
 
 def _ensure_dist_packages_on_path():
-    """Ensure Debian/Ubuntu system dist-packages are visible to Python inside Docker."""
-    for candidate in ("/usr/lib/python3/dist-packages", "/usr/local/lib/python3/dist-packages"):
+    """
+    Ensure pip site-packages come BEFORE Debian/Ubuntu /usr/lib/python3/dist-packages
+    so PyPI binary wheel upgrades always take precedence over older apt packages.
+    """
+    try:
+        for sp in reversed(site.getsitepackages()):
+            if os.path.isdir(sp):
+                if sp in sys.path:
+                    sys.path.remove(sp)
+                sys.path.insert(0, sp)
+    except Exception:
+        pass
+    for candidate in ("/usr/local/lib/python3/dist-packages", "/usr/lib/python3/dist-packages"):
         if os.path.isdir(candidate) and candidate not in sys.path:
             sys.path.append(candidate)
 
 
-def _try_import_libtorrent():
-    global lt, LIBTORRENT_AVAILABLE, LIBTORRENT_VERSION
+def _try_import_libtorrent(force_reload: bool = False):
+    global lt, LIBTORRENT_AVAILABLE, LIBTORRENT_VERSION, LIBTORRENT_SOURCE
     _ensure_dist_packages_on_path()
     try:
         importlib.invalidate_caches()
+        if force_reload and "libtorrent" in sys.modules:
+            del sys.modules["libtorrent"]
         mod = importlib.import_module("libtorrent")
         lt = mod
         LIBTORRENT_AVAILABLE = True
         LIBTORRENT_VERSION = str(getattr(mod, "__version__", getattr(mod, "version", "available")) or "available")
+        mod_file = str(getattr(mod, "__file__", "") or "")
+        if "/site-packages/" in mod_file or "/usr/local/" in mod_file:
+            LIBTORRENT_SOURCE = "PyPI wheel"
+        elif "/dist-packages/" in mod_file:
+            LIBTORRENT_SOURCE = "Debian apt"
+        else:
+            LIBTORRENT_SOURCE = "system"
         return True
     except Exception:
         lt = None
         LIBTORRENT_AVAILABLE = False
         LIBTORRENT_VERSION = None
+        LIBTORRENT_SOURCE = ""
         return False
 
 
@@ -63,11 +85,12 @@ MAX_TORRENT_FILE_BYTES = 15 * 1024 * 1024  # 15 MiB cap for .torrent metadata up
 DEFAULT_SETTINGS = {
     "listen_port": 6881,
     "listen_interface": "0.0.0.0",
-    "window_mb": 24,
-    "max_connections": 60,
-    "max_uploads": 4,
+    "window_mb": 128,                 # 128 MiB default (configurable 16..512 MiB)
+    "max_active_torrents": 2,         # Concurrent active torrents (1..10), each streaming 1 file at a time
+    "max_connections": 200,           # 10..1000 peers
+    "max_uploads": 8,
     "download_rate_limit_kbps": 0,    # 0 = unlimited
-    "upload_rate_limit_kbps": 256,    # 0 = unlimited; modest default avoids starving cloud uploads
+    "upload_rate_limit_kbps": 512,    # 0 = unlimited; balances swarm reciprocity and cloud upload headroom
     "default_conflict_action": "keep_both",
     "enable_dht": True,
     "enable_pex": True,
@@ -87,6 +110,7 @@ DEFAULT_SETTINGS = {
     "proxy_tracker_connections": True,
     "proxy_hostnames": True,
     "force_proxy": False,
+    "perf_v2_migrated": True,
 }
 
 # Linux fallocate flags for releasing already-streamed blocks back to the OS
@@ -408,7 +432,11 @@ class _TorrentSequentialReader:
 
 
 class _ActiveJobStreamer:
-    """Manages the bounded sliding piece window for a single active libtorrent handle."""
+    """
+    Manages the bounded sliding piece window (up to 512 MiB) for a single active
+    libtorrent handle, with a background look-ahead prefetcher thread that keeps
+    the piece pipeline saturated while destination writes are in flight.
+    """
 
     def __init__(self, manager, job_id: str, handle, tinfo, save_dir: Path, window_bytes: int):
         self.manager = manager
@@ -418,10 +446,14 @@ class _ActiveJobStreamer:
         self.save_dir = save_dir
         self.piece_length = max(16384, int(tinfo.piece_length()))
         self.num_pieces = max(1, int(tinfo.num_pieces()))
+        self._win_lock = threading.RLock()
         self.window_bytes = max(8 * 1024 * 1024, int(window_bytes))
-        self.window_pieces = max(4, min(64, int(self.window_bytes // self.piece_length) + 2))
+        self.window_pieces = max(8, min(512, int(self.window_bytes // self.piece_length) + 4))
         self._active_window_start = -1
         self._active_window_end = -1
+        self._active_missing_count = -1
+        self._cursor_piece = 0
+        self._file_last_piece = max(0, self.num_pieces - 1)
         self._last_stat_ts = 0.0
         self._last_reannounce_ts = time.time()
         self._up_bytes_window = 0
@@ -429,12 +461,47 @@ class _ActiveJobStreamer:
         self._up_rate = 0
         self._stop_event = threading.Event()
         try:
-            self.handle.set_sequential_download(True)
+            # We manage explicit sliding-window piece priorities & graduated deadlines
+            # rather than global sequential mode so multi-file selection and look-ahead
+            # pipelining across dozens of peers run at maximum throughput.
+            self.handle.set_sequential_download(False)
         except Exception:
             pass
+        self._prefetch_thread = threading.Thread(
+            target=self._prefetch_loop,
+            name=f"sagedrive-prefetch-{job_id}",
+            daemon=True,
+        )
+        self._prefetch_thread.start()
 
     def request_stop(self):
         self._stop_event.set()
+
+    def update_window_bytes(self, new_window_bytes: int):
+        with self._win_lock:
+            self.window_bytes = max(8 * 1024 * 1024, int(new_window_bytes))
+            self.window_pieces = max(8, min(512, int(self.window_bytes // self.piece_length) + 4))
+            if self._active_window_start >= 0:
+                self.set_window(self._cursor_piece, self._file_last_piece, force=True)
+
+    def _prefetch_loop(self):
+        """
+        Continuously slides the piece window forward as in-flight pieces complete,
+        even while the upload thread is blocked sending a multi-megabyte chunk to
+        SMB NAS, Google Drive, or FileJump.
+        """
+        while not self._stop_event.wait(timeout=0.25):
+            try:
+                if self._stop_event.is_set():
+                    break
+                with self._win_lock:
+                    cur = self._cursor_piece
+                    last_p = self._file_last_piece
+                    if self._active_window_start >= 0:
+                        self.set_window(cur, last_p, force=False)
+                self.refresh_stats(cur, last_p, force=False)
+            except Exception:
+                pass
 
     def _check_abort(self):
         if self._stop_event.is_set():
@@ -456,49 +523,85 @@ class _ActiveJobStreamer:
 
     def set_window(self, start_piece: int, file_last_piece: int, force: bool = False):
         """
-        Keep a strictly bounded sliding window of active pieces while NEVER
-        passing an all-zero priority list (which would cause libtorrent to mark
-        the torrent finished and disconnect all seeders!).
+        Keep a strictly bounded sliding window of up to `window_pieces` un-downloaded
+        pieces active across peers while NEVER passing an all-zero priority list.
         """
-        start_piece = max(0, min(start_piece, self.num_pieces - 1))
-        file_last_piece = max(start_piece, min(file_last_piece, self.num_pieces - 1))
+        with self._win_lock:
+            start_piece = max(0, min(start_piece, self.num_pieces - 1))
+            file_last_piece = max(start_piece, min(file_last_piece, self.num_pieces - 1))
+            self._cursor_piece = start_piece
+            self._file_last_piece = file_last_piece
 
-        # Expand end_piece up to window_pieces un-downloaded pieces (bounded to 2x window_pieces max)
-        end_piece = min(file_last_piece, start_piece + self.window_pieces - 1)
-        missing_in_win = 0
-        p_scan = start_piece
-        max_scan = min(file_last_piece, start_piece + self.window_pieces * 2 - 1)
-        while p_scan <= max_scan and missing_in_win < self.window_pieces:
-            if not self.handle.have_piece(p_scan):
-                missing_in_win += 1
-            end_piece = max(end_piece, p_scan)
-            p_scan += 1
+            # Advance past already-verified contiguous pieces at the front of the window
+            # so completed pieces inside the buffer don't consume active look-ahead slots
+            end_piece = min(file_last_piece, start_piece + self.window_pieces - 1)
+            missing_pieces = []
+            p_scan = start_piece
+            max_scan = min(file_last_piece, start_piece + self.window_pieces * 2 - 1)
+            while p_scan <= max_scan and len(missing_pieces) < self.window_pieces:
+                if not self.handle.have_piece(p_scan):
+                    missing_pieces.append(p_scan)
+                end_piece = max(end_piece, p_scan)
+                p_scan += 1
 
-        if not force and start_piece == self._active_window_start and end_piece == self._active_window_end:
-            return
+            missing_in_win = len(missing_pieces)
+            if (
+                not force
+                and start_piece == self._active_window_start
+                and end_piece == self._active_window_end
+                and missing_in_win == self._active_missing_count
+            ):
+                return
 
-        priorities = [0] * self.num_pieces
-        for p in range(start_piece, end_piece + 1):
-            dist = p - start_piece
-            priorities[p] = 7 if dist == 0 else (6 if dist <= 3 else 4)
+            priorities = [0] * self.num_pieces
+            for p in range(start_piece, end_piece + 1):
+                dist = p - start_piece
+                if dist <= 1:
+                    priorities[p] = 7
+                elif dist <= 7:
+                    priorities[p] = 6
+                elif dist <= 23:
+                    priorities[p] = 5
+                else:
+                    priorities[p] = 4
 
-        # If every piece in this window is already downloaded, keep the next piece after end_piece
-        # at low priority (1) so libtorrent stays in downloading state and keeps seeders connected
-        if missing_in_win == 0 and end_piece + 1 < self.num_pieces:
-            priorities[end_piece + 1] = 1
+            # If every piece in the current file's window is already downloaded, keep the next piece
+            # at low priority (1) so libtorrent stays in downloading state and keeps seeders connected
+            if missing_in_win == 0 and end_piece + 1 < self.num_pieces:
+                priorities[end_piece + 1] = 1
 
-        self.handle.prioritize_pieces(priorities)
-        for p in range(start_piece, end_piece + 1):
-            if not self.handle.have_piece(p):
+            self.handle.prioritize_pieces(priorities)
+            # Set graduated piece deadlines across the front 32 missing pieces so libtorrent
+            # pipelines block requests across multiple fast seeders in parallel
+            for idx, p in enumerate(missing_pieces[:32]):
                 try:
-                    self.handle.set_piece_deadline(p, (p - start_piece) * 250)
+                    self.handle.set_piece_deadline(p, 150 + idx * 120)
                 except Exception:
                     pass
-        self._active_window_start = start_piece
-        self._active_window_end = end_piece
+
+            self._active_window_start = start_piece
+            self._active_window_end = end_piece
+            self._active_missing_count = missing_in_win
+
+    def peek_contiguous_ready_bytes(self, abs_start: int, max_want: int, file_idx: int) -> int:
+        """
+        Return how many contiguous verified bytes starting at `abs_start` are already
+        available in the sliding window (up to `max_want`), allowing fast persistent
+        SMB writes to batch up to 4 MiB whenever the buffer is ahead.
+        """
+        piece_idx = abs_start // self.piece_length
+        if not self.handle.have_piece(piece_idx):
+            return 0
+        offset_in_piece = abs_start % self.piece_length
+        ready = min(max_want, self.piece_length - offset_in_piece)
+        cur_p = piece_idx + 1
+        while ready < max_want and cur_p < self.num_pieces and self.handle.have_piece(cur_p):
+            ready = min(max_want, ready + self.piece_length)
+            cur_p += 1
+        return ready
 
     def _estimate_window_usage(self, cursor_piece: int, file_last_piece: int) -> int:
-        end_p = min(file_last_piece, self.num_pieces - 1, cursor_piece + self.window_pieces - 1)
+        end_p = min(file_last_piece, self.num_pieces - 1, max(cursor_piece + self.window_pieces - 1, self._active_window_end))
         buffered = 0
         for p in range(cursor_piece, end_p + 1):
             if self.handle.have_piece(p):
@@ -507,7 +610,7 @@ class _ActiveJobStreamer:
 
     def refresh_stats(self, cursor_piece: int = 0, file_last_piece: int = 0, force: bool = False):
         now = time.time()
-        if not force and (now - self._last_stat_ts) < 0.75:
+        if not force and (now - self._last_stat_ts) < 0.6:
             return
         self._last_stat_ts = now
         try:
@@ -516,8 +619,8 @@ class _ActiveJobStreamer:
             peer_ul_rate = int(getattr(st, "upload_rate", 0) or 0)
             peers = int(getattr(st, "num_peers", 0) or 0)
             seeds = int(getattr(st, "num_seeds", 0) or 0)
-            # If stuck with 0 peers for 20s, trigger tracker/DHT reannounce
-            if peers == 0 and (now - self._last_reannounce_ts) > 20.0:
+            # If stuck with 0 peers for 15s, trigger tracker/DHT reannounce
+            if peers == 0 and (now - self._last_reannounce_ts) > 15.0:
                 self._last_reannounce_ts = now
                 try:
                     self.handle.force_reannounce()
@@ -550,7 +653,7 @@ class _ActiveJobStreamer:
         Safely open and pread verified piece bytes from libtorrent's sparse file.
         Handles async disk-cache flush latency in libtorrent 1.2 & 2.0 cleanly.
         """
-        deadline = time.time() + 20.0
+        deadline = time.time() + 25.0
         flushed_once = False
         while True:
             self._check_abort()
@@ -565,7 +668,7 @@ class _ActiveJobStreamer:
                                 pass
                         if time.time() > deadline:
                             raise FileNotFoundError(f"Torrent backing file not flushed to scratch: {backing_path.name}")
-                        time.sleep(0.08)
+                        time.sleep(0.05)
                         continue
                     fd = os.open(str(backing_path), os.O_RDWR)
                 chunk = os.pread(fd, length, file_pos)
@@ -581,11 +684,11 @@ class _ActiveJobStreamer:
                         pass
                 if time.time() > deadline:
                     raise RuntimeError(f"Timed out waiting for sparse torrent bytes at offset {file_pos} ({backing_path.name})")
-                time.sleep(0.08)
+                time.sleep(0.05)
             except FileNotFoundError:
                 if time.time() > deadline:
                     raise
-                time.sleep(0.08)
+                time.sleep(0.05)
 
     def wait_for_range(self, abs_start: int, want: int, file_idx: int, file_pos: int) -> int:
         piece_idx = abs_start // self.piece_length
@@ -600,11 +703,11 @@ class _ActiveJobStreamer:
         while not self.handle.have_piece(piece_idx):
             self._check_abort()
             self.refresh_stats(piece_idx, file_last_piece)
-            time.sleep(0.15)
+            time.sleep(0.08)
         self.refresh_stats(piece_idx, file_last_piece)
         return readable_in_piece
 
-    def wait_initial_buffer(self, file_idx: int, target_bytes: int = 2 * 1024 * 1024):
+    def wait_initial_buffer(self, file_idx: int, target_bytes: int = 4 * 1024 * 1024):
         """Wait until the first piece(s) of a file are verified before opening an HTTP upload stream."""
         finfo = self.tinfo.files()
         f_off = finfo.file_offset(file_idx)
@@ -619,7 +722,7 @@ class _ActiveJobStreamer:
             while not self.handle.have_piece(p):
                 self._check_abort()
                 self.refresh_stats(first_p, last_p)
-                time.sleep(0.15)
+                time.sleep(0.08)
         self.refresh_stats(first_p, last_p, force=True)
 
     def on_bytes_streamed(self, file_idx: int, uploaded_bytes: int, delta: int):
@@ -638,6 +741,7 @@ class _ActiveJobStreamer:
             abs_pos = int(finfo.file_offset(file_idx)) + int(uploaded_bytes)
             cur_piece = max(0, min(self.num_pieces - 1, abs_pos // self.piece_length))
             _, last_piece = self.file_piece_bounds(file_idx)
+            self.set_window(cur_piece, last_piece, force=False)
             self.refresh_stats(cur_piece, last_piece, force=True)
         except Exception:
             pass
@@ -651,8 +755,8 @@ class TorrentManager:
         self._jobs = []
         self._settings = dict(DEFAULT_SETTINGS)
         self._session = None
-        self._active_streamer = None
-        self._active_job_id = None
+        self._active_streamers = {}  # job_id -> _ActiveJobStreamer
+        self._active_job_ids = set()
         self._wake_event = threading.Event()
         self._worker_started = False
 
@@ -712,9 +816,24 @@ class TorrentManager:
             try:
                 raw = json.loads(TORRENT_SETTINGS_FILE.read_text(encoding="utf-8"))
                 if isinstance(raw, dict):
+                    needs_save = False
+                    # One-time automatic migration from the old 24 MiB / 60-peer defaults to 128 MiB / 200-peer defaults
+                    if not raw.get("perf_v2_migrated"):
+                        if int(raw.get("window_mb", 24) or 24) <= 24:
+                            raw["window_mb"] = 128
+                        if int(raw.get("max_connections", 60) or 60) <= 60:
+                            raw["max_connections"] = 200
+                        if int(raw.get("max_uploads", 4) or 4) <= 4:
+                            raw["max_uploads"] = 8
+                        if int(raw.get("upload_rate_limit_kbps", 256) or 256) == 256:
+                            raw["upload_rate_limit_kbps"] = 512
+                        raw["perf_v2_migrated"] = True
+                        needs_save = True
                     merged = dict(DEFAULT_SETTINGS)
                     merged.update(raw)
                     self._settings = self._validate_settings(merged, existing=raw)
+                    if needs_save:
+                        self._save_settings()
                     return
             except Exception:
                 pass
@@ -736,13 +855,19 @@ class TorrentManager:
             window_mb = int(raw.get("window_mb", DEFAULT_SETTINGS["window_mb"]))
         except Exception:
             window_mb = DEFAULT_SETTINGS["window_mb"]
-        window_mb = max(8, min(64, window_mb))
+        window_mb = max(8, min(512, window_mb))
+
+        try:
+            max_active = int(raw.get("max_active_torrents", DEFAULT_SETTINGS["max_active_torrents"]))
+        except Exception:
+            max_active = DEFAULT_SETTINGS["max_active_torrents"]
+        max_active = max(1, min(10, max_active))
 
         try:
             max_conn = int(raw.get("max_connections", DEFAULT_SETTINGS["max_connections"]))
         except Exception:
             max_conn = DEFAULT_SETTINGS["max_connections"]
-        max_conn = max(10, min(500, max_conn))
+        max_conn = max(10, min(1000, max_conn))
 
         try:
             max_uploads = int(raw.get("max_uploads", DEFAULT_SETTINGS["max_uploads"]))
@@ -795,6 +920,7 @@ class TorrentManager:
             "listen_port": listen_port,
             "listen_interface": listen_interface,
             "window_mb": window_mb,
+            "max_active_torrents": max_active,
             "max_connections": max_conn,
             "max_uploads": max_uploads,
             "download_rate_limit_kbps": dl_limit,
@@ -818,6 +944,7 @@ class TorrentManager:
             "proxy_tracker_connections": self._as_bool(raw.get("proxy_tracker_connections"), DEFAULT_SETTINGS["proxy_tracker_connections"]),
             "proxy_hostnames": self._as_bool(raw.get("proxy_hostnames"), DEFAULT_SETTINGS["proxy_hostnames"]),
             "force_proxy": self._as_bool(raw.get("force_proxy"), DEFAULT_SETTINGS["force_proxy"]),
+            "perf_v2_migrated": True,
         }
 
     def _save_settings(self):
@@ -835,6 +962,8 @@ class TorrentManager:
             out["proxy_password"] = ""
             out["engine_available"] = LIBTORRENT_AVAILABLE
             out["engine_version"] = str(LIBTORRENT_VERSION or "")
+            out["engine_source"] = str(LIBTORRENT_SOURCE or "")
+            out["active_torrents_count"] = len(self._active_job_ids)
             return out
 
     def update_settings(self, updates: dict, user="admin"):
@@ -846,55 +975,86 @@ class TorrentManager:
             self._save_settings()
             if self._session is not None:
                 self._apply_session_settings(self._session)
-            proxy_desc = (
-                f", proxy {self._settings['proxy_type'].upper()}://{self._settings['proxy_hostname']}:{self._settings['proxy_port']}"
-                if self._settings["proxy_type"] != "none" and self._settings["proxy_hostname"]
-                else ""
-            )
-            self._log(
-                "Torrent Settings Updated",
-                "change",
-                (
-                    f"Port {self._settings['listen_port']}, window {self._settings['window_mb']} MiB, "
-                    f"DL {self._settings['download_rate_limit_kbps']} KB/s, UL {self._settings['upload_rate_limit_kbps']} KB/s, "
-                    f"enc {self._settings['encryption_mode']}{proxy_desc}"
-                ),
-                drive="Torrents",
-                target="Engine Settings",
-                user=user,
-            )
-            return self.get_settings()
+            new_win_bytes = int(self._settings["window_mb"]) * 1024 * 1024
+            active_streamers = list(self._active_streamers.values())
+            for j in self._jobs:
+                if "stats" in j:
+                    j["stats"]["window_cap_bytes"] = new_win_bytes
+            self._save_jobs_unlocked()
 
-    def install_engine(self, user="admin"):
-        """Install libtorrent at runtime inside the running Docker container (pip wheel or apt python3-libtorrent)."""
+        for streamer in active_streamers:
+            try:
+                streamer.update_window_bytes(new_win_bytes)
+            except Exception:
+                pass
+        # Wake worker loop in case max_active_torrents was increased
+        self._wake_event.set()
+
+        proxy_desc = (
+            f", proxy {self._settings['proxy_type'].upper()}://{self._settings['proxy_hostname']}:{self._settings['proxy_port']}"
+            if self._settings["proxy_type"] != "none" and self._settings["proxy_hostname"]
+            else ""
+        )
+        self._log(
+            "Torrent Settings Updated",
+            "change",
+            (
+                f"Port {self._settings['listen_port']}, window {self._settings['window_mb']} MiB, "
+                f"max active {self._settings['max_active_torrents']}, "
+                f"DL {self._settings['download_rate_limit_kbps']} KB/s, UL {self._settings['upload_rate_limit_kbps']} KB/s, "
+                f"enc {self._settings['encryption_mode']}{proxy_desc}"
+            ),
+            drive="Torrents",
+            target="Engine Settings",
+            user=user,
+        )
+        return self.get_settings()
+
+    def install_engine(self, user="admin", force_upgrade: bool = False):
+        """
+        Install or upgrade libtorrent at runtime inside the running Docker container,
+        prioritizing the latest prebuilt binary wheel from PyPI (`pip install --upgrade --prefer-binary libtorrent`).
+        """
         with self._install_lock:
-            if _try_import_libtorrent():
+            prev_version = str(LIBTORRENT_VERSION or "")
+            if not force_upgrade and _try_import_libtorrent():
                 return {
                     "ok": True,
                     "already_installed": True,
                     "engine_available": True,
                     "engine_version": str(LIBTORRENT_VERSION or ""),
+                    "engine_source": str(LIBTORRENT_SOURCE or ""),
                     "method": "existing",
-                    "message": f"libtorrent ({LIBTORRENT_VERSION}) is already installed and ready.",
+                    "message": f"libtorrent {LIBTORRENT_VERSION} ({LIBTORRENT_SOURCE or 'installed'}) is already active.",
                 }
 
             logs = []
-            # 1) Try prebuilt binary wheel via pip (fast, no compiler required)
+            # 1) Always try latest prebuilt binary wheel from PyPI first
             try:
+                pip_cmd = [
+                    sys.executable, "-m", "pip", "install",
+                    "--no-cache-dir", "--upgrade", "--prefer-binary", "libtorrent",
+                ]
                 res = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "--no-cache-dir", "--prefer-binary", "libtorrent"],
+                    pip_cmd,
                     capture_output=True,
                     text=True,
                     timeout=240,
                     shell=False,
                 )
-                snippet = ((res.stdout or "") + "\n" + (res.stderr or "")).strip()[-1200:]
+                snippet = ((res.stdout or "") + "\n" + (res.stderr or "")).strip()[-1400:]
                 logs.append(f"[pip] exit={res.returncode}\n{snippet}")
-                if _try_import_libtorrent():
+                if _try_import_libtorrent(force_reload=True):
+                    action_lbl = "Upgraded" if (force_upgrade and prev_version) else "Installed"
+                    ver_note = (
+                        f"{prev_version} → {LIBTORRENT_VERSION}"
+                        if (prev_version and prev_version != LIBTORRENT_VERSION)
+                        else str(LIBTORRENT_VERSION)
+                    )
                     self._log(
-                        "Torrent Engine Installed",
-                        "add",
-                        f"Installed libtorrent {LIBTORRENT_VERSION} via pip binary wheel",
+                        f"Torrent Engine {action_lbl}",
+                        "change" if force_upgrade else "add",
+                        f"{action_lbl} libtorrent ({ver_note}) via PyPI binary wheel",
                         drive="Torrents",
                         target="libtorrent",
                         user=user,
@@ -905,13 +1065,15 @@ class TorrentManager:
                         "already_installed": False,
                         "engine_available": True,
                         "engine_version": str(LIBTORRENT_VERSION or ""),
+                        "engine_source": str(LIBTORRENT_SOURCE or "PyPI wheel"),
                         "method": "pip",
-                        "message": f"Successfully installed libtorrent {LIBTORRENT_VERSION} via pip.",
+                        "message": f"Successfully installed latest PyPI libtorrent wheel: v{LIBTORRENT_VERSION} ({LIBTORRENT_SOURCE}).",
+                        "details": snippet,
                     }
             except Exception as exc:
                 logs.append(f"[pip] exception: {exc}")
 
-            # 2) Fallback: Debian/Ubuntu apt-get python3-libtorrent + site-packages .pth bridge
+            # 2) Fallback: Debian/Ubuntu apt-get python3-libtorrent + low-priority .pth bridge
             if shutil.which("apt-get"):
                 env = dict(os.environ)
                 env["DEBIAN_FRONTEND"] = "noninteractive"
@@ -937,11 +1099,11 @@ class TorrentManager:
                     try:
                         sp_dirs = site.getsitepackages()
                         if sp_dirs and os.path.isdir("/usr/lib/python3/dist-packages"):
-                            pth = Path(sp_dirs[0]) / "debian_dist_packages.pth"
+                            pth = Path(sp_dirs[0]) / "zz_debian_dist_packages.pth"
                             pth.write_text("/usr/lib/python3/dist-packages\n", encoding="utf-8")
                     except Exception:
                         pass
-                    if _try_import_libtorrent():
+                    if _try_import_libtorrent(force_reload=True):
                         self._log(
                             "Torrent Engine Installed",
                             "add",
@@ -956,8 +1118,10 @@ class TorrentManager:
                             "already_installed": False,
                             "engine_available": True,
                             "engine_version": str(LIBTORRENT_VERSION or ""),
+                            "engine_source": str(LIBTORRENT_SOURCE or "Debian apt"),
                             "method": "apt",
-                            "message": f"Successfully installed python3-libtorrent {LIBTORRENT_VERSION} via apt.",
+                            "message": f"Installed python3-libtorrent {LIBTORRENT_VERSION} via apt.",
+                            "details": snippet,
                         }
                 except Exception as exc:
                     logs.append(f"[apt] exception: {exc}")
@@ -966,17 +1130,18 @@ class TorrentManager:
             self._log(
                 "Torrent Engine Install Failed",
                 "change",
-                "Runtime libtorrent install failed; rebuild Docker image with python:3.11-slim-bookworm",
+                "Runtime libtorrent install/upgrade failed",
                 drive="Torrents",
                 target="libtorrent",
                 user=user,
             )
             return {
                 "ok": False,
-                "engine_available": False,
-                "engine_version": "",
+                "engine_available": LIBTORRENT_AVAILABLE,
+                "engine_version": str(LIBTORRENT_VERSION or ""),
+                "engine_source": str(LIBTORRENT_SOURCE or ""),
                 "method": "none",
-                "message": "Could not install libtorrent at runtime. Rebuild the Docker image (`docker compose build --no-cache`) to bundle libtorrent natively.",
+                "message": "Could not install or upgrade libtorrent at runtime. Rebuild the Docker image (`docker compose build --no-cache`) to bundle the latest PyPI wheel.",
                 "details": detail,
             }
 
@@ -1067,6 +1232,7 @@ class TorrentManager:
             force_proxy_val = bool(s.get("force_proxy", False))
 
         utp_enabled = bool(s.get("enable_utp", True))
+        max_active = max(1, int(s.get("max_active_torrents") or 2))
         return {
             "listen_interfaces": listen_str,
             "enable_dht": bool(s.get("enable_dht", True)),
@@ -1075,10 +1241,26 @@ class TorrentManager:
             "enable_natpmp": bool(s.get("enable_natpmp", True)),
             "enable_incoming_utp": utp_enabled,
             "enable_outgoing_utp": utp_enabled,
-            "connections_limit": int(s.get("max_connections") or 60),
-            "unchoke_slots_limit": int(s.get("max_uploads", 4)),
+            "connections_limit": int(s.get("max_connections") or 200),
+            "unchoke_slots_limit": int(s.get("max_uploads", 8)),
             "download_rate_limit": int(s.get("download_rate_limit_kbps") or 0) * 1024,
             "upload_rate_limit": int(s.get("upload_rate_limit_kbps") or 0) * 1024,
+            # High-throughput session pipeline tuning
+            "aio_threads": 8,
+            "checking_mem_usage": 1024,
+            "max_queued_disk_bytes": 64 * 1024 * 1024,
+            "send_buffer_watermark": 32 * 1024 * 1024,
+            "send_buffer_low_watermark": 1024 * 1024,
+            "send_buffer_watermark_factor": 150,
+            "request_queue_time": 3,
+            "max_out_request_queue": 1500,
+            "max_allowed_in_request_queue": 2000,
+            "active_downloads": max(8, max_active * 2),
+            "active_seeds": max(4, max_active),
+            "active_limit": max(32, max_active * 4),
+            "torrent_connect_boost": 64,
+            "connection_speed": 50,
+            "mixed_mode_algorithm": 0,  # prefer_tcp so uTP congestion control never throttles TCP peers
             "in_enc_policy": enc_val,
             "out_enc_policy": enc_val,
             "anonymous_mode": bool(s.get("anonymous_mode", False)),
@@ -1099,7 +1281,7 @@ class TorrentManager:
             ses.apply_settings(pack)
             return
         except Exception:
-            # Some keys (e.g. force_proxy in libtorrent 2.0) may be deprecated; apply valid keys individually
+            # Apply valid keys individually across libtorrent 1.2 / 2.0
             for k, v in pack.items():
                 try:
                     ses.apply_settings({k: v})
@@ -1109,7 +1291,7 @@ class TorrentManager:
     def _ensure_session(self):
         if not LIBTORRENT_AVAILABLE and not _try_import_libtorrent():
             raise RuntimeError(
-                "libtorrent is not installed in this runtime. Click 'Install libtorrent Now' in Settings → Torrents or rebuild the Docker container."
+                "libtorrent is not installed in this runtime. Click 'Install / Upgrade libtorrent' in Settings → Torrents or rebuild the Docker container."
             )
         if self._session is None:
             base = {
@@ -1122,6 +1304,7 @@ class TorrentManager:
                     self._session.add_dht_router("router.bittorrent.com", 6881)
                     self._session.add_dht_router("router.utorrent.com", 6881)
                     self._session.add_dht_router("dht.transmissionbt.com", 6881)
+                    self._session.add_dht_router("dht.libtorrent.org", 25401)
                 except Exception:
                     pass
         return self._session
@@ -1130,7 +1313,7 @@ class TorrentManager:
         if self._worker_started:
             return
         self._worker_started = True
-        t = threading.Thread(target=self._worker_loop, name="sagedrive-torrent-worker", daemon=True)
+        t = threading.Thread(target=self._worker_loop, name="sagedrive-torrent-scheduler", daemon=True)
         t.start()
 
     def _recompute_job_totals(self, job: dict):
@@ -1297,10 +1480,12 @@ class TorrentManager:
             job["stats"]["upload_rate"] = 0
             job["stats"]["window_bytes"] = 0
             job["updated_at"] = _now_iso()
-            if self._active_job_id == job_id and self._active_streamer:
-                self._active_streamer.request_stop()
+            streamer = self._active_streamers.get(job_id)
+            if streamer is not None:
+                streamer.request_stop()
             self._save_jobs_unlocked()
         self._log("Torrent Paused", "change", f"Paused torrent '{job['name']}'", drive="Torrents", target=job["name"], user=user)
+        self._wake_event.set()
         return self.get_job(job_id)
 
     def resume_job(self, job_id: str, user="admin"):
@@ -1354,8 +1539,9 @@ class TorrentManager:
             removed_name = job.get("name") or job_id
             meta_file = job.get("meta_file") or ""
             job["status"] = "cancelled"
-            if self._active_job_id == job_id and self._active_streamer:
-                self._active_streamer.request_stop()
+            streamer = self._active_streamers.get(job_id)
+            if streamer is not None:
+                streamer.request_stop()
             # Cancel any open Google Drive resumable upload sessions cleanly
             for f in job.get("files", []):
                 uri = f.get("gdrive_resumable_uri")
@@ -1371,22 +1557,47 @@ class TorrentManager:
                 pass
         shutil.rmtree(SCRATCH_ROOT / job_id, ignore_errors=True)
         self._log("Torrent Removed", "delete", f"Removed torrent '{removed_name}' and cleared transient buffer", drive="Torrents", target=removed_name, user=user)
+        self._wake_event.set()
         return True
 
     def _worker_loop(self):
         while True:
-            self._wake_event.wait(timeout=2.0)
+            self._wake_event.wait(timeout=1.5)
             self._wake_event.clear()
             while True:
                 next_job_id = None
                 with self._lock:
-                    # FIFO among queued jobs (oldest queued first)
-                    queued = [j for j in reversed(self._jobs) if j.get("status") == "queued"]
+                    max_active = max(1, int(self._settings.get("max_active_torrents") or 2))
+                    if len(self._active_job_ids) >= max_active:
+                        break
+                    # FIFO among queued jobs not already running
+                    queued = [
+                        j for j in reversed(self._jobs)
+                        if j.get("status") == "queued" and j.get("id") not in self._active_job_ids
+                    ]
                     if queued:
                         next_job_id = queued[0]["id"]
+                        self._active_job_ids.add(next_job_id)
                 if not next_job_id:
                     break
-                self._run_job(next_job_id)
+                t = threading.Thread(
+                    target=self._run_job_wrapper,
+                    args=(next_job_id,),
+                    name=f"sagedrive-torrent-job-{next_job_id}",
+                    daemon=True,
+                )
+                t.start()
+
+    def _run_job_wrapper(self, job_id: str):
+        try:
+            self._run_job(job_id)
+        finally:
+            with self._lock:
+                self._active_job_ids.discard(job_id)
+                streamer = self._active_streamers.pop(job_id, None)
+                if streamer is not None:
+                    streamer.request_stop()
+            self._wake_event.set()
 
     def _run_job(self, job_id: str):
         job_snap = self.get_job(job_id)
@@ -1396,8 +1607,10 @@ class TorrentManager:
         save_dir = SCRATCH_ROOT / job_id
         handle = None
         ses = None
+        streamer = None
         try:
-            ses = self._ensure_session()
+            with self._lock:
+                ses = self._ensure_session()
             save_dir.mkdir(parents=True, exist_ok=True)
 
             with self._lock:
@@ -1452,7 +1665,7 @@ class TorrentManager:
                 )
                 if time.time() > meta_deadline:
                     raise TimeoutError("Timed out waiting for magnet metadata (no peers responded within 3 minutes)")
-                time.sleep(0.4)
+                time.sleep(0.35)
 
             tinfo = handle.torrent_file()
 
@@ -1496,15 +1709,14 @@ class TorrentManager:
             win_bytes = int(self._settings["window_mb"]) * 1024 * 1024
             streamer = _ActiveJobStreamer(self, job_id, handle, tinfo, save_dir, win_bytes)
             with self._lock:
-                self._active_job_id = job_id
-                self._active_streamer = streamer
+                self._active_streamers[job_id] = streamer
 
             # Immediately activate the first file's sliding window so seeders stay connected!
             if first_selected_idx is not None:
                 fp_start, fp_end = streamer.file_piece_bounds(first_selected_idx)
                 streamer.set_window(fp_start, fp_end, force=True)
 
-            # Stream selected files strictly 1 file at a time
+            # Stream selected files strictly 1 file at a time within this torrent job
             while True:
                 next_file = None
                 with self._lock:
@@ -1587,10 +1799,10 @@ class TorrentManager:
                         user=job.get("created_by", "admin"),
                     )
         finally:
+            if streamer is not None:
+                streamer.request_stop()
             with self._lock:
-                if self._active_job_id == job_id:
-                    self._active_job_id = None
-                    self._active_streamer = None
+                self._active_streamers.pop(job_id, None)
             if ses is not None and handle is not None:
                 try:
                     ses.remove_torrent(handle, lt.session.delete_files)
@@ -1712,7 +1924,7 @@ class TorrentManager:
             )
             return ""
 
-        chunk_unit = 5 * 1024 * 1024  # 5 MiB (multiple of 256 KiB required by Google Drive)
+        chunk_unit = 8 * 1024 * 1024  # 8 MiB (multiple of 256 KiB required by Google Drive)
         fd = None
         punched_up_to = offset
         try:
@@ -1760,10 +1972,9 @@ class TorrentManager:
                 total_size=0, conflict_action=conflict_action,
             )
 
-        # Pre-buffer up to half the sliding window (or full file if smaller than window)
-        # so FileJump's HTTP upload connection never times out waiting on slow initial peers
-        prebuf = min(file_size, max(4 * 1024 * 1024, streamer.window_bytes // 2))
-        if file_size <= streamer.window_bytes:
+        # Pre-buffer up to 16 MiB (or full file if smaller) so FileJump's HTTP stream starts hot
+        prebuf = min(file_size, 16 * 1024 * 1024, max(4 * 1024 * 1024, streamer.window_bytes // 4))
+        if file_size <= streamer.window_bytes and file_size <= 16 * 1024 * 1024:
             prebuf = file_size
         streamer.wait_initial_buffer(fidx, target_bytes=prebuf)
         reader = _TorrentSequentialReader(streamer, fidx, file_size, file_offset, backing_path)
@@ -1794,19 +2005,28 @@ class TorrentManager:
         if should_skip:
             return resolved_path
 
+        smb_writer = smb_manager.PersistentSMBWriter(share_id, resolved_path)
         if file_size == 0:
-            smb_manager.upload_chunk(share_id, resolved_path, b"", offset=0, truncate=True)
+            try:
+                smb_writer.write_chunk(b"", offset=0, truncate=True)
+            finally:
+                smb_writer.close()
             return resolved_path
 
-        chunk_unit = 1 * 1024 * 1024  # 1 MiB sequential SMB writes for responsive live progress
+        min_chunk_unit = 1 * 1024 * 1024  # 1 MiB minimum for responsive progress on live downloads
+        max_chunk_unit = 4 * 1024 * 1024  # 4 MiB burst when pieces are already buffered in sliding window
         offset = 0
         fd = None
         punched_up_to = 0
         try:
             while offset < file_size:
                 streamer._check_abort()
+                rem_bytes = file_size - offset
+                ready_now = streamer.peek_contiguous_ready_bytes(
+                    file_offset + offset, min(max_chunk_unit, rem_bytes), fidx
+                )
+                target_chunk = min(rem_bytes, max(min_chunk_unit, ready_now))
                 buf = bytearray()
-                target_chunk = min(chunk_unit, file_size - offset)
                 cur_read_pos = offset
                 while len(buf) < target_chunk:
                     want = target_chunk - len(buf)
@@ -1815,8 +2035,8 @@ class TorrentManager:
                     buf.extend(data)
                     cur_read_pos += len(data)
 
-                smb_manager.upload_chunk(
-                    share_id, resolved_path, bytes(buf), offset=offset, truncate=(offset == 0)
+                smb_writer.write_chunk(
+                    bytes(buf), offset=offset, truncate=(offset == 0)
                 )
                 offset += len(buf)
                 streamer.on_bytes_streamed(fidx, offset, len(buf))
@@ -1827,6 +2047,7 @@ class TorrentManager:
                         _punch_hole_fd(fd, punched_up_to, safe_end - punched_up_to)
                         punched_up_to = safe_end
         finally:
+            smb_writer.close()
             if fd is not None:
                 try:
                     if file_size > punched_up_to:

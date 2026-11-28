@@ -4523,6 +4523,7 @@ def list_torrents():
         "settings": settings,
         "engine_available": settings.get("engine_available", False),
         "engine_version": settings.get("engine_version", ""),
+        "engine_source": settings.get("engine_source", ""),
     })
 
 
@@ -4548,8 +4549,10 @@ def save_torrent_settings():
 @auth.require_admin
 def install_torrent_engine():
     uname = (getattr(request, "user", None) or {}).get("username", "admin")
+    body = request.get_json(silent=True) or {}
+    force_upgrade = bool(body.get("force_upgrade", False))
     try:
-        result = _get_torrent_mgr().install_engine(user=uname)
+        result = _get_torrent_mgr().install_engine(user=uname, force_upgrade=force_upgrade)
         status_code = 200 if result.get("ok") else 500
         return jsonify(result), status_code
     except Exception as e:

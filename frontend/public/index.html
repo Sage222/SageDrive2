@@ -903,13 +903,13 @@ let _oauthFormExpanded = false;
 let _loginLockoutTimer = null;
 let _torrentJobs = [];
 let _torrentSettings = {
-  listen_port:6881, listen_interface:'0.0.0.0', window_mb:24, max_connections:60, max_uploads:4,
-  download_rate_limit_kbps:0, upload_rate_limit_kbps:256, default_conflict_action:'keep_both',
+  listen_port:6881, listen_interface:'0.0.0.0', window_mb:128, max_active_torrents:2, max_connections:200, max_uploads:8,
+  download_rate_limit_kbps:0, upload_rate_limit_kbps:512, default_conflict_action:'keep_both',
   enable_dht:true, enable_pex:true, enable_lsd:false, enable_upnp:true, enable_natpmp:true, enable_utp:true,
   encryption_mode:'enabled', anonymous_mode:false, extra_trackers:'',
   proxy_type:'none', proxy_hostname:'', proxy_port:1080, proxy_username:'', proxy_password:'', proxy_password_set:false,
   proxy_peer_connections:true, proxy_tracker_connections:true, proxy_hostnames:true, force_proxy:false,
-  engine_available:true, engine_version:''
+  engine_available:true, engine_version:'', engine_source:''
 };
 let _torrentInstallingEngine = false;
 let _torrentInstallNotice = null;
@@ -7768,13 +7768,19 @@ async function renderSettings() {
             <svg data-lucide="magnet" width="16" height="16" style="color:var(--color-primary)"></svg>
             <span class="card-title">Zero-Disk Torrent Engine &amp; Bandwidth Limits</span>
           </div>
-          <span style="font-size:var(--text-xs);font-family:var(--font-mono);color:${_torrentSettings.engine_available ? 'var(--color-success)' : 'var(--color-warning)'}">
-            ${_torrentSettings.engine_available ? `Engine Ready (${escHtml(_torrentSettings.engine_version || 'libtorrent')})` : 'libtorrent Not Installed'}
-          </span>
+          <div style="display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap">
+            <span style="font-size:var(--text-xs);font-family:var(--font-mono);color:${_torrentSettings.engine_available ? 'var(--color-success)' : 'var(--color-warning)'}">
+              ${_torrentSettings.engine_available ? `Engine Ready (${escHtml(_torrentSettings.engine_version || 'libtorrent')}${_torrentSettings.engine_source ? ' · ' + escHtml(_torrentSettings.engine_source) : ''})` : 'libtorrent Not Installed'}
+            </span>
+            <button class="btn btn-secondary btn-sm" style="padding:3px 9px;font-size:11px" onclick="installTorrentEngine(true)" ${(!_adminMode || _torrentInstallingEngine) ? 'disabled' : ''} title="Install or upgrade to the latest official libtorrent binary wheel from PyPI">
+              <svg data-lucide="${_torrentInstallingEngine ? 'loader' : 'arrow-up-circle'}" width="12" height="12"></svg>
+              ${_torrentInstallingEngine ? 'Upgrading…' : 'Upgrade to Latest PyPI Wheel'}
+            </button>
+          </div>
         </div>
         <div class="card-body" style="display:flex;flex-direction:column;gap:var(--space-4)">
           <p style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.55">
-            Streams verified BitTorrent pieces sequentially straight into Google Drive or FileJump (1 file at a time) using a bounded sliding window and Linux hole-punching so container disk usage returns to 0 B.
+            Streams verified BitTorrent pieces sequentially straight into Google Drive, FileJump, or Local SMB NAS using a high-throughput background prefetch sliding window and Linux hole-punching so container disk usage returns to 0 B. Note: <code style="font-family:var(--font-mono)">libtorrent-rasterbar</code> 2.0.11+ is the latest official Python wheel on PyPI (2.1.x refers to the unrelated rTorrent C++ library).
           </p>
 
           ${!_torrentSettings.engine_available ? `
@@ -7782,10 +7788,10 @@ async function renderSettings() {
             <div style="display:flex;align-items:flex-start;gap:var(--space-2);min-width:220px;flex:1">
               <svg data-lucide="alert-triangle" width="16" height="16" style="color:var(--color-warning);flex-shrink:0;margin-top:2px"></svg>
               <div style="font-size:var(--text-xs);line-height:1.5">
-                <strong>libtorrent is not installed in this container.</strong> Install it directly into the running container now, or rebuild the Docker image (<code style="font-family:var(--font-mono)">docker compose build --no-cache</code>) which now bundles <code style="font-family:var(--font-mono)">libtorrent</code> automatically.
+                <strong>libtorrent is not installed in this container.</strong> Install the latest PyPI wheel directly into the running container now, or rebuild the Docker image (<code style="font-family:var(--font-mono)">docker compose build --no-cache</code>) which bundles the latest PyPI <code style="font-family:var(--font-mono)">libtorrent</code> wheel automatically.
               </div>
             </div>
-            <button class="btn btn-primary btn-sm" onclick="installTorrentEngine()" ${(!_adminMode || _torrentInstallingEngine) ? 'disabled' : ''}>
+            <button class="btn btn-primary btn-sm" onclick="installTorrentEngine(false)" ${(!_adminMode || _torrentInstallingEngine) ? 'disabled' : ''}>
               <svg data-lucide="${_torrentInstallingEngine ? 'loader' : 'download'}" width="14" height="14"></svg>
               ${_torrentInstallingEngine ? 'Installing libtorrent...' : 'Install libtorrent Now'}
             </button>
@@ -7801,23 +7807,45 @@ async function renderSettings() {
 
           <div class="form-row">
             <div class="form-group">
-              <label class="form-label" for="tor-set-limit">Download Speed Cap (KB/s, 0 = unlimited)</label>
-              <input class="form-input" id="tor-set-limit" type="number" min="0" max="1000000" value="${Number(_torrentSettings.download_rate_limit_kbps ?? 0)}" ${_adminMode ? '' : 'disabled'} />
+              <label class="form-label" for="tor-set-window">Sliding Window Buffer Cap (Per Active Torrent)</label>
+              <select class="form-input" id="tor-set-window" ${_adminMode ? '' : 'disabled'}>
+                ${[16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512].map(mb => `<option value="${mb}" ${Number(_torrentSettings.window_mb || 128) === mb ? 'selected' : ''}>${mb} MiB${mb === 128 ? ' (Recommended High-Speed Default)' : ' peak transient buffer'}</option>`).join('')}
+              </select>
+              <div style="font-size:11px;color:var(--color-text-faint);margin-top:3px">Larger buffers keep dozens of pieces prefetched in parallel while chunks stream to NAS or cloud storage.</div>
             </div>
             <div class="form-group">
-              <label class="form-label" for="tor-set-ul-limit">Upload Speed Cap (KB/s, 0 = unlimited)</label>
-              <input class="form-input" id="tor-set-ul-limit" type="number" min="0" max="1000000" value="${Number(_torrentSettings.upload_rate_limit_kbps ?? 256)}" ${_adminMode ? '' : 'disabled'} />
-              <div style="font-size:11px;color:var(--color-text-faint);margin-top:3px">Limits BitTorrent peer upload bandwidth so cloud uploads are not starved.</div>
+              <label class="form-label" for="tor-set-max-active">Max Concurrent Active Torrents (1–10)</label>
+              <select class="form-input" id="tor-set-max-active" ${_adminMode ? '' : 'disabled'}>
+                ${[1, 2, 3, 4, 5, 6, 8, 10].map(n => `<option value="${n}" ${Number(_torrentSettings.max_active_torrents || 2) === n ? 'selected' : ''}>${n} concurrent torrent${n === 1 ? '' : 's'} (each streams 1 file at a time)</option>`).join('')}
+              </select>
+              <div style="font-size:11px;color:var(--color-text-faint);margin-top:3px">Additional torrents wait in queue and start automatically when a slot finishes.</div>
             </div>
           </div>
 
           <div class="form-row">
             <div class="form-group">
-              <label class="form-label" for="tor-set-window">Sliding Window Buffer Cap</label>
-              <select class="form-input" id="tor-set-window" ${_adminMode ? '' : 'disabled'}>
-                ${[16, 24, 32, 48, 64].map(mb => `<option value="${mb}" ${Number(_torrentSettings.window_mb || 24) === mb ? 'selected' : ''}>${mb} MiB (peak transient container buffer)</option>`).join('')}
-              </select>
+              <label class="form-label" for="tor-set-limit">Download Speed Cap (KB/s, 0 = unlimited)</label>
+              <input class="form-input" id="tor-set-limit" type="number" min="0" max="1000000" value="${Number(_torrentSettings.download_rate_limit_kbps ?? 0)}" ${_adminMode ? '' : 'disabled'} />
             </div>
+            <div class="form-group">
+              <label class="form-label" for="tor-set-ul-limit">Upload Speed Cap (KB/s, 0 = unlimited)</label>
+              <input class="form-input" id="tor-set-ul-limit" type="number" min="0" max="1000000" value="${Number(_torrentSettings.upload_rate_limit_kbps ?? 512)}" ${_adminMode ? '' : 'disabled'} />
+              <div style="font-size:11px;color:var(--color-text-faint);margin-top:3px">Limits BitTorrent peer upload bandwidth so cloud/NAS writes are not starved.</div>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" for="tor-set-peers">Max Peer Connections (10–1000)</label>
+              <input class="form-input" id="tor-set-peers" type="number" min="10" max="1000" value="${Number(_torrentSettings.max_connections ?? 200)}" ${_adminMode ? '' : 'disabled'} />
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="tor-set-uploads">Max Upload Slots (-1 = unlimited)</label>
+              <input class="form-input" id="tor-set-uploads" type="number" min="-1" max="200" value="${Number(_torrentSettings.max_uploads ?? 8)}" ${_adminMode ? '' : 'disabled'} />
+            </div>
+          </div>
+
+          <div class="form-row">
             <div class="form-group">
               <label class="form-label" for="tor-set-conflict">Default Filename Conflict Policy</label>
               <select class="form-input" id="tor-set-conflict" ${_adminMode ? '' : 'disabled'}>
@@ -7825,17 +7853,6 @@ async function renderSettings() {
                 <option value="skip" ${_torrentSettings.default_conflict_action === 'skip' ? 'selected' : ''}>Skip Existing Files</option>
                 <option value="replace" ${_torrentSettings.default_conflict_action === 'replace' ? 'selected' : ''}>Replace Existing Files</option>
               </select>
-            </div>
-          </div>
-
-          <div class="form-row">
-            <div class="form-group">
-              <label class="form-label" for="tor-set-peers">Max Peer Connections (10–500)</label>
-              <input class="form-input" id="tor-set-peers" type="number" min="10" max="500" value="${Number(_torrentSettings.max_connections ?? 60)}" ${_adminMode ? '' : 'disabled'} />
-            </div>
-            <div class="form-group">
-              <label class="form-label" for="tor-set-uploads">Max Upload Slots (-1 = unlimited)</label>
-              <input class="form-input" id="tor-set-uploads" type="number" min="-1" max="200" value="${Number(_torrentSettings.max_uploads ?? 4)}" ${_adminMode ? '' : 'disabled'} />
             </div>
           </div>
 
@@ -9126,15 +9143,20 @@ async function clearTorrentProxyPassword() {
   }
 }
 
-async function installTorrentEngine() {
+async function installTorrentEngine(forceUpgrade = false) {
   if (!_adminMode) {
-    toast('Unlock Administrator Functions in Settings to install libtorrent', 'error');
+    toast('Unlock Administrator Functions in Settings to install or upgrade libtorrent', 'error');
     showAdminPinModal();
     return;
   }
   if (_torrentInstallingEngine) return;
   _torrentInstallingEngine = true;
-  _torrentInstallNotice = { ok: true, message: 'Installing libtorrent inside container (this may take 15–60 seconds)...' };
+  _torrentInstallNotice = {
+    ok: true,
+    message: forceUpgrade
+      ? 'Upgrading libtorrent to latest PyPI binary wheel inside container (this may take 15–45 seconds)...'
+      : 'Installing libtorrent inside container (this may take 15–60 seconds)...'
+  };
   if (_view === 'settings') renderSettings();
   if (_view === 'torrents') renderTorrentsView(true);
   try {
@@ -9144,7 +9166,7 @@ async function installTorrentEngine() {
         'Content-Type': 'application/json',
         ...(_token ? { Authorization: `Bearer ${_token}` } : {}),
       },
-      body: '{}',
+      body: JSON.stringify({ force_upgrade: Boolean(forceUpgrade) }),
     });
     const data = await res.json().catch(() => ({}));
     if (res.ok && data.ok) {
@@ -9188,11 +9210,12 @@ async function saveTorrentSettings() {
   const payload = {
     listen_port: intVal('tor-set-port', 6881),
     listen_interface: (document.getElementById('tor-set-iface')?.value || '0.0.0.0').trim() || '0.0.0.0',
-    window_mb: intVal('tor-set-window', 24),
-    max_connections: intVal('tor-set-peers', 60),
-    max_uploads: intVal('tor-set-uploads', 4),
+    window_mb: intVal('tor-set-window', 128),
+    max_active_torrents: intVal('tor-set-max-active', 2),
+    max_connections: intVal('tor-set-peers', 200),
+    max_uploads: intVal('tor-set-uploads', 8),
     download_rate_limit_kbps: intVal('tor-set-limit', 0),
-    upload_rate_limit_kbps: intVal('tor-set-ul-limit', 256),
+    upload_rate_limit_kbps: intVal('tor-set-ul-limit', 512),
     default_conflict_action: document.getElementById('tor-set-conflict')?.value || 'keep_both',
     encryption_mode: document.getElementById('tor-set-enc')?.value || 'enabled',
     anonymous_mode: Boolean(document.getElementById('tor-set-anon')?.checked),
@@ -9261,7 +9284,8 @@ function renderTorrentsView(isSilentRefresh = false) {
   const totalPeerUpRate = activeJobs.reduce((acc, j) => acc + Number(j.stats?.peer_upload_rate || 0), 0);
   const totalTargetRate = activeJobs.reduce((acc, j) => acc + Number(j.stats?.upload_rate || 0), 0);
   const totalPeers = activeJobs.reduce((acc, j) => acc + Number(j.stats?.peers || 0), 0);
-  const windowCapMb = Number((_torrentSettings && _torrentSettings.window_mb) || 24);
+  const windowCapMb = Number((_torrentSettings && _torrentSettings.window_mb) || 128);
+  const maxActiveTorrents = Number((_torrentSettings && _torrentSettings.max_active_torrents) || 2);
 
   const rowsHtml = filtered.length
     ? `<div class="torrent-list-panel">
@@ -9423,6 +9447,8 @@ function renderTorrentsView(isSilentRefresh = false) {
           <button class="torrent-filter-btn ${_torrentFilter==='error'?'active':''}" onclick="setTorrentFilter('error')">Failed (${counts.error})</button>
         </div>
         <div class="torrent-summary-line">
+          <span title="Concurrent active torrent slots (configure in Settings → Torrents)">Active ${counts.active}/${maxActiveTorrents}</span>
+          <span aria-hidden="true">·</span>
           <span title="Total swarm download speed">DL ↓ ${formatTorrentRate(totalDownRate)}</span>
           <span aria-hidden="true">·</span>
           <span title="Total peer upload speed">UL ↑ ${formatTorrentRate(totalPeerUpRate)}</span>
@@ -9430,7 +9456,7 @@ function renderTorrentsView(isSilentRefresh = false) {
           <span aria-hidden="true">·</span>
           <span>Peers ${totalPeers}</span>
           <span aria-hidden="true">·</span>
-          <span>Buffer ${formatSize(activeWindowBytes)} / ${windowCapMb} MB</span>
+          <span>Buffer ${formatSize(activeWindowBytes)} / ${windowCapMb} MiB per torrent</span>
         </div>
       </div>
       ${rowsHtml}

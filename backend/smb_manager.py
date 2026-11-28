@@ -465,6 +465,62 @@ def prepare_upload_target(share_id, dest_path, conflict_action="keep_both"):
         c.close()
 
 
+class PersistentSMBWriter:
+    """
+    Maintains a single persistent SMBConnection across an entire file stream
+    to eliminate per-chunk TCP + SMB authentication handshake overhead.
+    Automatically reconnects and retries if the connection drops mid-transfer.
+    """
+
+    def __init__(self, share_id: str, resolved_path: str):
+        self.share_id = share_id
+        self.norm_path = sanitize_smb_path(resolved_path, allow_root=False)
+        self.cfg = _cfg(share_id)
+        self.conn = None
+
+    def _ensure_conn(self):
+        if self.conn is None:
+            self.conn = _conn(self.cfg)
+        return self.conn
+
+    def _reset_conn(self):
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+
+    def write_chunk(self, chunk_bytes: bytes, offset: int = 0, truncate: bool = False):
+        payload = chunk_bytes if isinstance(chunk_bytes, (bytes, bytearray)) else bytes(chunk_bytes)
+        last_err = None
+        for attempt in range(3):
+            try:
+                c = self._ensure_conn()
+                if offset == 0 and attempt == 0:
+                    parent = "/".join(self.norm_path.split("/")[:-1])
+                    if parent and parent != "/":
+                        _ensure_dirs_on_conn(c, self.cfg["share"], parent)
+                bio = io.BytesIO(payload)
+                c.storeFileFromOffset(
+                    self.cfg["share"],
+                    self.norm_path,
+                    bio,
+                    offset=int(offset or 0),
+                    truncate=bool(truncate),
+                    timeout=300,
+                )
+                return
+            except Exception as exc:
+                last_err = exc
+                self._reset_conn()
+        if last_err is not None:
+            raise last_err
+
+    def close(self):
+        self._reset_conn()
+
+
 def _delete_recursive_on_conn(c, share_name, path, is_dir=False):
     if not is_dir:
         c.deleteFiles(share_name, path)

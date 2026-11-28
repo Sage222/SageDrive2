@@ -28,9 +28,10 @@ services:
       - ./frontend/public/index.html:/app/static/index.html
       - ./backend/main.py:/app/main.py
       - ./entrypoint.sh:/app/entrypoint.sh:ro
-    # CRITICAL: These privileges are required for FUSE to work
+    # CRITICAL: These privileges are required for FUSE and optional kernel WireGuard interface policy routing
     cap_add:
       - SYS_ADMIN
+      - NET_ADMIN
     devices:
       - /dev/fuse
     security_opt:

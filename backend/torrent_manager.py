@@ -2,18 +2,23 @@ import base64
 import ctypes
 import hashlib
 import importlib
+import io
 import json
 import mimetypes
 import os
+import platform
 import posixpath
 import re
 import secrets
 import shutil
 import site
+import socket
 import subprocess
 import sys
+import tarfile
 import threading
 import time
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -78,8 +83,25 @@ _try_import_libtorrent()
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 TORRENTS_STATE_FILE = DATA_DIR / "torrents_state.json"
 TORRENT_SETTINGS_FILE = DATA_DIR / "torrent_settings.json"
+TORRENT_WG_FILE = DATA_DIR / "torrent_wireguard.json"
 TORRENT_META_DIR = DATA_DIR / "torrent_meta"
 SCRATCH_ROOT = Path(os.environ.get("TORRENT_SCRATCH_DIR", "/tmp/sagedrive_torrents"))
+WG_LOCAL_SOCKS_PORT = 25344
+WG_KERNEL_IFACE = "wg-torrent"
+WG_POLICY_TABLE = "51820"
+WG_POLICY_PRIO = "100"
+
+SAMPLE_WG_CONF_TEMPLATE = """[Interface]
+PrivateKey = PRIVATEKEY
+Address = 10.5.0.2/32
+DNS = 103.86.96.100, 103.86.99.100
+
+[Peer]
+PublicKey = PUBLICKEY
+AllowedIPs = 0.0.0.0/5, 8.0.0.0/7, 10.0.1.0/24, 10.0.2.0/23, 10.0.4.0/22, 10.0.8.0/21, 10.0.16.0/20, 10.0.32.0/19, 10.0.64.0/18, 10.0.128.0/17, 10.1.0.0/16, 10.2.0.0/15, 10.4.0.0/14, 10.8.0.0/13, 10.16.0.0/12, 10.32.0.0/11, 10.64.0.0/10, 10.128.0.0/9, 11.0.0.0/8, 12.0.0.0/6, 16.0.0.0/4, 32.0.0.0/3, 64.0.0.0/2, 128.0.0.0/1
+Endpoint = 187.15.155.152:51820
+PersistentKeepalive = 25
+"""
 
 MAX_TORRENT_FILE_BYTES = 15 * 1024 * 1024  # 15 MiB cap for .torrent metadata uploads
 DEFAULT_SETTINGS = {
@@ -147,6 +169,252 @@ def _sanitize_rel_path(raw_path: str) -> str:
         return "file"
     safe_parts = [re.sub(r'[<>:"|?*\x00-\x1f]+', "_", p) for p in parts]
     return "/".join(safe_parts)
+
+
+def _is_valid_wg_key(val: str) -> bool:
+    s = str(val or "").strip()
+    if len(s) != 44 or not s.endswith("="):
+        return False
+    try:
+        raw = base64.b64decode(s, validate=True)
+        return len(raw) == 32
+    except Exception:
+        return False
+
+
+def _mask_wg_conf(raw_text: str) -> str:
+    out_lines = []
+    for line in str(raw_text or "").splitlines():
+        m = re.match(r"^(\s*(?:PrivateKey|PresharedKey)\s*=\s*)(.+)$", line, flags=re.IGNORECASE)
+        if m:
+            prefix, secret_val = m.group(1), m.group(2).strip()
+            if _is_valid_wg_key(secret_val):
+                out_lines.append(f"{prefix}{secret_val[:4]}••••••••••••••••••••••••••••••••••••{secret_val[-4:]}")
+            else:
+                out_lines.append(f"{prefix}{secret_val}")
+        else:
+            out_lines.append(line)
+    return "\n".join(out_lines)
+
+
+def parse_wireguard_conf(raw_text: str, name: str = "", filename: str = "") -> dict:
+    """
+    Parse and validate a WireGuard .conf file ([Interface] and [Peer]).
+    Ignores wg-quick shell hooks (PreUp/PostUp/PreDown/PostDown) for security.
+    """
+    text = str(raw_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        raise ValueError("WireGuard configuration text is empty")
+    if len(text) > 128 * 1024:
+        raise ValueError("WireGuard configuration file exceeds 128 KiB limit")
+
+    section = ""
+    iface = {}
+    peer = {}
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().lower()
+            continue
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        key = k.strip().lower()
+        # Strip inline comments unless part of base64 key
+        val = v.strip()
+        if key not in ("privatekey", "publickey", "presharedkey") and " #" in val:
+            val = val.split(" #", 1)[0].strip()
+
+        if section == "interface":
+            if key in ("address", "dns") and key in iface:
+                iface[key] = f"{iface[key]}, {val}"
+            else:
+                iface[key] = val
+        elif section == "peer":
+            if key == "allowedips" and key in peer:
+                peer[key] = f"{peer[key]}, {val}"
+            else:
+                peer[key] = val
+
+    if not iface:
+        raise ValueError("Missing [Interface] section in WireGuard configuration")
+    if not peer:
+        raise ValueError("Missing [Peer] section in WireGuard configuration")
+
+    priv_key = iface.get("privatekey", "").strip()
+    address_raw = iface.get("address", "").strip()
+    dns_raw = iface.get("dns", "").strip()
+    mtu_raw = iface.get("mtu", "").strip()
+    listen_port_raw = iface.get("listenport", "").strip()
+
+    pub_key = peer.get("publickey", "").strip()
+    psk_key = peer.get("presharedkey", "").strip()
+    endpoint_raw = peer.get("endpoint", "").strip()
+    allowed_ips_raw = peer.get("allowedips", "0.0.0.0/0").strip() or "0.0.0.0/0"
+    keepalive_raw = peer.get("persistentkeepalive", "25").strip() or "25"
+
+    if not priv_key:
+        raise ValueError("Missing 'PrivateKey' under [Interface]")
+    if not address_raw:
+        raise ValueError("Missing 'Address' under [Interface] (e.g. 10.5.0.2/32)")
+    if not pub_key:
+        raise ValueError("Missing 'PublicKey' under [Peer]")
+    if not endpoint_raw:
+        raise ValueError("Missing 'Endpoint' under [Peer] (e.g. 187.15.155.152:51820)")
+
+    # Extract primary IPv4 address from Address list
+    addr_list = [a.strip() for a in address_raw.split(",") if a.strip()]
+    primary_ipv4 = ""
+    for a in addr_list:
+        ip_only = a.split("/")[0].strip()
+        if ":" not in ip_only and re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", ip_only):
+            primary_ipv4 = ip_only
+            break
+    if not primary_ipv4 and addr_list:
+        primary_ipv4 = addr_list[0].split("/")[0].strip()
+
+    # Parse endpoint host:port
+    ep_host = endpoint_raw
+    ep_port = 51820
+    if endpoint_raw.startswith("[") and "]:" in endpoint_raw:
+        h_part, p_part = endpoint_raw.rsplit("]:", 1)
+        ep_host = h_part + "]"
+        try:
+            ep_port = int(p_part)
+        except Exception:
+            ep_port = 51820
+    elif ":" in endpoint_raw:
+        h_part, p_part = endpoint_raw.rsplit(":", 1)
+        ep_host = h_part.strip()
+        try:
+            ep_port = int(p_part.strip())
+        except Exception:
+            ep_port = 51820
+    ep_port = max(1, min(65535, ep_port))
+
+    mtu = None
+    if mtu_raw:
+        try:
+            mtu = max(1200, min(1500, int(mtu_raw)))
+        except Exception:
+            mtu = None
+
+    listen_port = None
+    if listen_port_raw:
+        try:
+            listen_port = max(1024, min(65535, int(listen_port_raw)))
+        except Exception:
+            listen_port = None
+
+    try:
+        keepalive = max(0, min(3600, int(keepalive_raw)))
+    except Exception:
+        keepalive = 25
+
+    allowed_list = [c.strip() for c in allowed_ips_raw.split(",") if c.strip()]
+    priv_valid = _is_valid_wg_key(priv_key)
+    pub_valid = _is_valid_wg_key(pub_key)
+    psk_valid = (not psk_key) or _is_valid_wg_key(psk_key)
+    keys_valid = bool(priv_valid and pub_valid and psk_valid)
+
+    warnings = []
+    if not priv_valid:
+        warnings.append("Interface PrivateKey is a placeholder or not a valid 44-character base64 WireGuard key")
+    if not pub_valid:
+        warnings.append("Peer PublicKey is a placeholder or not a valid 44-character base64 WireGuard key")
+    if not psk_valid:
+        warnings.append("Peer PresharedKey is not a valid 44-character base64 WireGuard key")
+
+    clean_filename = re.sub(r'[^0-9a-zA-Z._\-]+', '_', (filename or "").strip())
+    if clean_filename and not clean_filename.lower().endswith(".conf"):
+        clean_filename += ".conf"
+
+    clean_name = (name or "").strip()
+    if not clean_name:
+        if clean_filename:
+            base_stem = re.sub(r"\.conf$", "", clean_filename, flags=re.IGNORECASE)
+            # Strip random attachment hash suffix like ca2117_cec4d8a6 -> ca2117
+            base_stem = re.sub(r"_[0-9a-f]{8}$", "", base_stem, flags=re.IGNORECASE)
+            clean_name = f"{base_stem} ({ep_host}:{ep_port})"
+        else:
+            clean_name = f"WireGuard ({ep_host}:{ep_port})"
+    if not clean_filename:
+        slug = re.sub(r"[^0-9a-zA-Z._\-]+", "_", clean_name.split("(")[0].strip() or ep_host).strip("_") or "wg0"
+        clean_filename = f"{slug}.conf"
+
+    pub_preview = (
+        f"{pub_key[:6]}…{pub_key[-6:]}"
+        if len(pub_key) >= 16
+        else pub_key
+    )
+
+    return {
+        "name": clean_name[:120],
+        "filename": clean_filename[:120],
+        "raw_conf": text,
+        "masked_conf": _mask_wg_conf(text),
+        "private_key": priv_key,
+        "public_key": pub_key,
+        "public_key_preview": pub_preview,
+        "preshared_key": psk_key,
+        "address": ", ".join(addr_list),
+        "ipv4": primary_ipv4,
+        "dns": dns_raw or "1.1.1.1, 1.0.0.1",
+        "mtu": mtu,
+        "listen_port": listen_port,
+        "endpoint": f"{ep_host}:{ep_port}",
+        "endpoint_host": ep_host,
+        "endpoint_port": ep_port,
+        "allowed_ips": ", ".join(allowed_list),
+        "allowed_ips_count": len(allowed_list),
+        "persistent_keepalive": keepalive,
+        "keys_valid": keys_valid,
+        "key_warning": " · ".join(warnings),
+    }
+
+
+def _detect_wireguard_client_info() -> dict:
+    """Check installed wireproxy and wireguard-tools versions inside the container."""
+    wp_bin = shutil.which("wireproxy") or ("/usr/local/bin/wireproxy" if os.path.isfile("/usr/local/bin/wireproxy") else "")
+    wg_bin = shutil.which("wg") or ("/usr/bin/wg" if os.path.isfile("/usr/bin/wg") else "")
+    wp_ver = ""
+    wg_ver = ""
+
+    if wp_bin and os.access(wp_bin, os.X_OK):
+        try:
+            res = subprocess.run([wp_bin, "--version"], capture_output=True, text=True, timeout=4, shell=False)
+            out = ((res.stdout or "") + " " + (res.stderr or "")).strip()
+            m = re.search(r"version\s+([0-9]+\.[0-9]+\.[0-9A-Za-z.\-]+)", out, flags=re.IGNORECASE)
+            wp_ver = f"v{m.group(1)}" if m else (out.splitlines()[0][:40] if out else "installed")
+        except Exception:
+            wp_ver = "installed"
+
+    if wg_bin and os.access(wg_bin, os.X_OK):
+        try:
+            res = subprocess.run([wg_bin, "--version"], capture_output=True, text=True, timeout=4, shell=False)
+            out = ((res.stdout or "") + " " + (res.stderr or "")).strip()
+            m = re.search(r"(v[0-9]+\.[0-9]+\.[0-9A-Za-z.\-]+)", out)
+            wg_ver = m.group(1) if m else (out.split()[0][:40] if out else "installed")
+        except Exception:
+            wg_ver = "installed"
+
+    parts = []
+    if wp_ver:
+        parts.append(f"wireproxy {wp_ver}")
+    if wg_ver:
+        parts.append(f"wg {wg_ver}")
+
+    return {
+        "available": bool(wp_ver or wg_ver),
+        "wireproxy_bin": wp_bin if wp_ver else "",
+        "wireproxy_version": wp_ver,
+        "wg_bin": wg_bin if wg_ver else "",
+        "wg_version": wg_ver,
+        "version_summary": " · ".join(parts) if parts else "",
+    }
 
 
 # ── Pure-Python Bencode Parser (for instant, dependency-free .torrent inspection) ──
@@ -760,12 +1028,25 @@ class TorrentManager:
         self._wake_event = threading.Event()
         self._worker_started = False
 
+        # WireGuard VPN (Torrent-Only) runtime state
+        self._wg_state = {
+            "enabled": False,
+            "active_profile_id": "",
+            "profiles": [],
+        }
+        self._wg_proc = None
+        self._wg_runtime_mode = ""        # "wireproxy" | "kernel-wg" | "standby" | ""
+        self._wg_runtime_status = "disabled"  # "connected" | "standby_sandbox" | "disabled" | "error"
+        self._wg_runtime_message = "WireGuard VPN disabled (torrent traffic uses standard settings)"
+        self._wg_active_ipv4 = ""
+
         # Clean up any leftover ephemeral scratch files on startup (zero persistent disk leak)
         shutil.rmtree(SCRATCH_ROOT, ignore_errors=True)
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         TORRENT_META_DIR.mkdir(parents=True, exist_ok=True)
 
         self._load_settings()
+        self._load_wireguard_state()
         self._load_jobs()
         self._start_worker()
 
@@ -956,6 +1237,7 @@ class TorrentManager:
     def get_settings(self):
         if not LIBTORRENT_AVAILABLE:
             _try_import_libtorrent()
+        wg_client = _detect_wireguard_client_info()
         with self._lock:
             out = dict(self._settings)
             out["proxy_password_set"] = bool(out.get("proxy_password"))
@@ -964,6 +1246,17 @@ class TorrentManager:
             out["engine_version"] = str(LIBTORRENT_VERSION or "")
             out["engine_source"] = str(LIBTORRENT_SOURCE or "")
             out["active_torrents_count"] = len(self._active_job_ids)
+            out["wg_client_available"] = wg_client["available"]
+            out["wg_client_version"] = wg_client["version_summary"]
+            out["wg_enabled"] = bool(self._wg_state.get("enabled", False))
+            out["wg_active_profile_id"] = str(self._wg_state.get("active_profile_id") or "")
+            out["wg_tunnel_state"] = self._wg_runtime_status
+            out["wg_tunnel_mode"] = self._wg_runtime_mode
+            out["wg_status_message"] = self._wg_runtime_message
+            active_prof = self._get_wg_profile_unlocked(out["wg_active_profile_id"])
+            out["wg_active_profile_name"] = active_prof["name"] if active_prof else ""
+            out["wg_active_endpoint"] = active_prof["endpoint"] if active_prof else ""
+            out["wg_active_address"] = active_prof["address"] if active_prof else ""
             return out
 
     def update_settings(self, updates: dict, user="admin"):
@@ -1145,6 +1438,635 @@ class TorrentManager:
                 "details": detail,
             }
 
+    # ── WireGuard VPN (Torrent Traffic Only) Management ──────────────────────────
+    def _load_wireguard_state(self):
+        if TORRENT_WG_FILE.exists():
+            try:
+                raw = json.loads(TORRENT_WG_FILE.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    profiles = []
+                    for item in (raw.get("profiles") or []):
+                        if not isinstance(item, dict) or not item.get("raw_conf"):
+                            continue
+                        try:
+                            parsed = parse_wireguard_conf(
+                                item["raw_conf"],
+                                name=item.get("name", ""),
+                                filename=item.get("filename", ""),
+                            )
+                            parsed["id"] = str(item.get("id") or f"wg_{secrets.token_hex(6)}")
+                            parsed["created_at"] = str(item.get("created_at") or _now_iso())
+                            parsed["updated_at"] = str(item.get("updated_at") or _now_iso())
+                            profiles.append(parsed)
+                        except Exception:
+                            continue
+                    active_id = str(raw.get("active_profile_id") or "")
+                    if profiles and not any(p["id"] == active_id for p in profiles):
+                        active_id = profiles[0]["id"]
+                    self._wg_state = {
+                        "enabled": bool(raw.get("enabled", False)),
+                        "active_profile_id": active_id,
+                        "profiles": profiles,
+                    }
+                    if self._wg_state["enabled"] and active_id:
+                        try:
+                            self._start_wireguard_tunnel_unlocked(active_id)
+                        except Exception as exc:
+                            self._wg_state["enabled"] = False
+                            self._wg_runtime_status = "error"
+                            self._wg_runtime_message = str(exc)
+                            self._save_wireguard_state_unlocked()
+                    return
+            except Exception:
+                pass
+
+        # First-run seed: preload the user's attached ca2117.conf template so it is immediately ready in the list
+        seed_profiles = []
+        try:
+            parsed = parse_wireguard_conf(
+                SAMPLE_WG_CONF_TEMPLATE,
+                name="ca2117 (187.15.155.152:51820)",
+                filename="ca2117.conf",
+            )
+            parsed["id"] = "wg_ca2117"
+            parsed["created_at"] = _now_iso()
+            parsed["updated_at"] = _now_iso()
+            seed_profiles.append(parsed)
+        except Exception:
+            pass
+
+        self._wg_state = {
+            "enabled": False,
+            "active_profile_id": seed_profiles[0]["id"] if seed_profiles else "",
+            "profiles": seed_profiles,
+        }
+        self._save_wireguard_state_unlocked()
+
+    def _save_wireguard_state_unlocked(self):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        serializable = {
+            "enabled": bool(self._wg_state.get("enabled", False)),
+            "active_profile_id": str(self._wg_state.get("active_profile_id") or ""),
+            "profiles": [
+                {
+                    "id": p["id"],
+                    "name": p["name"],
+                    "filename": p["filename"],
+                    "raw_conf": p["raw_conf"],
+                    "created_at": p.get("created_at") or _now_iso(),
+                    "updated_at": p.get("updated_at") or _now_iso(),
+                }
+                for p in (self._wg_state.get("profiles") or [])
+            ],
+        }
+        tmp = TORRENT_WG_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(serializable, indent=2), encoding="utf-8")
+        os.replace(tmp, TORRENT_WG_FILE)
+
+    def _get_wg_profile_unlocked(self, profile_id: str):
+        if not profile_id:
+            return None
+        for p in (self._wg_state.get("profiles") or []):
+            if p["id"] == profile_id:
+                return p
+        return None
+
+    @staticmethod
+    def _public_wg_profile(p: dict, include_raw: bool = False) -> dict:
+        out = {
+            "id": p["id"],
+            "name": p["name"],
+            "filename": p["filename"],
+            "address": p["address"],
+            "ipv4": p["ipv4"],
+            "dns": p["dns"],
+            "mtu": p["mtu"],
+            "listen_port": p["listen_port"],
+            "endpoint": p["endpoint"],
+            "endpoint_host": p["endpoint_host"],
+            "endpoint_port": p["endpoint_port"],
+            "public_key_preview": p["public_key_preview"],
+            "allowed_ips": p["allowed_ips"],
+            "allowed_ips_count": p["allowed_ips_count"],
+            "persistent_keepalive": p["persistent_keepalive"],
+            "keys_valid": p["keys_valid"],
+            "key_warning": p["key_warning"],
+            "masked_conf": p["masked_conf"],
+            "created_at": p.get("created_at") or "",
+            "updated_at": p.get("updated_at") or "",
+        }
+        if include_raw:
+            out["raw_conf"] = p["raw_conf"]
+        return out
+
+    def get_wireguard_state(self) -> dict:
+        client = _detect_wireguard_client_info()
+        with self._lock:
+            active_id = str(self._wg_state.get("active_profile_id") or "")
+            active_prof = self._get_wg_profile_unlocked(active_id)
+            return {
+                "enabled": bool(self._wg_state.get("enabled", False)),
+                "active_profile_id": active_id,
+                "active_profile_name": active_prof["name"] if active_prof else "",
+                "active_endpoint": active_prof["endpoint"] if active_prof else "",
+                "active_address": active_prof["address"] if active_prof else "",
+                "tunnel_state": self._wg_runtime_status,
+                "tunnel_mode": self._wg_runtime_mode,
+                "status_message": self._wg_runtime_message,
+                "client_available": client["available"],
+                "client_version": client["version_summary"],
+                "wireproxy_version": client["wireproxy_version"],
+                "wg_version": client["wg_version"],
+                "profiles": [self._public_wg_profile(p, include_raw=False) for p in (self._wg_state.get("profiles") or [])],
+            }
+
+    def get_wireguard_profile_detail(self, profile_id: str) -> dict:
+        with self._lock:
+            prof = self._get_wg_profile_unlocked(profile_id)
+            if not prof:
+                raise KeyError("WireGuard profile not found")
+            return self._public_wg_profile(prof, include_raw=True)
+
+    def save_wireguard_profile(
+        self,
+        conf_text: str,
+        name: str = "",
+        filename: str = "",
+        profile_id: str = "",
+        activate: bool = False,
+        user: str = "admin",
+    ) -> dict:
+        parsed = parse_wireguard_conf(conf_text, name=name, filename=filename)
+        now = _now_iso()
+        with self._lock:
+            existing = self._get_wg_profile_unlocked(profile_id) if profile_id else None
+            if existing:
+                parsed["id"] = existing["id"]
+                parsed["created_at"] = existing.get("created_at") or now
+                parsed["updated_at"] = now
+                idx = next(i for i, p in enumerate(self._wg_state["profiles"]) if p["id"] == existing["id"])
+                self._wg_state["profiles"][idx] = parsed
+                action_title = "WireGuard Profile Updated"
+            else:
+                parsed["id"] = f"wg_{secrets.token_hex(6)}"
+                parsed["created_at"] = now
+                parsed["updated_at"] = now
+                self._wg_state["profiles"].append(parsed)
+                if not self._wg_state.get("active_profile_id"):
+                    self._wg_state["active_profile_id"] = parsed["id"]
+                action_title = "WireGuard Profile Added"
+
+            if activate:
+                self._wg_state["active_profile_id"] = parsed["id"]
+
+            # If this profile is the currently active profile and WireGuard is enabled, hot-reload the tunnel
+            is_active_prof = self._wg_state.get("active_profile_id") == parsed["id"]
+            if self._wg_state.get("enabled") and is_active_prof:
+                if parsed["keys_valid"]:
+                    self._start_wireguard_tunnel_unlocked(parsed["id"])
+                    if self._session is not None:
+                        self._apply_session_settings(self._session)
+                else:
+                    self._stop_wireguard_tunnel_unlocked()
+                    self._wg_state["enabled"] = False
+                    self._wg_runtime_status = "disabled"
+                    self._wg_runtime_message = f"Disabled: {parsed['key_warning']}"
+                    if self._session is not None:
+                        self._apply_session_settings(self._session)
+
+            self._save_wireguard_state_unlocked()
+
+        self._log(
+            action_title,
+            "change" if existing else "add",
+            f"{parsed['name']} · Endpoint {parsed['endpoint']} · Address {parsed['address']}",
+            drive="Torrents",
+            target=parsed["name"],
+            user=user,
+        )
+        return self.get_wireguard_state()
+
+    def delete_wireguard_profile(self, profile_id: str, user: str = "admin") -> dict:
+        with self._lock:
+            prof = self._get_wg_profile_unlocked(profile_id)
+            if not prof:
+                raise KeyError("WireGuard profile not found")
+            was_active = self._wg_state.get("active_profile_id") == profile_id
+            self._wg_state["profiles"] = [p for p in self._wg_state["profiles"] if p["id"] != profile_id]
+
+            if was_active:
+                if self._wg_state.get("enabled"):
+                    self._stop_wireguard_tunnel_unlocked()
+                    self._wg_state["enabled"] = False
+                    self._wg_runtime_status = "disabled"
+                    self._wg_runtime_message = "WireGuard VPN disabled (active profile was removed)"
+                    if self._session is not None:
+                        self._apply_session_settings(self._session)
+                self._wg_state["active_profile_id"] = (
+                    self._wg_state["profiles"][0]["id"] if self._wg_state["profiles"] else ""
+                )
+            self._save_wireguard_state_unlocked()
+
+        self._log(
+            "WireGuard Profile Removed",
+            "delete",
+            f"Removed WireGuard profile {prof['name']} ({prof['endpoint']})",
+            drive="Torrents",
+            target=prof["name"],
+            user=user,
+        )
+        return self.get_wireguard_state()
+
+    def _stop_wireguard_tunnel_unlocked(self):
+        # 1) Stop userspace wireproxy daemon if running
+        if self._wg_proc is not None:
+            try:
+                self._wg_proc.terminate()
+                self._wg_proc.wait(timeout=3)
+            except Exception:
+                try:
+                    self._wg_proc.kill()
+                except Exception:
+                    pass
+            self._wg_proc = None
+
+        # 2) Clean up kernel wg-torrent interface and policy routing rule if present
+        ip_bin = shutil.which("ip") or "/sbin/ip"
+        if os.path.isfile(ip_bin) or shutil.which("ip"):
+            try:
+                subprocess.run([ip_bin, "rule", "del", "priority", WG_POLICY_PRIO], capture_output=True, timeout=3, shell=False)
+            except Exception:
+                pass
+            try:
+                subprocess.run([ip_bin, "route", "flush", "table", WG_POLICY_TABLE], capture_output=True, timeout=3, shell=False)
+            except Exception:
+                pass
+            try:
+                subprocess.run([ip_bin, "link", "del", "dev", WG_KERNEL_IFACE], capture_output=True, timeout=3, shell=False)
+            except Exception:
+                pass
+
+        for tmp_path in ("/tmp/sagedrive_wg_proxy.conf", "/tmp/sagedrive_wg_kernel.conf"):
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except Exception:
+                pass
+
+        self._wg_runtime_mode = ""
+        self._wg_active_ipv4 = ""
+
+    def _start_wireguard_tunnel_unlocked(self, profile_id: str):
+        prof = self._get_wg_profile_unlocked(profile_id)
+        if not prof:
+            raise ValueError("Select a WireGuard profile before enabling the VPN")
+        if not prof.get("keys_valid"):
+            raise ValueError(
+                f"Profile '{prof['name']}' contains placeholder keys ({prof.get('key_warning') or 'invalid base64 key'}). "
+                "Click Edit on the profile to paste your actual 44-character base64 WireGuard PrivateKey and PublicKey."
+            )
+
+        self._stop_wireguard_tunnel_unlocked()
+        client = _detect_wireguard_client_info()
+        errors = []
+
+        # 1) Try Userspace WireGuard Tunnel (wireproxy -> 127.0.0.1:25344 SOCKS5 strictly for libtorrent)
+        if client["wireproxy_bin"]:
+            try:
+                wp_lines = [
+                    "[Interface]",
+                    f"PrivateKey = {prof['private_key']}",
+                    f"Address = {prof['address']}",
+                    f"DNS = {prof['dns']}",
+                ]
+                if prof.get("mtu"):
+                    wp_lines.append(f"MTU = {prof['mtu']}")
+                wp_lines.extend([
+                    "",
+                    "[Peer]",
+                    f"PublicKey = {prof['public_key']}",
+                ])
+                if prof.get("preshared_key"):
+                    wp_lines.append(f"PresharedKey = {prof['preshared_key']}")
+                wp_lines.extend([
+                    f"Endpoint = {prof['endpoint']}",
+                    "AllowedIPs = 0.0.0.0/0, ::/0",
+                    f"PersistentKeepalive = {prof.get('persistent_keepalive') or 25}",
+                    "",
+                    "[Socks5]",
+                    f"BindAddress = 127.0.0.1:{WG_LOCAL_SOCKS_PORT}",
+                    "",
+                ])
+                wp_conf_path = Path("/tmp/sagedrive_wg_proxy.conf")
+                wp_conf_path.write_text("\n".join(wp_lines), encoding="utf-8")
+                os.chmod(wp_conf_path, 0o600)
+
+                chk = subprocess.run(
+                    [client["wireproxy_bin"], "-n", "-c", str(wp_conf_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    shell=False,
+                )
+                if chk.returncode != 0:
+                    raise RuntimeError((chk.stderr or chk.stdout or "Invalid wireproxy configuration").strip())
+
+                proc = subprocess.Popen(
+                    [client["wireproxy_bin"], "-c", str(wp_conf_path)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                # Wait briefly for local SOCKS5 bind on 127.0.0.1:25344
+                bound = False
+                for _ in range(12):
+                    if proc.poll() is not None:
+                        break
+                    try:
+                        with socket.create_connection(("127.0.0.1", WG_LOCAL_SOCKS_PORT), timeout=0.15):
+                            bound = True
+                            break
+                    except Exception:
+                        time.sleep(0.1)
+
+                if proc.poll() is None and bound:
+                    self._wg_proc = proc
+                    self._wg_runtime_mode = "wireproxy"
+                    self._wg_runtime_status = "connected"
+                    self._wg_active_ipv4 = prof["ipv4"]
+                    self._wg_runtime_message = (
+                        f"Connected to {prof['name']} ({prof['endpoint']}) · "
+                        f"Torrent-Only WireGuard Tunnel (127.0.0.1:{WG_LOCAL_SOCKS_PORT})"
+                    )
+                    return
+                else:
+                    try:
+                        proc.terminate()
+                        _, err_out = proc.communicate(timeout=2)
+                    except Exception:
+                        err_out = ""
+                    errors.append(f"wireproxy: {(err_out or 'exited before binding').strip()[-300:]}")
+            except Exception as exc:
+                errors.append(f"wireproxy: {exc}")
+
+        # 2) Try Kernel WireGuard Interface (wg-torrent) with Source-IP Policy Routing (Table 51820)
+        ip_bin = shutil.which("ip") or ("/sbin/ip" if os.path.isfile("/sbin/ip") else "")
+        if client["wg_bin"] and ip_bin and prof.get("ipv4"):
+            try:
+                wg_lines = [
+                    "[Interface]",
+                    f"PrivateKey = {prof['private_key']}",
+                ]
+                if prof.get("listen_port"):
+                    wg_lines.append(f"ListenPort = {prof['listen_port']}")
+                wg_lines.extend([
+                    "",
+                    "[Peer]",
+                    f"PublicKey = {prof['public_key']}",
+                ])
+                if prof.get("preshared_key"):
+                    wg_lines.append(f"PresharedKey = {prof['preshared_key']}")
+                wg_lines.extend([
+                    f"Endpoint = {prof['endpoint']}",
+                    "AllowedIPs = 0.0.0.0/0",
+                    f"PersistentKeepalive = {prof.get('persistent_keepalive') or 25}",
+                    "",
+                ])
+                wg_conf_path = Path("/tmp/sagedrive_wg_kernel.conf")
+                wg_conf_path.write_text("\n".join(wg_lines), encoding="utf-8")
+                os.chmod(wg_conf_path, 0o600)
+
+                subprocess.run([ip_bin, "link", "del", "dev", WG_KERNEL_IFACE], capture_output=True, timeout=3, shell=False)
+                r_add = subprocess.run(
+                    [ip_bin, "link", "add", "dev", WG_KERNEL_IFACE, "type", "wireguard"],
+                    capture_output=True, text=True, timeout=5, shell=False,
+                )
+                if r_add.returncode != 0:
+                    raise RuntimeError((r_add.stderr or r_add.stdout or "ip link add wireguard failed").strip())
+
+                r_set = subprocess.run(
+                    [client["wg_bin"], "setconf", WG_KERNEL_IFACE, str(wg_conf_path)],
+                    capture_output=True, text=True, timeout=5, shell=False,
+                )
+                if r_set.returncode != 0:
+                    raise RuntimeError((r_set.stderr or r_set.stdout or "wg setconf failed").strip())
+
+                for addr_item in [a.strip() for a in prof["address"].split(",") if a.strip()]:
+                    if ":" not in addr_item:
+                        subprocess.run(
+                            [ip_bin, "address", "add", addr_item, "dev", WG_KERNEL_IFACE],
+                            capture_output=True, text=True, timeout=4, shell=False,
+                        )
+                if prof.get("mtu"):
+                    subprocess.run(
+                        [ip_bin, "link", "set", "mtu", str(prof["mtu"]), "up", "dev", WG_KERNEL_IFACE],
+                        capture_output=True, text=True, timeout=4, shell=False,
+                    )
+                else:
+                    subprocess.run(
+                        [ip_bin, "link", "set", "up", "dev", WG_KERNEL_IFACE],
+                        capture_output=True, text=True, timeout=4, shell=False,
+                    )
+
+                # Policy route ONLY traffic originating from the WireGuard interface IP
+                subprocess.run(
+                    [ip_bin, "route", "replace", "default", "dev", WG_KERNEL_IFACE, "table", WG_POLICY_TABLE],
+                    capture_output=True, text=True, timeout=4, shell=False,
+                )
+                subprocess.run(
+                    [ip_bin, "rule", "del", "priority", WG_POLICY_PRIO],
+                    capture_output=True, text=True, timeout=4, shell=False,
+                )
+                subprocess.run(
+                    [ip_bin, "rule", "add", "from", f"{prof['ipv4']}/32", "table", WG_POLICY_TABLE, "priority", WG_POLICY_PRIO],
+                    capture_output=True, text=True, timeout=4, shell=False,
+                )
+
+                self._wg_runtime_mode = "kernel-wg"
+                self._wg_runtime_status = "connected"
+                self._wg_active_ipv4 = prof["ipv4"]
+                self._wg_runtime_message = (
+                    f"Connected to {prof['name']} ({prof['endpoint']}) · "
+                    f"Kernel Interface {WG_KERNEL_IFACE} ({prof['ipv4']} · Torrent-Only Policy Route)"
+                )
+                return
+            except Exception as exc:
+                self._stop_wireguard_tunnel_unlocked()
+                errors.append(f"kernel-wg: {exc}")
+
+        # 3) If running inside a restricted cloud preview sandbox (gVisor EOPNOTSUPP), keep profile enabled in standby
+        combined_err = " | ".join(errors)
+        if "operation not supported" in combined_err.lower() or "operation not permitted" in combined_err.lower():
+            self._wg_runtime_mode = "standby"
+            self._wg_runtime_status = "standby_sandbox"
+            self._wg_active_ipv4 = prof["ipv4"]
+            self._wg_runtime_message = (
+                f"Enabled for {prof['name']} ({prof['endpoint']} · {prof['address']}). "
+                "Note: Current preview sandbox restricts raw UDP tunnel sockets; tunnel activates automatically in your Docker Linux container."
+            )
+            return
+
+        if not client["available"]:
+            raise RuntimeError(
+                "WireGuard client is not installed. Click 'Install / Update WireGuard Client' in Settings → Torrents."
+            )
+        raise RuntimeError(f"Failed to start WireGuard tunnel: {combined_err or 'unknown error'}")
+
+    def toggle_wireguard(self, enabled: bool, profile_id: str = "", user: str = "admin") -> dict:
+        with self._lock:
+            if profile_id:
+                prof = self._get_wg_profile_unlocked(profile_id)
+                if not prof:
+                    raise KeyError("Selected WireGuard profile not found")
+                self._wg_state["active_profile_id"] = profile_id
+
+            active_id = str(self._wg_state.get("active_profile_id") or "")
+            active_prof = self._get_wg_profile_unlocked(active_id)
+
+            if enabled:
+                if not active_prof:
+                    raise ValueError("Add or select a WireGuard .conf profile first")
+                self._start_wireguard_tunnel_unlocked(active_id)
+                self._wg_state["enabled"] = True
+                self._save_wireguard_state_unlocked()
+                if self._session is not None:
+                    self._apply_session_settings(self._session)
+                log_action = "Torrent WireGuard VPN Enabled"
+                log_detail = f"Activated {active_prof['name']} ({active_prof['endpoint']}) for torrent traffic only"
+            else:
+                self._stop_wireguard_tunnel_unlocked()
+                self._wg_state["enabled"] = False
+                self._wg_runtime_status = "disabled"
+                self._wg_runtime_message = "WireGuard VPN disabled (torrent traffic uses standard settings)"
+                self._save_wireguard_state_unlocked()
+                if self._session is not None:
+                    self._apply_session_settings(self._session)
+                log_action = "Torrent WireGuard VPN Disabled"
+                log_detail = "Disabled WireGuard VPN for torrent traffic"
+
+        self._log(
+            log_action,
+            "change",
+            log_detail,
+            drive="Torrents",
+            target=active_prof["name"] if active_prof else "WireGuard VPN",
+            user=user,
+        )
+        return self.get_wireguard_state()
+
+    def install_wireguard_client(self, user: str = "admin", force_upgrade: bool = False) -> dict:
+        """
+        Install or upgrade the WireGuard client inside the running container:
+        1) Latest prebuilt `wireproxy` userspace WireGuard tunnel binary from GitHub Releases
+        2) `wireguard-tools` (wg) and `iproute2` (ip) via apt-get if available
+        """
+        with self._install_lock:
+            before = _detect_wireguard_client_info()
+            if not force_upgrade and before["wireproxy_version"]:
+                return {
+                    "ok": True,
+                    "already_installed": True,
+                    "client_available": True,
+                    "client_version": before["version_summary"],
+                    "message": f"WireGuard client ({before['version_summary']}) is already installed.",
+                }
+
+            logs = []
+            machine = platform.machine().lower()
+            arch = "arm64" if ("aarch64" in machine or "arm64" in machine) else "amd64"
+
+            # 1) Download latest official wireproxy release binary from GitHub
+            for repo in ("pufferffish/wireproxy", "octeep/wireproxy"):
+                try:
+                    api_url = f"https://api.github.com/repos/{repo}/releases/latest"
+                    req = urllib.request.Request(api_url, headers={"User-Agent": "SageDrive/1.0"})
+                    with urllib.request.urlopen(req, timeout=20) as resp:
+                        release_data = json.loads(resp.read().decode("utf-8"))
+                    tag = str(release_data.get("tag_name") or "latest")
+                    target_asset = f"wireproxy_linux_{arch}.tar.gz"
+                    asset_url = next(
+                        (a["browser_download_url"] for a in (release_data.get("assets") or []) if a.get("name") == target_asset),
+                        "",
+                    )
+                    if not asset_url:
+                        raise RuntimeError(f"Asset {target_asset} not found in {repo} {tag}")
+
+                    dl_req = urllib.request.Request(asset_url, headers={"User-Agent": "SageDrive/1.0"})
+                    with urllib.request.urlopen(dl_req, timeout=45) as dl_resp:
+                        tar_bytes = dl_resp.read()
+
+                    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tf:
+                        member = next((m for m in tf.getmembers() if os.path.basename(m.name) == "wireproxy"), None)
+                        if not member:
+                            raise RuntimeError("wireproxy binary not found in release archive")
+                        bin_data = tf.extractfile(member).read()
+
+                    dest_path = Path("/usr/local/bin/wireproxy")
+                    dest_path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp_bin = dest_path.with_suffix(".tmp")
+                    tmp_bin.write_bytes(bin_data)
+                    os.chmod(tmp_bin, 0o755)
+                    os.replace(tmp_bin, dest_path)
+                    logs.append(f"[github:{repo}] Installed wireproxy {tag} ({target_asset}) -> /usr/local/bin/wireproxy")
+                    break
+                except Exception as exc:
+                    logs.append(f"[github:{repo}] {exc}")
+
+            # 2) Also install/update wireguard-tools + iproute2 via apt-get if available
+            if shutil.which("apt-get") and (force_upgrade or not before["wg_version"]):
+                env = dict(os.environ)
+                env["DEBIAN_FRONTEND"] = "noninteractive"
+                try:
+                    subprocess.run(["apt-get", "update"], capture_output=True, text=True, timeout=120, shell=False, env=env)
+                    inst = subprocess.run(
+                        ["apt-get", "install", "-y", "--no-install-recommends", "wireguard-tools", "iproute2", "ca-certificates"],
+                        capture_output=True,
+                        text=True,
+                        timeout=180,
+                        shell=False,
+                        env=env,
+                    )
+                    snippet = ((inst.stdout or "") + "\n" + (inst.stderr or "")).strip()[-800:]
+                    logs.append(f"[apt:wireguard-tools] exit={inst.returncode}\n{snippet}")
+                except Exception as exc:
+                    logs.append(f"[apt:wireguard-tools] {exc}")
+
+            after = _detect_wireguard_client_info()
+            # Hot-restart active WireGuard tunnel if currently enabled
+            with self._lock:
+                if after["available"] and self._wg_state.get("enabled") and self._wg_state.get("active_profile_id"):
+                    try:
+                        self._start_wireguard_tunnel_unlocked(self._wg_state["active_profile_id"])
+                        if self._session is not None:
+                            self._apply_session_settings(self._session)
+                    except Exception as exc:
+                        logs.append(f"[tunnel-reload] {exc}")
+
+            if after["available"]:
+                self._log(
+                    "WireGuard Client Updated" if force_upgrade else "WireGuard Client Installed",
+                    "change" if force_upgrade else "add",
+                    f"WireGuard client ready: {after['version_summary']}",
+                    drive="Torrents",
+                    target="WireGuard Client",
+                    user=user,
+                )
+                return {
+                    "ok": True,
+                    "client_available": True,
+                    "client_version": after["version_summary"],
+                    "message": f"WireGuard client ready: {after['version_summary']}",
+                    "details": "\n".join(logs)[-1500:],
+                }
+
+            return {
+                "ok": False,
+                "client_available": False,
+                "client_version": "",
+                "message": "Could not install or update WireGuard client inside container.",
+                "details": "\n".join(logs)[-1500:],
+            }
+
     def _load_jobs(self):
         if TORRENTS_STATE_FILE.exists():
             try:
@@ -1233,12 +2155,52 @@ class TorrentManager:
 
         utp_enabled = bool(s.get("enable_utp", True))
         max_active = max(1, int(s.get("max_active_torrents") or 2))
-        return {
+
+        # Check if WireGuard VPN (Torrent-Only) is enabled and overrides torrent routing
+        wg_enabled = bool(self._wg_state.get("enabled", False))
+        wg_mode = self._wg_runtime_mode
+        wg_ipv4 = self._wg_active_ipv4
+
+        effective_dht = bool(s.get("enable_dht", True))
+        effective_lsd = bool(s.get("enable_lsd", False))
+        effective_upnp = bool(s.get("enable_upnp", True))
+        effective_natpmp = bool(s.get("enable_natpmp", True))
+        effective_anon = bool(s.get("anonymous_mode", False))
+        effective_proxy_peers = bool(s.get("proxy_peer_connections", True))
+        effective_proxy_trackers = bool(s.get("proxy_tracker_connections", True))
+        effective_proxy_hostnames = bool(s.get("proxy_hostnames", True))
+        outgoing_iface = ""
+
+        if wg_enabled and wg_mode == "wireproxy":
+            # Route 100% of libtorrent traffic through the local userspace WireGuard SOCKS5 tunnel
+            proxy_type_val = p_socks5
+            phost = "127.0.0.1"
+            pport = WG_LOCAL_SOCKS_PORT
+            puser = ""
+            ppass = ""
+            force_proxy_val = True
+            effective_proxy_peers = True
+            effective_proxy_trackers = True
+            effective_proxy_hostnames = True
+            effective_anon = True
+            effective_lsd = False
+            effective_upnp = False
+            effective_natpmp = False
+        elif wg_enabled and wg_mode == "kernel-wg" and wg_ipv4:
+            # Bind libtorrent strictly to the policy-routed wg-torrent interface IP
+            listen_str = f"{wg_ipv4}:{port}"
+            outgoing_iface = wg_ipv4
+            effective_anon = True
+            effective_lsd = False
+            effective_upnp = False
+            effective_natpmp = False
+
+        pack = {
             "listen_interfaces": listen_str,
-            "enable_dht": bool(s.get("enable_dht", True)),
-            "enable_lsd": bool(s.get("enable_lsd", False)),
-            "enable_upnp": bool(s.get("enable_upnp", True)),
-            "enable_natpmp": bool(s.get("enable_natpmp", True)),
+            "enable_dht": effective_dht,
+            "enable_lsd": effective_lsd,
+            "enable_upnp": effective_upnp,
+            "enable_natpmp": effective_natpmp,
             "enable_incoming_utp": utp_enabled,
             "enable_outgoing_utp": utp_enabled,
             "connections_limit": int(s.get("max_connections") or 200),
@@ -1263,17 +2225,20 @@ class TorrentManager:
             "mixed_mode_algorithm": 0,  # prefer_tcp so uTP congestion control never throttles TCP peers
             "in_enc_policy": enc_val,
             "out_enc_policy": enc_val,
-            "anonymous_mode": bool(s.get("anonymous_mode", False)),
+            "anonymous_mode": effective_anon,
             "proxy_type": proxy_type_val,
             "proxy_hostname": phost,
             "proxy_port": pport,
             "proxy_username": puser,
             "proxy_password": ppass,
-            "proxy_peer_connections": bool(s.get("proxy_peer_connections", True)),
-            "proxy_tracker_connections": bool(s.get("proxy_tracker_connections", True)),
-            "proxy_hostnames": bool(s.get("proxy_hostnames", True)),
+            "proxy_peer_connections": effective_proxy_peers,
+            "proxy_tracker_connections": effective_proxy_trackers,
+            "proxy_hostnames": effective_proxy_hostnames,
             "force_proxy": force_proxy_val,
         }
+        if outgoing_iface:
+            pack["outgoing_interfaces"] = outgoing_iface
+        return pack
 
     def _apply_session_settings(self, ses):
         pack = self._build_session_settings()

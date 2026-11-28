@@ -911,8 +911,23 @@ let _torrentSettings = {
   proxy_peer_connections:true, proxy_tracker_connections:true, proxy_hostnames:true, force_proxy:false,
   engine_available:true, engine_version:'', engine_source:''
 };
+let _torrentWireguard = {
+  enabled: false,
+  active_profile_id: '',
+  active_profile_name: '',
+  active_endpoint: '',
+  active_address: '',
+  tunnel_state: 'disabled',
+  tunnel_mode: '',
+  status_message: 'WireGuard VPN disabled (torrent traffic uses standard settings)',
+  client_available: true,
+  client_version: '',
+  profiles: []
+};
 let _torrentInstallingEngine = false;
 let _torrentInstallNotice = null;
+let _wgInstallingClient = false;
+let _wgInstallNotice = null;
 let _torrentFilter = 'all';
 let _torrentExpandedIds = new Set();
 let _torrentPollTimer = null;
@@ -7934,22 +7949,175 @@ async function renderSettings() {
         </div>
       </div>
 
-      <!-- SOCKS5 / SOCKS4 / HTTP Proxy Configuration -->
+      <!-- WireGuard VPN Configuration (Torrent Traffic Only) -->
+      <div class="card">
+        <div class="card-header">
+          <div style="display:flex;align-items:center;gap:var(--space-2)">
+            <svg data-lucide="shield-check" width="16" height="16" style="color:var(--color-primary)"></svg>
+            <span class="card-title">WireGuard VPN (Torrent Traffic Only)</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap">
+            <span style="font-size:var(--text-xs);font-family:var(--font-mono);color:${_torrentWireguard.client_available ? 'var(--color-success)' : 'var(--color-warning)'}">
+              ${_torrentWireguard.client_available ? `Client Ready (${escHtml(_torrentWireguard.client_version || 'wireproxy')})` : 'WireGuard Client Not Installed'}
+            </span>
+            <button class="btn btn-secondary btn-sm" style="padding:3px 9px;font-size:11px" onclick="installWireguardClient(true)" ${(!_adminMode || _wgInstallingClient) ? 'disabled' : ''} title="Install or update to the latest official WireGuard client (wireproxy + wireguard-tools)">
+              <svg data-lucide="${_wgInstallingClient ? 'loader' : 'arrow-up-circle'}" width="12" height="12"></svg>
+              ${_wgInstallingClient ? 'Updating Client…' : 'Update Latest WireGuard Client'}
+            </button>
+          </div>
+        </div>
+        <div class="card-body" style="display:flex;flex-direction:column;gap:var(--space-4)">
+          <div style="padding:var(--space-3) var(--space-4);border:1px solid var(--color-divider);border-radius:var(--radius-md);background:var(--color-surface-offset);font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.55">
+            <strong style="color:var(--color-text)">Strict Torrent-Only Isolation:</strong> Both this WireGuard VPN tunnel and the SOCKS5/HTTP proxy below apply <strong>exclusively to BitTorrent swarm, tracker, and DHT traffic</strong> (<code style="font-family:var(--font-mono)">libtorrent</code>). Google Drive uploads, FileJump transfers, Local SMB NAS mounts, and the SageDrive web interface never traverse the VPN or proxy.
+          </div>
+
+          ${_wgInstallNotice ? `
+          <div style="padding:var(--space-3) var(--space-4);border:1px solid ${_wgInstallNotice.ok ? 'var(--color-success)' : 'var(--color-error)'};border-radius:var(--radius-md);background:color-mix(in oklab,${_wgInstallNotice.ok ? 'var(--color-success)' : 'var(--color-error)'} 10%,transparent);font-size:var(--text-xs);line-height:1.5">
+            <div style="font-weight:600;color:${_wgInstallNotice.ok ? 'var(--color-success)' : 'var(--color-error)'}">${escHtml(_wgInstallNotice.message || '')}</div>
+            ${_wgInstallNotice.details ? `<pre style="margin:var(--space-2) 0 0;padding:var(--space-2);background:var(--color-surface-offset);border-radius:var(--radius-sm);font-family:var(--font-mono);font-size:11px;white-space:pre-wrap;max-height:130px;overflow:auto;color:var(--color-text-muted)">${escHtml(_wgInstallNotice.details)}</pre>` : ''}
+          </div>
+          ` : ''}
+
+          <!-- Active Tunnel Control Bar -->
+          <div style="padding:var(--space-3) var(--space-4);border:1px solid ${_torrentWireguard.enabled ? 'var(--color-success)' : 'var(--color-border)'};border-radius:var(--radius-md);background:${_torrentWireguard.enabled ? 'color-mix(in oklab,var(--color-success) 8%,var(--color-surface-offset))' : 'var(--color-surface-offset)'};display:flex;align-items:center;justify-content:space-between;gap:var(--space-3);flex-wrap:wrap">
+            <div style="min-width:240px;flex:1">
+              <div style="display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap">
+                <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${_torrentWireguard.enabled ? 'var(--color-success)' : 'var(--color-text-faint)'}"></span>
+                <span style="font-weight:700;font-size:var(--text-sm);color:var(--color-text)">
+                  ${_torrentWireguard.enabled
+                    ? `WireGuard Active: ${escHtml(_torrentWireguard.active_profile_name || 'Connected')}`
+                    : 'WireGuard VPN Disabled'}
+                </span>
+                ${_torrentWireguard.enabled && _torrentWireguard.active_endpoint ? `
+                  <span style="font-size:11px;font-family:var(--font-mono);color:var(--color-success)">
+                    ${escHtml(_torrentWireguard.active_endpoint)} · ${escHtml(_torrentWireguard.active_address || '')}
+                  </span>
+                ` : ''}
+              </div>
+              <div style="font-size:11px;color:var(--color-text-muted);margin-top:4px;line-height:1.45">
+                ${escHtml(_torrentWireguard.status_message || 'Select or add a WireGuard .conf profile below and click Enable to route all torrent traffic through the VPN tunnel.')}
+              </div>
+            </div>
+
+            <div style="display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap">
+              ${(_torrentWireguard.profiles && _torrentWireguard.profiles.length > 0) ? `
+                <select class="form-input" id="wg-active-select" style="width:auto;min-width:210px;height:32px;padding:0 10px;font-size:var(--text-xs)" onchange="onSelectWireguardServer(this.value)" ${_adminMode ? '' : 'disabled'} title="Quick-switch active WireGuard server">
+                  ${_torrentWireguard.profiles.map(p => `
+                    <option value="${escAttr(p.id)}" ${p.id === _torrentWireguard.active_profile_id ? 'selected' : ''}>
+                      ${escHtml(p.name)}${!p.keys_valid ? ' (Needs Keys)' : ''}
+                    </option>
+                  `).join('')}
+                </select>
+              ` : ''}
+              ${_torrentWireguard.enabled ? `
+                <button type="button" class="btn btn-danger btn-sm" onclick="toggleTorrentWireguard(false)" ${_adminMode ? '' : 'disabled'}>
+                  <svg data-lucide="power-off" width="14" height="14"></svg> Disable WireGuard
+                </button>
+              ` : `
+                <button type="button" class="btn btn-primary btn-sm" onclick="toggleTorrentWireguard(true)" ${(!_adminMode || !(_torrentWireguard.profiles && _torrentWireguard.profiles.length)) ? 'disabled' : ''}>
+                  <svg data-lucide="power" width="14" height="14"></svg> Enable WireGuard
+                </button>
+              `}
+            </div>
+          </div>
+
+          <!-- Add / Import WireGuard Profiles Toolbar -->
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:var(--space-2);flex-wrap:wrap">
+            <div style="font-size:var(--text-xs);font-weight:600;color:var(--color-text)">
+              Stored WireGuard Server Profiles (${(_torrentWireguard.profiles || []).length})
+            </div>
+            <div style="display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap">
+              <input type="file" id="wg-conf-file-input" accept=".conf,text/plain" multiple style="display:none" onchange="onWireguardFileUpload(this.files); this.value='';" />
+              <button type="button" class="btn btn-secondary btn-sm" onclick="document.getElementById('wg-conf-file-input').click()" ${_adminMode ? '' : 'disabled'}>
+                <svg data-lucide="upload" width="14" height="14"></svg> Upload .conf File(s)
+              </button>
+              <button type="button" class="btn btn-primary btn-sm" onclick="openWireguardProfileModal('')" ${_adminMode ? '' : 'disabled'}>
+                <svg data-lucide="file-plus" width="14" height="14"></svg> Paste / Add .conf Config
+              </button>
+            </div>
+          </div>
+
+          <!-- Stored WireGuard Profiles List -->
+          ${(_torrentWireguard.profiles && _torrentWireguard.profiles.length) ? `
+            <div style="display:flex;flex-direction:column;border:1px solid var(--color-border);border-radius:var(--radius-md);overflow:hidden;background:var(--color-surface)">
+              ${_torrentWireguard.profiles.map((p, idx) => {
+                const isSelected = p.id === _torrentWireguard.active_profile_id;
+                const isConnected = _torrentWireguard.enabled && isSelected;
+                return `
+                  <div style="display:flex;align-items:center;justify-content:space-between;gap:var(--space-3);padding:var(--space-3) var(--space-4);border-top:${idx === 0 ? 'none' : '1px solid var(--color-divider)'};background:${isConnected ? 'color-mix(in oklab,var(--color-success) 6%,transparent)' : (isSelected ? 'var(--color-surface-offset)' : 'transparent')};flex-wrap:wrap">
+                    <div style="min-width:240px;flex:1">
+                      <div style="display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap">
+                        <span style="font-weight:600;font-size:var(--text-sm);color:var(--color-text)">${escHtml(p.name)}</span>
+                        <span style="font-size:11px;font-family:var(--font-mono);color:var(--color-text-faint)">(${escHtml(p.filename || 'wg.conf')})</span>
+                        ${isConnected
+                          ? `<span style="font-size:11px;font-family:var(--font-mono);font-weight:600;color:var(--color-success)">● Connected (Torrent-Only)</span>`
+                          : (isSelected ? `<span style="font-size:11px;font-family:var(--font-mono);color:var(--color-primary)">● Selected Server</span>` : '')}
+                        ${!p.keys_valid ? `<span style="font-size:11px;font-family:var(--font-mono);color:var(--color-warning)">⚠ Placeholder Keys</span>` : ''}
+                      </div>
+                      <div style="font-size:11px;font-family:var(--font-mono);color:var(--color-text-muted);margin-top:4px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                        <span>Endpoint: ${escHtml(p.endpoint)}</span>
+                        <span>·</span>
+                        <span>Address: ${escHtml(p.address)}</span>
+                        <span>·</span>
+                        <span>DNS: ${escHtml(p.dns || '—')}</span>
+                        <span>·</span>
+                        <span title="${escHtml(p.allowed_ips || '')}">AllowedIPs: ${Number(p.allowed_ips_count || 1)} CIDR${Number(p.allowed_ips_count || 1) === 1 ? '' : 's'}</span>
+                        <span>·</span>
+                        <span>Keepalive: ${Number(p.persistent_keepalive || 25)}s</span>
+                      </div>
+                      ${!p.keys_valid ? `
+                        <div style="font-size:11px;color:var(--color-warning);margin-top:4px">
+                          ${escHtml(p.key_warning || 'Replace placeholder PRIVATEKEY/PUBLICKEY with your actual 44-character base64 WireGuard keys before connecting.')}
+                        </div>
+                      ` : ''}
+                    </div>
+                    <div style="display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap">
+                      ${isConnected ? `
+                        <button type="button" class="btn btn-secondary btn-sm" style="padding:4px 10px;font-size:11px" onclick="toggleTorrentWireguard(false, '${escAttr(p.id)}')" ${_adminMode ? '' : 'disabled'}>
+                          <svg data-lucide="power-off" width="12" height="12"></svg> Disconnect
+                        </button>
+                      ` : `
+                        <button type="button" class="btn btn-primary btn-sm" style="padding:4px 10px;font-size:11px" onclick="toggleTorrentWireguard(true, '${escAttr(p.id)}')" ${_adminMode ? '' : 'disabled'} title="Switch to this WireGuard server and enable torrent-only VPN">
+                          <svg data-lucide="zap" width="12" height="12"></svg> ${_torrentWireguard.enabled ? 'Switch Server' : 'Enable &amp; Connect'}
+                        </button>
+                      `}
+                      <button type="button" class="btn btn-secondary btn-sm" style="padding:4px 9px;font-size:11px" onclick="openWireguardProfileModal('${escAttr(p.id)}')" ${_adminMode ? '' : 'disabled'} title="View or edit WireGuard .conf details">
+                        <svg data-lucide="edit-3" width="12" height="12"></svg> Edit .conf
+                      </button>
+                      <button type="button" class="btn btn-ghost btn-sm" style="padding:4px 8px;font-size:11px;color:var(--color-error)" onclick="deleteWireguardProfile('${escAttr(p.id)}', '${escAttr(p.name)}')" ${_adminMode ? '' : 'disabled'} title="Delete stored WireGuard profile">
+                        <svg data-lucide="trash-2" width="12" height="12"></svg>
+                      </button>
+                    </div>
+                  </div>
+                `;
+              }).join('')}
+            </div>
+          ` : `
+            <div style="padding:var(--space-6) var(--space-4);border:1px dashed var(--color-border);border-radius:var(--radius-md);text-align:center;color:var(--color-text-muted);font-size:var(--text-xs)">
+              No WireGuard server profiles saved yet. Click <strong>Upload .conf File(s)</strong> or <strong>Paste / Add .conf Config</strong> above to store multiple VPN servers.
+            </div>
+          `}
+        </div>
+      </div>
+
+      <!-- SOCKS5 / SOCKS4 / HTTP Proxy Configuration (Torrent Traffic Only) -->
       <div class="card">
         <div class="card-header">
           <div style="display:flex;align-items:center;gap:var(--space-2)">
             <svg data-lucide="globe" width="16" height="16" style="color:var(--color-primary)"></svg>
-            <span class="card-title">Proxy Configuration (SOCKS5 / HTTP)</span>
+            <span class="card-title">Proxy Configuration (SOCKS5 / HTTP — Torrent Traffic Only)</span>
           </div>
-          <span style="font-size:var(--text-xs);font-family:var(--font-mono);color:${(_torrentSettings.proxy_type && _torrentSettings.proxy_type !== 'none' && _torrentSettings.proxy_hostname) ? 'var(--color-primary)' : 'var(--color-text-muted)'}">
-            ${(_torrentSettings.proxy_type && _torrentSettings.proxy_type !== 'none' && _torrentSettings.proxy_hostname)
-              ? `${escHtml(_torrentSettings.proxy_type.toUpperCase())} · ${escHtml(_torrentSettings.proxy_hostname)}:${Number(_torrentSettings.proxy_port || 1080)}`
-              : 'Direct Connection'}
+          <span style="font-size:var(--text-xs);font-family:var(--font-mono);color:${_torrentWireguard.enabled ? 'var(--color-success)' : ((_torrentSettings.proxy_type && _torrentSettings.proxy_type !== 'none' && _torrentSettings.proxy_hostname) ? 'var(--color-primary)' : 'var(--color-text-muted)')}">
+            ${_torrentWireguard.enabled
+              ? `Managed by WireGuard (${escHtml(_torrentWireguard.active_profile_name || 'Active')})`
+              : ((_torrentSettings.proxy_type && _torrentSettings.proxy_type !== 'none' && _torrentSettings.proxy_hostname)
+                  ? `${escHtml(_torrentSettings.proxy_type.toUpperCase())} · ${escHtml(_torrentSettings.proxy_hostname)}:${Number(_torrentSettings.proxy_port || 1080)}`
+                  : 'Direct Connection')}
           </span>
         </div>
         <div class="card-body" style="display:flex;flex-direction:column;gap:var(--space-4)">
           <p style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.55">
-            Route BitTorrent peer connections, tracker announces, and DNS lookups through a SOCKS5, SOCKS4, or HTTP proxy. Applies live to the libtorrent session without restarting the container.
+            Route BitTorrent peer connections, tracker announces, and DNS lookups through a standalone SOCKS5, SOCKS4, or HTTP proxy when WireGuard VPN above is disabled. Applies strictly to torrent traffic—Google Drive, FileJump, and SMB NAS traffic never use this proxy.
           </p>
 
           <div class="form-row">
@@ -8957,6 +9125,9 @@ async function refreshTorrents(silent = false) {
     if (data && data.settings) {
       _torrentSettings = data.settings;
     }
+    if (data && data.wireguard) {
+      _torrentWireguard = data.wireguard;
+    }
     updateSidebarTorrentCount();
     if (_view === 'torrents') {
       renderTorrentsView(true);
@@ -9194,6 +9365,265 @@ async function installTorrentEngine(forceUpgrade = false) {
     _torrentInstallingEngine = false;
     if (_view === 'settings') renderSettings();
     if (_view === 'torrents') renderTorrentsView(true);
+  }
+}
+
+async function installWireguardClient(forceUpgrade = true) {
+  if (!_adminMode) {
+    toast('Unlock Administrator Functions in Settings to install or update the WireGuard client', 'error');
+    showAdminPinModal();
+    return;
+  }
+  if (_wgInstallingClient) return;
+  _wgInstallingClient = true;
+  _wgInstallNotice = {
+    ok: true,
+    message: 'Downloading and installing the latest official WireGuard client (wireproxy + wireguard-tools) inside container...'
+  };
+  if (_view === 'settings') renderSettings();
+  try {
+    const res = await fetch(`${API}/api/torrents/wireguard/install-client`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(_token ? { Authorization: `Bearer ${_token}` } : {}),
+      },
+      body: JSON.stringify({ force_upgrade: Boolean(forceUpgrade) }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.ok) {
+      _wgInstallNotice = {
+        ok: true,
+        message: data.message || `WireGuard client (${data.client_version || 'updated'}) is ready.`,
+        details: data.details || '',
+      };
+      toast(_wgInstallNotice.message, 'success');
+      await refreshTorrents(true);
+    } else {
+      _wgInstallNotice = {
+        ok: false,
+        message: data.message || data.error || 'Failed to update WireGuard client.',
+        details: data.details || '',
+      };
+      toast(_wgInstallNotice.message, 'error');
+    }
+  } catch (e) {
+    _wgInstallNotice = {
+      ok: false,
+      message: 'WireGuard client update failed: ' + (e.message || String(e)),
+    };
+    toast(_wgInstallNotice.message, 'error');
+  } finally {
+    _wgInstallingClient = false;
+    if (_view === 'settings') renderSettings();
+    if (_view === 'torrents') renderTorrentsView(true);
+  }
+}
+
+async function toggleTorrentWireguard(enable, profileId = '') {
+  if (!_adminMode) {
+    toast('Unlock Administrator Functions in Settings to control WireGuard VPN', 'error');
+    showAdminPinModal();
+    return;
+  }
+  const targetId = profileId || document.getElementById('wg-active-select')?.value || _torrentWireguard.active_profile_id || '';
+  try {
+    const state = await apiJSON('/api/torrents/wireguard/toggle', {
+      method: 'POST',
+      json: { enabled: Boolean(enable), profile_id: targetId },
+    });
+    _torrentWireguard = state;
+    await refreshTorrents(true);
+    if (_view === 'settings') renderSettings();
+    if (_view === 'torrents') renderTorrentsView(true);
+    toast(
+      enable
+        ? `WireGuard VPN enabled for torrent traffic (${state.active_profile_name || 'Connected'})`
+        : 'WireGuard VPN disabled for torrent traffic',
+      'success'
+    );
+  } catch (e) {
+    toast(e.message || 'Failed to toggle WireGuard VPN', 'error');
+  }
+}
+
+async function onSelectWireguardServer(profileId) {
+  if (!profileId) return;
+  _torrentWireguard.active_profile_id = profileId;
+  if (_torrentWireguard.enabled) {
+    await toggleTorrentWireguard(true, profileId);
+  } else if (_view === 'settings') {
+    renderSettings();
+  }
+}
+
+async function onWireguardFileUpload(fileList) {
+  if (!_adminMode) {
+    toast('Unlock Administrator Functions in Settings to upload WireGuard .conf files', 'error');
+    showAdminPinModal();
+    return;
+  }
+  if (!fileList || !fileList.length) return;
+  const fd = new FormData();
+  for (let i = 0; i < fileList.length; i++) {
+    fd.append('files', fileList[i]);
+  }
+  fd.append('activate', 'true');
+  try {
+    const res = await fetch(`${API}/api/torrents/wireguard/profiles`, {
+      method: 'POST',
+      headers: _token ? { Authorization: `Bearer ${_token}` } : {},
+      body: fd,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Upload failed (${res.status})`);
+    _torrentWireguard = data;
+    await refreshTorrents(true);
+    if (_view === 'settings') renderSettings();
+    toast(`Imported ${fileList.length} WireGuard .conf profile${fileList.length === 1 ? '' : 's'}`, 'success');
+  } catch (e) {
+    toast('Failed to import WireGuard .conf: ' + (e.message || String(e)), 'error');
+  }
+}
+
+async function openWireguardProfileModal(profileId = '') {
+  if (!_adminMode) {
+    toast('Unlock Administrator Functions in Settings to add or edit WireGuard profiles', 'error');
+    showAdminPinModal();
+    return;
+  }
+  let existing = null;
+  if (profileId) {
+    try {
+      existing = await apiJSON(`/api/torrents/wireguard/profiles/${encodeURIComponent(profileId)}`);
+    } catch (e) {
+      toast('Failed to load WireGuard profile: ' + e.message, 'error');
+      return;
+    }
+  }
+  const samplePlaceholder = `[Interface]
+PrivateKey = <paste_your_44_char_base64_private_key>
+Address = 10.5.0.2/32
+DNS = 103.86.96.100, 103.86.99.100
+
+[Peer]
+PublicKey = <paste_peer_44_char_base64_public_key>
+AllowedIPs = 0.0.0.0/5, 8.0.0.0/7, 10.0.1.0/24, 10.0.2.0/23, 10.0.4.0/22, 10.0.8.0/21, 10.0.16.0/20, 10.0.32.0/19, 10.0.64.0/18, 10.0.128.0/17, 10.1.0.0/16, 10.2.0.0/15, 10.4.0.0/14, 10.8.0.0/13, 10.16.0.0/12, 10.32.0.0/11, 10.64.0.0/10, 10.128.0.0/9, 11.0.0.0/8, 12.0.0.0/6, 16.0.0.0/4, 32.0.0.0/3, 64.0.0.0/2, 128.0.0.0/1
+Endpoint = 187.15.155.152:51820
+PersistentKeepalive = 25`;
+
+  showModal(`
+    <div class="modal-header">
+      <h3 class="modal-title">${existing ? `Edit WireGuard Profile · ${escHtml(existing.name)}` : 'Add WireGuard VPN Profile (Torrent Traffic Only)'}</h3>
+      <button class="btn btn-ghost btn-icon" onclick="closeModal()"><svg data-lucide="x" width="16" height="16"></svg></button>
+    </div>
+    <div class="modal-body" style="display:flex;flex-direction:column;gap:var(--space-3)">
+      <div style="font-size:var(--text-xs);color:var(--color-text-muted);line-height:1.5">
+        Paste the contents of your WireGuard <code style="font-family:var(--font-mono)">.conf</code> file below, or load a <code style="font-family:var(--font-mono)">.conf</code> file from disk. This VPN profile routes <strong>only BitTorrent traffic</strong>—Google Drive, FileJump, and Local SMB NAS transfers are never affected.
+      </div>
+      <div class="form-row">
+        <div class="form-group" style="flex:1">
+          <label class="form-label" for="wg-modal-name">Server Profile Name (optional — auto-named from Endpoint if blank)</label>
+          <input class="form-input" id="wg-modal-name" type="text" value="${escHtml(existing ? existing.name : '')}" placeholder="e.g. Canada #2117 (ca2117)" />
+        </div>
+        <div class="form-group" style="display:flex;align-items:flex-end">
+          <input type="file" id="wg-modal-file-picker" accept=".conf,text/plain" style="display:none" onchange="loadWireguardFileIntoModal(this.files[0])" />
+          <button type="button" class="btn btn-secondary btn-sm" style="height:36px" onclick="document.getElementById('wg-modal-file-picker').click()">
+            <svg data-lucide="folder-open" width="14" height="14"></svg> Load from .conf File…
+          </button>
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="wg-modal-conf">WireGuard Configuration (<code style="font-family:var(--font-mono)">[Interface]</code> &amp; <code style="font-family:var(--font-mono)">[Peer]</code>)</label>
+        <textarea class="form-input" id="wg-modal-conf" rows="13" style="font-family:var(--font-mono);font-size:12px;line-height:1.45;white-space:pre;resize:vertical" placeholder="${escHtml(samplePlaceholder)}">${escHtml(existing ? existing.raw_conf : '')}</textarea>
+      </div>
+      <label style="display:flex;align-items:center;gap:var(--space-2);font-size:var(--text-xs);color:var(--color-text);cursor:pointer">
+        <input type="checkbox" id="wg-modal-activate" ${(!existing || existing.id === _torrentWireguard.active_profile_id) ? 'checked' : ''} />
+        Set as selected active WireGuard server profile
+      </label>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveWireguardProfileModal('${escAttr(existing ? existing.id : '')}')">
+        <svg data-lucide="save" width="14" height="14"></svg> ${existing ? 'Save Changes' : 'Save WireGuard Profile'}
+      </button>
+    </div>
+  `);
+}
+
+function loadWireguardFileIntoModal(file) {
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    const ta = document.getElementById('wg-modal-conf');
+    if (ta) ta.value = String(reader.result || '');
+    const nameIn = document.getElementById('wg-modal-name');
+    if (nameIn && !nameIn.value.trim()) {
+      nameIn.value = file.name.replace(/\.conf$/i, '');
+    }
+  };
+  reader.readAsText(file);
+}
+
+async function saveWireguardProfileModal(profileId = '') {
+  const confText = (document.getElementById('wg-modal-conf')?.value || '').trim();
+  const nameVal = (document.getElementById('wg-modal-name')?.value || '').trim();
+  const activateVal = Boolean(document.getElementById('wg-modal-activate')?.checked);
+  if (!confText) {
+    toast('Paste or load a WireGuard .conf configuration first', 'error');
+    return;
+  }
+  try {
+    const state = await apiJSON('/api/torrents/wireguard/profiles', {
+      method: 'POST',
+      json: {
+        id: profileId,
+        name: nameVal,
+        filename: nameVal ? `${nameVal.replace(/[^0-9a-zA-Z._\-]+/g, '_')}.conf` : '',
+        conf_text: confText,
+        activate: activateVal,
+      },
+    });
+    _torrentWireguard = state;
+    closeModal();
+    await refreshTorrents(true);
+    if (_view === 'settings') renderSettings();
+    toast(profileId ? 'WireGuard profile updated' : 'WireGuard profile saved', 'success');
+  } catch (e) {
+    toast(e.message || 'Failed to save WireGuard profile', 'error');
+  }
+}
+
+function deleteWireguardProfile(profileId, profileName) {
+  if (!_adminMode) {
+    showAdminPinModal();
+    return;
+  }
+  showModal(`
+    <div class="modal-header">
+      <h3 class="modal-title">Remove WireGuard Profile</h3>
+      <button class="btn btn-ghost btn-icon" onclick="closeModal()"><svg data-lucide="x" width="16" height="16"></svg></button>
+    </div>
+    <div class="modal-body" style="font-size:var(--text-sm);color:var(--color-text-muted);line-height:1.5">
+      Remove stored WireGuard configuration <strong style="color:var(--color-text)">${escHtml(profileName || profileId)}</strong>?
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-danger" onclick="confirmDeleteWireguardProfile('${escAttr(profileId)}')">Remove Profile</button>
+    </div>
+  `);
+}
+
+async function confirmDeleteWireguardProfile(profileId) {
+  closeModal();
+  try {
+    const state = await apiJSON(`/api/torrents/wireguard/profiles/${encodeURIComponent(profileId)}`, { method: 'DELETE' });
+    _torrentWireguard = state;
+    await refreshTorrents(true);
+    if (_view === 'settings') renderSettings();
+    toast('WireGuard profile removed', 'success');
+  } catch (e) {
+    toast(e.message || 'Failed to remove WireGuard profile', 'error');
   }
 }
 
@@ -9447,6 +9877,10 @@ function renderTorrentsView(isSilentRefresh = false) {
           <button class="torrent-filter-btn ${_torrentFilter==='error'?'active':''}" onclick="setTorrentFilter('error')">Failed (${counts.error})</button>
         </div>
         <div class="torrent-summary-line">
+          <span style="color:${_torrentWireguard.enabled ? 'var(--color-success)' : 'var(--color-text-muted)'};cursor:pointer" onclick="setSettingsTab('torrents');showView('settings')" title="${escHtml(_torrentWireguard.status_message || 'Click to configure WireGuard VPN (Torrent Traffic Only)')}">
+            VPN: ${_torrentWireguard.enabled ? escHtml(_torrentWireguard.active_profile_name || 'On') : 'Off'}
+          </span>
+          <span aria-hidden="true">·</span>
           <span title="Concurrent active torrent slots (configure in Settings → Torrents)">Active ${counts.active}/${maxActiveTorrents}</span>
           <span aria-hidden="true">·</span>
           <span title="Total swarm download speed">DL ↓ ${formatTorrentRate(totalDownRate)}</span>

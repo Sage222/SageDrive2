@@ -4521,6 +4521,7 @@ def list_torrents():
     return jsonify({
         "jobs": mgr.list_jobs(),
         "settings": settings,
+        "wireguard": mgr.get_wireguard_state(),
         "engine_available": settings.get("engine_available", False),
         "engine_version": settings.get("engine_version", ""),
         "engine_source": settings.get("engine_source", ""),
@@ -4553,6 +4554,110 @@ def install_torrent_engine():
     force_upgrade = bool(body.get("force_upgrade", False))
     try:
         result = _get_torrent_mgr().install_engine(user=uname, force_upgrade=force_upgrade)
+        status_code = 200 if result.get("ok") else 500
+        return jsonify(result), status_code
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "message": str(e)}), 500
+
+
+@app.get("/api/torrents/wireguard")
+@auth.require_auth
+def get_torrent_wireguard():
+    return jsonify(_get_torrent_mgr().get_wireguard_state())
+
+
+@app.get("/api/torrents/wireguard/profiles/<profile_id>")
+@auth.require_admin
+def get_torrent_wireguard_profile(profile_id):
+    try:
+        return jsonify(_get_torrent_mgr().get_wireguard_profile_detail(profile_id))
+    except KeyError:
+        return jsonify({"error": "WireGuard profile not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.post("/api/torrents/wireguard/profiles")
+@auth.require_admin
+def save_torrent_wireguard_profile():
+    uname = (getattr(request, "user", None) or {}).get("username", "admin")
+    mgr = _get_torrent_mgr()
+    try:
+        if request.content_type and "multipart/form-data" in request.content_type.lower():
+            uploaded_files = request.files.getlist("files") or request.files.getlist("file")
+            if not uploaded_files:
+                return jsonify({"error": "No WireGuard .conf file uploaded"}), 400
+            custom_name = (request.form.get("name") or "").strip()
+            activate = str(request.form.get("activate") or "").lower() in ("1", "true", "yes")
+            state = None
+            for idx, f in enumerate(uploaded_files):
+                raw_bytes = f.read(128 * 1024 + 1)
+                if len(raw_bytes) > 128 * 1024:
+                    return jsonify({"error": f"File '{f.filename}' exceeds 128 KiB limit"}), 400
+                conf_text = raw_bytes.decode("utf-8", errors="replace")
+                state = mgr.save_wireguard_profile(
+                    conf_text=conf_text,
+                    name=custom_name if len(uploaded_files) == 1 else "",
+                    filename=f.filename or f"wg_{idx + 1}.conf",
+                    activate=(activate and idx == len(uploaded_files) - 1),
+                    user=uname,
+                )
+            return jsonify(state or mgr.get_wireguard_state())
+
+        body = request.get_json(force=True) or {}
+        conf_text = body.get("conf_text") or body.get("raw_conf") or ""
+        name = (body.get("name") or "").strip()
+        filename = (body.get("filename") or "").strip()
+        profile_id = (body.get("id") or body.get("profile_id") or "").strip()
+        activate = bool(body.get("activate", False))
+        state = mgr.save_wireguard_profile(
+            conf_text=conf_text,
+            name=name,
+            filename=filename,
+            profile_id=profile_id,
+            activate=activate,
+            user=uname,
+        )
+        return jsonify(state)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.delete("/api/torrents/wireguard/profiles/<profile_id>")
+@auth.require_admin
+def delete_torrent_wireguard_profile(profile_id):
+    uname = (getattr(request, "user", None) or {}).get("username", "admin")
+    try:
+        return jsonify(_get_torrent_mgr().delete_wireguard_profile(profile_id, user=uname))
+    except KeyError:
+        return jsonify({"error": "WireGuard profile not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.post("/api/torrents/wireguard/toggle")
+@auth.require_admin
+def toggle_torrent_wireguard():
+    uname = (getattr(request, "user", None) or {}).get("username", "admin")
+    body = request.get_json(force=True) or {}
+    enabled = bool(body.get("enabled", False))
+    profile_id = str(body.get("profile_id") or "").strip()
+    try:
+        return jsonify(_get_torrent_mgr().toggle_wireguard(enabled=enabled, profile_id=profile_id, user=uname))
+    except KeyError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.post("/api/torrents/wireguard/install-client")
+@auth.require_admin
+def install_torrent_wireguard_client():
+    uname = (getattr(request, "user", None) or {}).get("username", "admin")
+    body = request.get_json(silent=True) or {}
+    force_upgrade = bool(body.get("force_upgrade", False))
+    try:
+        result = _get_torrent_mgr().install_wireguard_client(user=uname, force_upgrade=force_upgrade)
         status_code = 200 if result.get("ok") else 500
         return jsonify(result), status_code
     except Exception as e:

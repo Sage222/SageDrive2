@@ -90,6 +90,16 @@ WG_LOCAL_SOCKS_PORT = 25344
 WG_KERNEL_IFACE = "wg-torrent"
 WG_POLICY_TABLE = "51820"
 WG_POLICY_PRIO = "100"
+WG_POLICY_LOCAL_PRIO = "99"
+
+WG_TCP_FALLBACK_TRACKERS = (
+    "http://tracker.opentrackr.org:1337/announce",
+    "https://tracker.tamersunion.org:443/announce",
+    "http://tracker.openbittorrent.com:80/announce",
+    "https://tracker.gbitt.info:443/announce",
+    "http://tracker.bt4g.com:2095/announce",
+    "https://tracker.lilithraws.org:443/announce",
+)
 
 SAMPLE_WG_CONF_TEMPLATE = """[Interface]
 PrivateKey = PRIVATEKEY
@@ -1690,13 +1700,24 @@ class TorrentManager:
                     pass
             self._wg_proc = None
 
-        # 2) Clean up kernel wg-torrent interface and policy routing rule if present
-        ip_bin = shutil.which("ip") or "/sbin/ip"
-        if os.path.isfile(ip_bin) or shutil.which("ip"):
+        if getattr(self, "_wg_log_fp", None) is not None:
             try:
-                subprocess.run([ip_bin, "rule", "del", "priority", WG_POLICY_PRIO], capture_output=True, timeout=3, shell=False)
+                self._wg_log_fp.close()
             except Exception:
                 pass
+            self._wg_log_fp = None
+
+        # 2) Clean up kernel wg-torrent interface and policy routing rules if present
+        ip_bin = shutil.which("ip") or "/sbin/ip"
+        if os.path.isfile(ip_bin) or shutil.which("ip"):
+            for prio in (WG_POLICY_LOCAL_PRIO, WG_POLICY_PRIO):
+                for _ in range(3):
+                    try:
+                        r = subprocess.run([ip_bin, "rule", "del", "priority", prio], capture_output=True, timeout=2, shell=False)
+                        if r.returncode != 0:
+                            break
+                    except Exception:
+                        break
             try:
                 subprocess.run([ip_bin, "route", "flush", "table", WG_POLICY_TABLE], capture_output=True, timeout=3, shell=False)
             except Exception:
@@ -1716,6 +1737,26 @@ class TorrentManager:
         self._wg_runtime_mode = ""
         self._wg_active_ipv4 = ""
 
+    @staticmethod
+    def _probe_socks5_tunnel(socks_port: int, target_ip: str = "1.1.1.1", target_port: int = 80, timeout: float = 3.5) -> bool:
+        """
+        Pre-warm the WireGuard handshake through wireproxy's local SOCKS5 listener by issuing
+        a real SOCKS5 TCP CONNECT request through the tunnel.
+        """
+        try:
+            with socket.create_connection(("127.0.0.1", socks_port), timeout=timeout) as s:
+                s.settimeout(timeout)
+                s.sendall(b"\x05\x01\x00")
+                greeting = s.recv(2)
+                if len(greeting) < 2 or greeting[0] != 0x05 or greeting[1] != 0x00:
+                    return False
+                req = b"\x05\x01\x00\x01" + socket.inet_aton(target_ip) + int(target_port).to_bytes(2, "big")
+                s.sendall(req)
+                resp = s.recv(10)
+                return len(resp) >= 2 and resp[0] == 0x05 and resp[1] == 0x00
+        except Exception:
+            return False
+
     def _start_wireguard_tunnel_unlocked(self, profile_id: str):
         prof = self._get_wg_profile_unlocked(profile_id)
         if not prof:
@@ -1729,87 +1770,10 @@ class TorrentManager:
         self._stop_wireguard_tunnel_unlocked()
         client = _detect_wireguard_client_info()
         errors = []
+        has_ipv6_addr = ":" in str(prof.get("address") or "")
 
-        # 1) Try Userspace WireGuard Tunnel (wireproxy -> 127.0.0.1:25344 SOCKS5 strictly for libtorrent)
-        if client["wireproxy_bin"]:
-            try:
-                wp_lines = [
-                    "[Interface]",
-                    f"PrivateKey = {prof['private_key']}",
-                    f"Address = {prof['address']}",
-                    f"DNS = {prof['dns']}",
-                ]
-                if prof.get("mtu"):
-                    wp_lines.append(f"MTU = {prof['mtu']}")
-                wp_lines.extend([
-                    "",
-                    "[Peer]",
-                    f"PublicKey = {prof['public_key']}",
-                ])
-                if prof.get("preshared_key"):
-                    wp_lines.append(f"PresharedKey = {prof['preshared_key']}")
-                wp_lines.extend([
-                    f"Endpoint = {prof['endpoint']}",
-                    "AllowedIPs = 0.0.0.0/0, ::/0",
-                    f"PersistentKeepalive = {prof.get('persistent_keepalive') or 25}",
-                    "",
-                    "[Socks5]",
-                    f"BindAddress = 127.0.0.1:{WG_LOCAL_SOCKS_PORT}",
-                    "",
-                ])
-                wp_conf_path = Path("/tmp/sagedrive_wg_proxy.conf")
-                wp_conf_path.write_text("\n".join(wp_lines), encoding="utf-8")
-                os.chmod(wp_conf_path, 0o600)
-
-                chk = subprocess.run(
-                    [client["wireproxy_bin"], "-n", "-c", str(wp_conf_path)],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                    shell=False,
-                )
-                if chk.returncode != 0:
-                    raise RuntimeError((chk.stderr or chk.stdout or "Invalid wireproxy configuration").strip())
-
-                proc = subprocess.Popen(
-                    [client["wireproxy_bin"], "-c", str(wp_conf_path)],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
-                # Wait briefly for local SOCKS5 bind on 127.0.0.1:25344
-                bound = False
-                for _ in range(12):
-                    if proc.poll() is not None:
-                        break
-                    try:
-                        with socket.create_connection(("127.0.0.1", WG_LOCAL_SOCKS_PORT), timeout=0.15):
-                            bound = True
-                            break
-                    except Exception:
-                        time.sleep(0.1)
-
-                if proc.poll() is None and bound:
-                    self._wg_proc = proc
-                    self._wg_runtime_mode = "wireproxy"
-                    self._wg_runtime_status = "connected"
-                    self._wg_active_ipv4 = prof["ipv4"]
-                    self._wg_runtime_message = (
-                        f"Connected to {prof['name']} ({prof['endpoint']}) · "
-                        f"Torrent-Only WireGuard Tunnel (127.0.0.1:{WG_LOCAL_SOCKS_PORT})"
-                    )
-                    return
-                else:
-                    try:
-                        proc.terminate()
-                        _, err_out = proc.communicate(timeout=2)
-                    except Exception:
-                        err_out = ""
-                    errors.append(f"wireproxy: {(err_out or 'exited before binding').strip()[-300:]}")
-            except Exception as exc:
-                errors.append(f"wireproxy: {exc}")
-
-        # 2) Try Kernel WireGuard Interface (wg-torrent) with Source-IP Policy Routing (Table 51820)
+        # 1) Try Kernel WireGuard Interface (wg-torrent) first when container has NET_ADMIN:
+        #    Supports full native UDP (DHT, UDP trackers, uTP) + TCP strictly for sockets bound to prof['ipv4'].
         ip_bin = shutil.which("ip") or ("/sbin/ip" if os.path.isfile("/sbin/ip") else "")
         if client["wg_bin"] and ip_bin and prof.get("ipv4"):
             try:
@@ -1857,16 +1821,24 @@ class TorrentManager:
                             [ip_bin, "address", "add", addr_item, "dev", WG_KERNEL_IFACE],
                             capture_output=True, text=True, timeout=4, shell=False,
                         )
-                if prof.get("mtu"):
-                    subprocess.run(
-                        [ip_bin, "link", "set", "mtu", str(prof["mtu"]), "up", "dev", WG_KERNEL_IFACE],
-                        capture_output=True, text=True, timeout=4, shell=False,
-                    )
-                else:
-                    subprocess.run(
-                        [ip_bin, "link", "set", "up", "dev", WG_KERNEL_IFACE],
-                        capture_output=True, text=True, timeout=4, shell=False,
-                    )
+                mtu_val = str(prof.get("mtu") or 1420)
+                subprocess.run(
+                    [ip_bin, "link", "set", "mtu", mtu_val, "up", "dev", WG_KERNEL_IFACE],
+                    capture_output=True, text=True, timeout=4, shell=False,
+                )
+
+                # Disable strict reverse-path filtering so incoming VPN packets on wg-torrent are not dropped
+                for sysctl_path, val in (
+                    ("/proc/sys/net/ipv4/conf/all/rp_filter", "0"),
+                    ("/proc/sys/net/ipv4/conf/default/rp_filter", "0"),
+                    (f"/proc/sys/net/ipv4/conf/{WG_KERNEL_IFACE}/rp_filter", "0"),
+                    ("/proc/sys/net/ipv4/conf/all/src_valid_mark", "1"),
+                ):
+                    try:
+                        if os.path.exists(sysctl_path):
+                            Path(sysctl_path).write_text(val, encoding="utf-8")
+                    except Exception:
+                        pass
 
                 # Policy route ONLY traffic originating from the WireGuard interface IP
                 subprocess.run(
@@ -1874,25 +1846,145 @@ class TorrentManager:
                     capture_output=True, text=True, timeout=4, shell=False,
                 )
                 subprocess.run(
-                    [ip_bin, "rule", "del", "priority", WG_POLICY_PRIO],
+                    [ip_bin, "rule", "add", "from", f"{prof['ipv4']}/32", "table", "main", "suppress_prefixlength", "0", "priority", WG_POLICY_LOCAL_PRIO],
                     capture_output=True, text=True, timeout=4, shell=False,
                 )
-                subprocess.run(
+                r_rule = subprocess.run(
                     [ip_bin, "rule", "add", "from", f"{prof['ipv4']}/32", "table", WG_POLICY_TABLE, "priority", WG_POLICY_PRIO],
                     capture_output=True, text=True, timeout=4, shell=False,
                 )
+                if r_rule.returncode != 0:
+                    raise RuntimeError((r_rule.stderr or r_rule.stdout or "ip rule add failed").strip())
+
+                # Verify that a socket bound to prof['ipv4'] can actually complete a handshake & connect through wg-torrent
+                probe_ok = False
+                for probe_target in (("1.1.1.1", 80), ("1.1.1.1", 443), ("8.8.8.8", 53)):
+                    try:
+                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        s.settimeout(2.5)
+                        s.bind((prof["ipv4"], 0))
+                        s.connect(probe_target)
+                        s.close()
+                        probe_ok = True
+                        break
+                    except Exception:
+                        try:
+                            s.close()
+                        except Exception:
+                            pass
+                if not probe_ok:
+                    raise RuntimeError(f"Kernel interface {WG_KERNEL_IFACE} could not reach internet from {prof['ipv4']} (falling back to userspace tunnel)")
 
                 self._wg_runtime_mode = "kernel-wg"
                 self._wg_runtime_status = "connected"
                 self._wg_active_ipv4 = prof["ipv4"]
                 self._wg_runtime_message = (
                     f"Connected to {prof['name']} ({prof['endpoint']}) · "
-                    f"Kernel Interface {WG_KERNEL_IFACE} ({prof['ipv4']} · Torrent-Only Policy Route)"
+                    f"Kernel Interface {WG_KERNEL_IFACE} ({prof['ipv4']} · Full TCP+UDP Torrent-Only Policy Route)"
                 )
                 return
             except Exception as exc:
                 self._stop_wireguard_tunnel_unlocked()
                 errors.append(f"kernel-wg: {exc}")
+
+        # 2) Userspace WireGuard Tunnel (wireproxy -> 127.0.0.1:25344 SOCKS5 strictly for libtorrent)
+        if client["wireproxy_bin"]:
+            try:
+                dns_tokens = [d.strip() for d in str(prof.get("dns") or "").split(",") if d.strip()]
+                for fb_dns in ("1.1.1.1", "8.8.8.8"):
+                    if fb_dns not in dns_tokens:
+                        dns_tokens.append(fb_dns)
+                dns_str = ", ".join(dns_tokens)
+                first_dns_ip = next((d for d in dns_tokens if ":" not in d), "1.1.1.1")
+
+                wp_lines = [
+                    "[Interface]",
+                    f"PrivateKey = {prof['private_key']}",
+                    f"Address = {prof['address']}",
+                    f"DNS = {dns_str}",
+                    f"MTU = {prof.get('mtu') or 1380}",
+                    "",
+                    "[Peer]",
+                    f"PublicKey = {prof['public_key']}",
+                ]
+                if prof.get("preshared_key"):
+                    wp_lines.append(f"PresharedKey = {prof['preshared_key']}")
+                allowed_str = "0.0.0.0/0, ::/0" if has_ipv6_addr else "0.0.0.0/0"
+                wp_lines.extend([
+                    f"Endpoint = {prof['endpoint']}",
+                    f"AllowedIPs = {allowed_str}",
+                    f"PersistentKeepalive = {prof.get('persistent_keepalive') or 25}",
+                    "",
+                    "[Socks5]",
+                    f"BindAddress = 127.0.0.1:{WG_LOCAL_SOCKS_PORT}",
+                    "",
+                ])
+                wp_conf_path = Path("/tmp/sagedrive_wg_proxy.conf")
+                wp_conf_path.write_text("\n".join(wp_lines), encoding="utf-8")
+                os.chmod(wp_conf_path, 0o600)
+
+                chk = subprocess.run(
+                    [client["wireproxy_bin"], "-n", "-c", str(wp_conf_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    shell=False,
+                )
+                if chk.returncode != 0:
+                    raise RuntimeError((chk.stderr or chk.stdout or "Invalid wireproxy configuration").strip())
+
+                # CRITICAL: Run wireproxy with -s (silent) and redirect output to a log file
+                # (never an unread subprocess.PIPE, which deadlocks once the 64 KiB pipe buffer fills!).
+                log_fp = open("/tmp/sagedrive_wireproxy.log", "w", encoding="utf-8")
+                self._wg_log_fp = log_fp
+                proc = subprocess.Popen(
+                    [client["wireproxy_bin"], "-s", "-c", str(wp_conf_path)],
+                    stdout=log_fp,
+                    stderr=log_fp,
+                    text=True,
+                )
+                # Wait briefly for local SOCKS5 bind on 127.0.0.1:25344
+                bound = False
+                for _ in range(15):
+                    if proc.poll() is not None:
+                        break
+                    try:
+                        with socket.create_connection(("127.0.0.1", WG_LOCAL_SOCKS_PORT), timeout=0.15):
+                            bound = True
+                            break
+                    except Exception:
+                        time.sleep(0.1)
+
+                if proc.poll() is None and bound:
+                    # Pre-warm the WireGuard peer handshake through the SOCKS5 tunnel so libtorrent starts hot
+                    handshake_ok = (
+                        self._probe_socks5_tunnel(WG_LOCAL_SOCKS_PORT, "1.1.1.1", 80, timeout=3.0)
+                        or self._probe_socks5_tunnel(WG_LOCAL_SOCKS_PORT, first_dns_ip, 53, timeout=2.5)
+                    )
+                    self._wg_proc = proc
+                    self._wg_runtime_mode = "wireproxy"
+                    self._wg_runtime_status = "connected"
+                    self._wg_active_ipv4 = prof["ipv4"]
+                    hs_note = "Handshake Verified" if handshake_ok else "Tunnel Listening (Verify VPN Key/Endpoint if Peers Stay 0)"
+                    self._wg_runtime_message = (
+                        f"Connected to {prof['name']} ({prof['endpoint']}) · "
+                        f"Torrent-Only WireGuard Tunnel (127.0.0.1:{WG_LOCAL_SOCKS_PORT} · {hs_note})"
+                    )
+                    return
+                else:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=2)
+                    except Exception:
+                        pass
+                    try:
+                        log_fp.flush()
+                        err_out = Path("/tmp/sagedrive_wireproxy.log").read_text(encoding="utf-8", errors="replace")
+                    except Exception:
+                        err_out = ""
+                    errors.append(f"wireproxy: {(err_out or 'exited before binding').strip()[-300:]}")
+            except Exception as exc:
+                errors.append(f"wireproxy: {exc}")
 
         # 3) If running inside a restricted cloud preview sandbox (gVisor EOPNOTSUPP), keep profile enabled in standby
         combined_err = " | ".join(errors)
@@ -1908,7 +2000,7 @@ class TorrentManager:
 
         if not client["available"]:
             raise RuntimeError(
-                "WireGuard client is not installed. Click 'Install / Update WireGuard Client' in Settings → Torrents."
+                "WireGuard client is not installed. Click 'Update Latest WireGuard Client' in Settings → Torrents."
             )
         raise RuntimeError(f"Failed to start WireGuard tunnel: {combined_err or 'unknown error'}")
 
@@ -1944,6 +2036,7 @@ class TorrentManager:
                 log_action = "Torrent WireGuard VPN Disabled"
                 log_detail = "Disabled WireGuard VPN for torrent traffic"
 
+        self._wake_event.set()
         self._log(
             log_action,
             "change",
@@ -2172,31 +2265,47 @@ class TorrentManager:
         outgoing_iface = ""
 
         if wg_enabled and wg_mode == "wireproxy":
-            # Route 100% of libtorrent traffic through the local userspace WireGuard SOCKS5 tunnel
+            # Route all BitTorrent TCP peer connections (piece downloads, uploads, and magnet metadata)
+            # through the local userspace WireGuard SOCKS5 tunnel (127.0.0.1:25344).
+            # CRITICAL: wireproxy's SOCKS5 server does not implement SOCKS5 UDP ASSOCIATE (returns 0x07),
+            # so uTP must be disabled (forcing all peer transfers over TCP through WireGuard) and
+            # proxy_tracker_connections / proxy_hostnames / force_proxy must be False so libtorrent does
+            # not trap UDP tracker announces and DHT peer discovery inside an unsupported SOCKS5 UDP socket.
             proxy_type_val = p_socks5
             phost = "127.0.0.1"
             pport = WG_LOCAL_SOCKS_PORT
             puser = ""
             ppass = ""
-            force_proxy_val = True
+            force_proxy_val = False
             effective_proxy_peers = True
-            effective_proxy_trackers = True
-            effective_proxy_hostnames = True
-            effective_anon = True
+            effective_proxy_trackers = False
+            effective_proxy_hostnames = False
+            effective_anon = False
+            utp_enabled = False
             effective_lsd = False
             effective_upnp = False
             effective_natpmp = False
+            outgoing_iface = ""
         elif wg_enabled and wg_mode == "kernel-wg" and wg_ipv4:
-            # Bind libtorrent strictly to the policy-routed wg-torrent interface IP
+            # Bind libtorrent strictly to the policy-routed wg-torrent interface IP.
+            # CRITICAL: anonymous_mode must be False when proxy_type is none, otherwise libtorrent
+            # refuses to contact trackers or DHT!
             listen_str = f"{wg_ipv4}:{port}"
             outgoing_iface = wg_ipv4
-            effective_anon = True
+            proxy_type_val = p_none
+            phost = ""
+            pport = 0
+            puser = ""
+            ppass = ""
+            force_proxy_val = False
+            effective_anon = False
             effective_lsd = False
             effective_upnp = False
             effective_natpmp = False
 
-        pack = {
+        return {
             "listen_interfaces": listen_str,
+            "outgoing_interfaces": outgoing_iface,
             "enable_dht": effective_dht,
             "enable_lsd": effective_lsd,
             "enable_upnp": effective_upnp,
@@ -2236,15 +2345,11 @@ class TorrentManager:
             "proxy_hostnames": effective_proxy_hostnames,
             "force_proxy": force_proxy_val,
         }
-        if outgoing_iface:
-            pack["outgoing_interfaces"] = outgoing_iface
-        return pack
 
     def _apply_session_settings(self, ses):
         pack = self._build_session_settings()
         try:
             ses.apply_settings(pack)
-            return
         except Exception:
             # Apply valid keys individually across libtorrent 1.2 / 2.0
             for k, v in pack.items():
@@ -2252,6 +2357,31 @@ class TorrentManager:
                     ses.apply_settings({k: v})
                 except Exception:
                     pass
+        # Force active torrents to immediately re-announce on the new tunnel/interface
+        try:
+            wg_on = bool(self._wg_state.get("enabled", False))
+            for h in ses.get_torrents():
+                if not h.is_valid():
+                    continue
+                if wg_on:
+                    for tr_url in WG_TCP_FALLBACK_TRACKERS:
+                        try:
+                            h.add_tracker({"url": tr_url, "tier": 1})
+                        except Exception:
+                            pass
+                try:
+                    h.force_reannounce(0, -1, 1)
+                except Exception:
+                    try:
+                        h.force_reannounce()
+                    except Exception:
+                        pass
+                try:
+                    h.force_dht_announce()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _ensure_session(self):
         if not LIBTORRENT_AVAILABLE and not _try_import_libtorrent():
@@ -2529,6 +2659,21 @@ class TorrentManager:
         while True:
             self._wake_event.wait(timeout=1.5)
             self._wake_event.clear()
+            # Keep active userspace WireGuard tunnel healthy if it ever exits unexpectedly
+            with self._lock:
+                if (
+                    self._wg_state.get("enabled")
+                    and self._wg_runtime_mode == "wireproxy"
+                    and (self._wg_proc is None or self._wg_proc.poll() is not None)
+                ):
+                    active_id = str(self._wg_state.get("active_profile_id") or "")
+                    if active_id:
+                        try:
+                            self._start_wireguard_tunnel_unlocked(active_id)
+                            if self._session is not None:
+                                self._apply_session_settings(self._session)
+                        except Exception:
+                            pass
             while True:
                 next_job_id = None
                 with self._lock:
@@ -2609,26 +2754,52 @@ class TorrentManager:
 
             handle = ses.add_torrent(atp)
 
-            extra_trackers = self._parse_extra_trackers(self._settings.get("extra_trackers", ""))
+            extra_trackers = list(self._parse_extra_trackers(self._settings.get("extra_trackers", "")))
+            for tr_url in WG_TCP_FALLBACK_TRACKERS:
+                if tr_url not in extra_trackers:
+                    extra_trackers.append(tr_url)
             for tr_url in extra_trackers:
                 try:
                     handle.add_tracker({"url": tr_url, "tier": 1})
                 except Exception:
                     pass
+            try:
+                handle.force_reannounce()
+                handle.force_dht_announce()
+            except Exception:
+                pass
 
             # Wait for magnet metadata if needed
-            meta_deadline = time.time() + 180.0
+            meta_start = time.time()
+            meta_deadline = meta_start + 180.0
+            last_nudge = meta_start
             while not handle.status().has_metadata:
                 cur = self._get_job_ref(job_id)
                 if not cur or cur["status"] in ("paused", "cancelled"):
                     raise InterruptedError("Paused while fetching metadata")
                 st = handle.status()
+                peers_now = int(getattr(st, "num_peers", 0) or 0)
+                seeds_now = int(getattr(st, "num_seeds", 0) or 0)
                 self._update_live_stats(
                     job_id,
-                    peers=int(getattr(st, "num_peers", 0) or 0),
-                    seeds=int(getattr(st, "num_seeds", 0) or 0),
+                    peers=peers_now,
+                    seeds=seeds_now,
                 )
-                if time.time() > meta_deadline:
+                now_ts = time.time()
+                if peers_now == 0 and (now_ts - last_nudge) >= 6.0:
+                    last_nudge = now_ts
+                    try:
+                        handle.force_reannounce(0, -1, 1)
+                    except Exception:
+                        try:
+                            handle.force_reannounce()
+                        except Exception:
+                            pass
+                    try:
+                        handle.force_dht_announce()
+                    except Exception:
+                        pass
+                if now_ts > meta_deadline:
                     raise TimeoutError("Timed out waiting for magnet metadata (no peers responded within 3 minutes)")
                 time.sleep(0.35)
 
